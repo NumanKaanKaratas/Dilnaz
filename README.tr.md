@@ -11,6 +11,8 @@ Dilnaz, bir sonraki yazı parçasını doğrudan token olarak tahmin etmek yerin
 
 Temel fikir şudur: klasik dil modelleri çoğunlukla "sıradaki token ne olmalı?" sorusunu öğrenir. Dilnaz ise önce "sıradaki anlam ne olmalı?" sorusunu öğrenir, sonra bu anlamı yazıya döker. Bu ayrım özellikle çok dilli genelleme, yüzey biçimi değişiklikleri, eş anlamlı kelimeler ve yazım farklılıkları için daha esnek bir temsil alanı oluşturmayı amaçlar.
 
+Bu araştırma yönünü ilginç buluyorsanız, repo'ya yıldız vermeniz projenin daha fazla araştırmacı ve geliştiriciye ulaşmasına yardımcı olur.
+
 ## Amaç
 
 Dilnaz'ın uzun vadeli hedefi, metni yalnızca karakter veya token dizisi olarak değil, anlam akışı olarak modellemektir.

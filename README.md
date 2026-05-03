@@ -11,6 +11,8 @@ Dilnaz is a two-stage semantic language modeling research project. Instead of tr
 
 The core hypothesis is simple: a model that learns the flow of meaning before surface form can generalize differently from a model that only learns token transitions. Words such as `araba`, `otomobil`, and `car` are different byte/token sequences, but they can occupy nearby regions in a multilingual semantic space. Dilnaz is built around that distinction.
 
+If this research direction is interesting to you, a star helps the project reach more researchers and builders.
+
 ## Architecture
 
 Dilnaz has two models:
