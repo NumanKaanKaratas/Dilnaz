@@ -1,0 +1,17 @@
+[project]
+name = "dilnaz"
+version = "0.1.0"
+description = "Two-stage semantic language modeling with DIL surface-semantic encoding and NAZ semantic next-step prediction"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy",
+  "pyarrow",
+  "torch",
+  "transformers",
+]
+license = { file = "LICENSE" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

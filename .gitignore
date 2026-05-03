@@ -1,0 +1,43 @@
+# Local/editor state
+.claude/
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model artifacts and generated data
+checkpoints/
+external/
+TrainDatas/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.npy
+*.npz
+
+# Logs and temporary files
+logs/
+runs/
+wandb/
+*.log
+*.tmp
+*.temp
+
+# OS files
+Thumbs.db
+.DS_Store
