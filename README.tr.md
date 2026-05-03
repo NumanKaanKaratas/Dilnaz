@@ -2,6 +2,11 @@
 
 **Dil:** [English](README.md) | Türkçe
 
+![Lisans: MIT](https://img.shields.io/badge/lisans-MIT-green.svg)
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
+![PyTorch](https://img.shields.io/badge/backend-PyTorch-ee4c2c.svg)
+![Durum: araştırma](https://img.shields.io/badge/durum-araştırma-orange.svg)
+
 Dilnaz, bir sonraki yazı parçasını doğrudan token olarak tahmin etmek yerine bir sonraki anlam dağılımını tahmin etmeyi hedefleyen iki aşamalı bir semantic language modeling araştırma projesidir.
 
 Temel fikir şudur: klasik dil modelleri çoğunlukla "sıradaki token ne olmalı?" sorusunu öğrenir. Dilnaz ise önce "sıradaki anlam ne olmalı?" sorusunu öğrenir, sonra bu anlamı yazıya döker. Bu ayrım özellikle çok dilli genelleme, yüzey biçimi değişiklikleri, eş anlamlı kelimeler ve yazım farklılıkları için daha esnek bir temsil alanı oluşturmayı amaçlar.
@@ -17,6 +22,19 @@ Bu mimaride yazım biçimi tamamen yok sayılmaz. Dil modeli geçmişteki dil, b
 ## Mimari
 
 Dilnaz iki ana modelden oluşur:
+
+```mermaid
+flowchart LR
+    A[Surface text] --> B[HybridTokenizer]
+    B --> C[DIL encoder<br/>surface + bağlam]
+    C --> D[(Semantic dağılım<br/>mean + log_std)]
+    D --> E[NAZ semantic backbone<br/>anlam akışı modeli]
+    E --> F[(Sonraki semantic dağılım<br/>pred_mean + pred_log_std)]
+    F --> G[DIL renderer<br/>latent -> byte]
+    G --> H[Surface text]
+    T[NLLB teacher<br/>çok dilli geometri] -. distillation .-> C
+    T -. grouped geometry .-> D
+```
 
 ```text
 surface text

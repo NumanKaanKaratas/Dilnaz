@@ -2,6 +2,11 @@
 
 **Language:** English | [Türkçe](README.tr.md)
 
+![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
+![PyTorch](https://img.shields.io/badge/backend-PyTorch-ee4c2c.svg)
+![Status: research](https://img.shields.io/badge/status-research-orange.svg)
+
 Dilnaz is a two-stage semantic language modeling research project. Instead of training the autoregressive model to predict the next discrete token directly, Dilnaz trains it to predict the next semantic distribution and then renders that distribution back into surface text.
 
 The core hypothesis is simple: a model that learns the flow of meaning before surface form can generalize differently from a model that only learns token transitions. Words such as `araba`, `otomobil`, and `car` are different byte/token sequences, but they can occupy nearby regions in a multilingual semantic space. Dilnaz is built around that distinction.
@@ -9,6 +14,19 @@ The core hypothesis is simple: a model that learns the flow of meaning before su
 ## Architecture
 
 Dilnaz has two models:
+
+```mermaid
+flowchart LR
+    A[Surface text] --> B[HybridTokenizer]
+    B --> C[DIL encoder<br/>surface + context]
+    C --> D[(Semantic distribution<br/>mean + log_std)]
+    D --> E[NAZ semantic backbone<br/>meaning sequence model]
+    E --> F[(Next semantic distribution<br/>pred_mean + pred_log_std)]
+    F --> G[DIL renderer<br/>latent to bytes]
+    G --> H[Surface text]
+    T[NLLB teacher<br/>multilingual geometry] -. distillation .-> C
+    T -. grouped geometry .-> D
+```
 
 ```text
 surface text
