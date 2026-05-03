@@ -1,6 +1,6 @@
 # Dilnaz
 
-**Dil:** [English](../README.md) | Türkçe
+**Dil:** [English](README.md) | Türkçe
 
 Dilnaz, bir sonraki yazı parçasını doğrudan token olarak tahmin etmek yerine bir sonraki anlam dağılımını tahmin etmeyi hedefleyen iki aşamalı bir semantic language modeling araştırma projesidir.
 

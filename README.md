@@ -1,6 +1,6 @@
 # Dilnaz
 
-**Language:** English | [Türkçe](dilnaz/README.md)
+**Language:** English | [Türkçe](README.tr.md)
 
 Dilnaz is a two-stage semantic language modeling research project. Instead of training the autoregressive model to predict the next discrete token directly, Dilnaz trains it to predict the next semantic distribution and then renders that distribution back into surface text.
 
