@@ -6,12 +6,13 @@
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
 ![PyTorch](https://img.shields.io/badge/backend-PyTorch-ee4c2c.svg)
 ![Durum: araştırma](https://img.shields.io/badge/durum-araştırma-orange.svg)
+[![GitHub stars](https://img.shields.io/github/stars/NumanKaanKaratas/Dilnaz?style=social)](https://github.com/NumanKaanKaratas/Dilnaz/stargazers)
 
 Dilnaz, bir sonraki yazı parçasını doğrudan token olarak tahmin etmek yerine bir sonraki anlam dağılımını tahmin etmeyi hedefleyen iki aşamalı bir semantic language modeling araştırma projesidir.
 
 Temel fikir şudur: klasik dil modelleri çoğunlukla "sıradaki token ne olmalı?" sorusunu öğrenir. Dilnaz ise önce "sıradaki anlam ne olmalı?" sorusunu öğrenir, sonra bu anlamı yazıya döker. Bu ayrım özellikle çok dilli genelleme, yüzey biçimi değişiklikleri, eş anlamlı kelimeler ve yazım farklılıkları için daha esnek bir temsil alanı oluşturmayı amaçlar.
 
-Bu araştırma yönünü ilginç buluyorsanız, repo'ya yıldız vermeniz projenin daha fazla araştırmacı ve geliştiriciye ulaşmasına yardımcı olur.
+Bu araştırma yönünü ilginç buluyorsanız, [repo'ya yıldız vermeniz](https://github.com/NumanKaanKaratas/Dilnaz/stargazers) projenin daha fazla araştırmacı ve geliştiriciye ulaşmasına yardımcı olur.
 
 ## Amaç
 

@@ -6,12 +6,13 @@
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
 ![PyTorch](https://img.shields.io/badge/backend-PyTorch-ee4c2c.svg)
 ![Status: research](https://img.shields.io/badge/status-research-orange.svg)
+[![GitHub stars](https://img.shields.io/github/stars/NumanKaanKaratas/Dilnaz?style=social)](https://github.com/NumanKaanKaratas/Dilnaz/stargazers)
 
 Dilnaz is a two-stage semantic language modeling research project. Instead of training the autoregressive model to predict the next discrete token directly, Dilnaz trains it to predict the next semantic distribution and then renders that distribution back into surface text.
 
 The core hypothesis is simple: a model that learns the flow of meaning before surface form can generalize differently from a model that only learns token transitions. Words such as `araba`, `otomobil`, and `car` are different byte/token sequences, but they can occupy nearby regions in a multilingual semantic space. Dilnaz is built around that distinction.
 
-If this research direction is interesting to you, a star helps the project reach more researchers and builders.
+If this research direction is interesting to you, [starring the repository](https://github.com/NumanKaanKaratas/Dilnaz/stargazers) helps the project reach more researchers and builders.
 
 ## Architecture
 
