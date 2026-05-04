@@ -218,7 +218,7 @@ def trainable_segments(tokenizer: HybridTokenizer, text: str, max_word_bytes: in
     return [
         segment
         for segment in tokenizer.encode_segments(text)
-        if segment.kind != "space" and 0 < segment.piece_len <= max_word_bytes
+        if 0 < segment.piece_len <= max_word_bytes
     ]
 
 

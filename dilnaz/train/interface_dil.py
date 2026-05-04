@@ -13,44 +13,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add
 from models.configuration_dil import DilConfig
 from models.modeling_dil import Dil
-from tokenization import HybridTokenizer
+from tokenization import HybridTokenizer, TokenSegment
 
 
-RIGHT_ATTACHED = set(".,;:!?%)]}")
-LEFT_ATTACHED = set("([{")
-CHECKPOINT_FORMAT_VERSION = 7
+CHECKPOINT_FORMAT_VERSION = 8
 
 
-def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[str]:
-    tokens = [
-        segment.text
+def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
+    segments = [
+        segment
         for segment in tokenizer.encode_segments(text)
-        if segment.kind != "space"
+        if segment.piece_len > 0
     ]
-    if not tokens:
+    if not segments:
         raise ValueError("text produced no tokens")
-    return tokens
+    return segments
 
 
-def make_batch(tokens: list[str], tokenizer: HybridTokenizer, config: DilConfig, device: torch.device):
+def make_batch(segments: list[TokenSegment], tokenizer: HybridTokenizer, config: DilConfig, device: torch.device):
     input_ids = torch.full(
-        (len(tokens), config.context_size, config.max_word_bytes),
+        (len(segments), config.context_size, config.max_word_bytes),
         config.pad_token_id,
         dtype=torch.long,
         device=device,
     )
     word_masks = torch.zeros(
-        (len(tokens), config.context_size, config.max_word_bytes),
+        (len(segments), config.context_size, config.max_word_bytes),
         dtype=torch.bool,
         device=device,
     )
     byte_lengths = []
 
-    for row_idx, token in enumerate(tokens):
-        token_ids = tokenizer.encode_segments(token)[0].token_ids
+    for row_idx, segment in enumerate(segments):
+        token_ids = segment.token_ids
         if len(token_ids) > config.max_word_bytes:
             raise ValueError(
-                f"token {row_idx} '{token}' has {len(token_ids)} pieces; "
+                f"token {row_idx} {tokenizer.decode(token_ids)!r} has {len(token_ids)} pieces; "
                 f"max_word_bytes={config.max_word_bytes}"
             )
         ids = torch.tensor(token_ids, dtype=torch.long, device=device)
@@ -58,9 +56,9 @@ def make_batch(tokens: list[str], tokenizer: HybridTokenizer, config: DilConfig,
         for context_idx, source_idx in enumerate(
             range(row_idx - config.context_left_radius, row_idx + 1)
         ):
-            if source_idx < 0 or source_idx >= len(tokens):
+            if source_idx < 0 or source_idx >= len(segments):
                 continue
-            context_ids = tokenizer.encode_segments(tokens[source_idx])[0].token_ids
+            context_ids = segments[source_idx].token_ids
             if len(context_ids) > config.max_word_bytes:
                 continue
             ids = torch.tensor(context_ids, dtype=torch.long, device=device)
@@ -191,40 +189,16 @@ def format_table(headers: list[str], rows: list[list[str]]):
         print("".join(f"{value:<{widths[idx]}}" for idx, value in enumerate(row)).rstrip())
 
 
-def join_tokens(tokens: list[str]) -> str:
-    text = ""
-    for token in tokens:
-        if not text:
-            text = token
-        elif token in RIGHT_ATTACHED:
-            text += token
-        elif text[-1] in LEFT_ATTACHED:
-            text += token
-        else:
-            text += " " + token
-    return text
-
-
 @torch.no_grad()
-def nllb_similarity(config: DilConfig, text: str, tokens: list[str], device: torch.device):
+def nllb_similarity(config: DilConfig, text: str, segments: list[TokenSegment], device: torch.device):
     nllb_tokenizer = AutoTokenizer.from_pretrained(config.nllb_model_name)
     if hasattr(nllb_tokenizer, "src_lang"):
         nllb_tokenizer.src_lang = config.nllb_src_lang
     nllb_model = AutoModelForSeq2SeqLM.from_pretrained(config.nllb_model_name, dtype=torch.float32).to(device)
     nllb_model.eval()
 
-    segments = []
-    pos = 0
-    for token in tokens:
-        start = text.find(token, pos)
-        if start < 0:
-            start = pos
-        end = start + len(token)
-        segments.append((start, end))
-        pos = end
-
-    starts = [s for s, _ in segments]
-    ends = [e for _, e in segments]
+    starts = [segment.start for segment in segments]
+    ends = [segment.end for segment in segments]
 
     encoded = nllb_tokenizer(text, return_tensors="pt", return_offsets_mapping=True)
     offsets = encoded.pop("offset_mapping")[0].tolist()
@@ -240,11 +214,11 @@ def nllb_similarity(config: DilConfig, text: str, tokens: list[str], device: tor
     outputs = nllb_model.get_encoder()(**inputs, output_hidden_states=True, return_dict=True)
     hidden_states = outputs.hidden_states
 
-    sample_count = len(tokens)
+    sample_count = len(segments)
     teacher = torch.zeros((sample_count, len(NLLB_LAYER_GROUPS), nllb_model.config.d_model), dtype=torch.float32, device=device)
     teacher_mask = torch.zeros((sample_count,), dtype=torch.bool, device=device)
     for row_idx, positions in enumerate(alignments):
-        if not positions or tokens[row_idx].isspace():
+        if not positions or segments[row_idx].text.isspace():
             continue
         teacher_mask[row_idx] = True
         hidden_positions = [pieces[p][3] for p in positions]
@@ -277,8 +251,10 @@ def main():
         torch.set_float32_matmul_precision("high")
 
     model, config, tokenizer, _ = load_model(args.checkpoint_dir, device)
-    tokens = tokenize_text(args.text, tokenizer)
-    input_ids, word_masks, byte_lengths = make_batch(tokens, tokenizer, config, device)
+    segments = tokenize_text(args.text, tokenizer)
+    tokens = [segment.text for segment in segments]
+    decoded_tokens = [tokenizer.decode(segment.token_ids) for segment in segments]
+    input_ids, word_masks, byte_lengths = make_batch(segments, tokenizer, config, device)
     latents = encode_tokens(model, input_ids, word_masks)
     similarities = similarity_matrix(latents)
     mapping = build_auto_mapping(tokens, similarities)
@@ -288,11 +264,11 @@ def main():
     swapped_latents = latents[source_indices]
     expected_lengths = [byte_lengths[source_idx] for source_idx in source_indices]
     swapped, swapped_lengths = decode_latents(model, tokenizer, swapped_latents)
-    expected = [tokens[source_idx] for source_idx in source_indices]
+    expected = [decoded_tokens[source_idx] for source_idx in source_indices]
 
-    print(f"tokens={tokens!r}")
+    print(f"tokens={decoded_tokens!r}")
     print()
-    nllb_sim = nllb_similarity(config, args.text, tokens, device)
+    nllb_sim = nllb_similarity(config, args.text, segments, device)
     print_similarity(tokens, nllb_sim, label="nllb_teacher_similarity_matrix")
     print()
     print_similarity(tokens, similarities, label="dil_similarity_matrix")
@@ -305,15 +281,15 @@ def main():
 
     print("comparison:")
     rows = []
-    for idx, token in enumerate(tokens):
+    for idx in range(len(tokens)):
         rows.append(
             [
                 f"[{idx}]",
-                token,
+                decoded_tokens[idx],
                 str(byte_lengths[idx]),
                 baseline[idx],
                 str(baseline_lengths[idx]),
-                str(baseline[idx] == token),
+                str(baseline[idx] == decoded_tokens[idx]),
                 swapped[idx],
                 expected[idx],
                 str(expected_lengths[idx]),
@@ -339,8 +315,8 @@ def main():
     )
     print()
 
-    baseline_text = join_tokens(baseline)
-    swapped_text = join_tokens(swapped)
+    baseline_text = "".join(baseline)
+    swapped_text = "".join(swapped)
     print(f"baseline_reconstructed_text={baseline_text!r}")
     print(f"swapped_reconstructed_text={swapped_text!r}")
     print()

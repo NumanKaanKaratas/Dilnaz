@@ -41,7 +41,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer
 
 
-CHECKPOINT_FORMAT_VERSION = 10
+CHECKPOINT_FORMAT_VERSION = 11
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 

@@ -16,11 +16,17 @@ from dilnaz.train.dil_data import (
     apply_teacher_centered_add_by_group,
     align_spans_to_pieces,
     split_text_for_nllb,
+    trainable_segments,
 )
+from dilnaz.train.naz_data import stream_token_pieces
 
 
 def load_tokenizer():
     return HybridTokenizer.from_file(default_vocab_path())
+
+
+def decode_segments(tokenizer: HybridTokenizer, segments) -> str:
+    return "".join(tokenizer.decode(segment.token_ids) for segment in segments)
 
 
 def test_hybrid_tokenizer_roundtrip_and_core_segments():
@@ -55,6 +61,45 @@ def test_hybrid_tokenizer_roundtrip_and_core_segments():
         if segment.kind != "space"
     ]
     assert turkish_initial == [("ışık", "word"), ("çağ", "word"), ("öykü", "word")]
+
+
+def test_leading_space_token_roundtrips_common_shapes():
+    tokenizer = load_tokenizer()
+
+    for text in [
+        "1234567890 sayıları bazen çok işe yarar.",
+        "1 2 3 4 5",
+        "1  2   3",
+        "Istanbul'da 1ad47wq çalıştı.",
+        "Dişi aslanın dişi kırıldı.",
+    ]:
+        assert tokenizer.decode(tokenizer.encode(text)) == text
+        assert decode_segments(tokenizer, tokenizer.encode_segments(text)) == text
+
+
+def test_leading_space_token_contract_marks_only_real_boundaries():
+    tokenizer = load_tokenizer()
+
+    compact_ids = tokenizer.encode("123")
+    spaced_segments = tokenizer.encode_segments("1 2 3")
+    spaced_ids = [piece.token_id for segment in spaced_segments for piece in segment.pieces]
+    assert compact_ids != spaced_ids
+    assert [segment.text for segment in spaced_segments] == ["1", "2", "3"]
+    assert tokenizer.is_leading_space_token(spaced_segments[1].token_ids[0])
+    assert tokenizer.is_leading_space_token(spaced_segments[2].token_ids[0])
+    assert tokenizer.decode(spaced_ids) == "1 2 3"
+
+    multi_space_segments = tokenizer.encode_segments("1  2")
+    assert [
+        (segment.text, segment.kind, tokenizer.decode(segment.token_ids))
+        for segment in multi_space_segments
+    ] == [
+        ("1", "digit", "1"),
+        (" ", "space", " "),
+        ("2", "digit", " 2"),
+    ]
+    assert not tokenizer.is_leading_space_token(multi_space_segments[1].token_ids[0])
+    assert tokenizer.is_leading_space_token(multi_space_segments[2].token_ids[0])
 
 
 def test_get_subtoken_alignment_shape():
@@ -114,6 +159,65 @@ def test_whitespace_surface_tokens_do_not_receive_teacher_distillation():
     assert batch["labels"][1, 0].item() == tokenizer.token_to_id["surface:\n"]
     assert batch["teacher_texts"] == ["A\nDişi"]
     assert batch["teacher_text_indices"].tolist() == [0, 0, 0]
+
+
+def test_dil_batch_labels_decode_with_tokenizer_contract():
+    tokenizer = load_tokenizer()
+    text = "1234567890 sayıları"
+    config = DilConfig(
+        vocab_size=tokenizer.vocab_size,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        max_word_bytes=32,
+    )
+    dataset = HybridDilBatchDataset(
+        train_file=Path("unused.txt"),
+        config=config,
+        tokenizer=tokenizer,
+        batch_size=32,
+        read_chars=1024,
+    )
+    segments = trainable_segments(tokenizer, text, config.max_word_bytes)
+    batch = dataset.make_batch(
+        [text],
+        [0],
+        [segments],
+        [BatchSampleRef(0, idx) for idx in range(len(segments))],
+    )
+
+    decoded_labels = []
+    for row in batch["labels"]:
+        ids = [int(token_id) for token_id in row.tolist() if int(token_id) != -100]
+        decoded_labels.append(tokenizer.decode(ids))
+
+    assert "".join(decoded_labels) == text
+    sayilari = next(segment for segment in segments if segment.text == "sayıları")
+    assert tokenizer.is_leading_space_token(sayilari.token_ids[0])
+    assert sayilari.start == text.index("sayıları")
+    assert batch["teacher_starts"][segments.index(sayilari)].item() == sayilari.start
+
+
+def test_naz_token_stream_preserves_extra_spaces(tmp_path):
+    tokenizer = load_tokenizer()
+    train_file = tmp_path / "spacing.txt"
+    text = "1  2   3"
+    train_file.write_text(text, encoding="utf-8")
+
+    token_ids = list(stream_token_pieces(train_file, tokenizer, max_word_bytes=32, read_chars=2))
+
+    assert "".join(tokenizer.decode(ids) for ids in token_ids) == text
+    assert tokenizer.is_leading_space_token(token_ids[2][0])
+    assert tokenizer.is_leading_space_token(token_ids[-1][0])
+
+
+def test_interfaces_do_not_keep_manual_join_logic():
+    root = Path(__file__).resolve().parents[1]
+    for relative_path in ["dilnaz/train/interface_dil.py", "dilnaz/train/interface_naz.py"]:
+        source = (root / relative_path).read_text(encoding="utf-8")
+        assert "def join_tokens" not in source
+        assert "format_next_token" not in source
+        assert "RIGHT_ATTACHED" not in source
+        assert "LEFT_ATTACHED" not in source
 
 
 def test_common_word_tokens_only_match_standalone_words():

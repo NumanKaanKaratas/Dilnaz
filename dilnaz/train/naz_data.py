@@ -13,7 +13,7 @@ from tokenization import HybridTokenizer
 
 
 WHITESPACE_PATTERN = re.compile(r"\s+", re.UNICODE)
-TOKEN_CACHE_FORMAT_VERSION = 2
+TOKEN_CACHE_FORMAT_VERSION = 3
 
 
 def last_whitespace_end(text: str) -> int:
@@ -37,10 +37,15 @@ def stream_text_blocks(path: Path, read_chars: int):
                 carry = text
                 continue
             block = text[:boundary]
+            next_carry = text[boundary:]
+            trailing_space_count = len(block) - len(block.rstrip(" "))
+            if trailing_space_count:
+                next_carry = block[-trailing_space_count:] + next_carry
+                block = block[:-trailing_space_count]
             if block.strip():
                 emitted = True
                 yield block
-            carry = text[boundary:]
+            carry = next_carry
     if carry.strip():
         emitted = True
         yield carry
@@ -51,7 +56,7 @@ def stream_text_blocks(path: Path, read_chars: int):
 def stream_token_pieces(path: Path, tokenizer: HybridTokenizer, max_word_bytes: int, read_chars: int):
     for block in stream_text_blocks(path, read_chars):
         for segment in tokenizer.encode_segments(block):
-            if segment.kind == "space" or segment.piece_len > max_word_bytes:
+            if segment.piece_len > max_word_bytes:
                 continue
             token_ids = [piece.token_id for piece in segment.pieces]
             if not token_ids:

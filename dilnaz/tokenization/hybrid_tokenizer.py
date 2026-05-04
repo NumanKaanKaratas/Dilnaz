@@ -10,6 +10,7 @@ BYTE_VOCAB_SIZE = 256
 PAD_TOKEN = "<pad>"
 EOS_TOKEN = "<eos>"
 WORD_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+LEADING_SPACE_KEY_PREFIX = "leading:"
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,8 @@ class HybridTokenizer:
         self.eos_token_id = BYTE_VOCAB_SIZE + 1
         self.id_to_token: dict[int, str] = {}
         self.token_to_id: dict[str, int] = {}
+        self.leading_token_to_base: dict[int, int] = {}
+        self.base_token_to_leading: dict[int, int] = {}
 
         entries: list[tuple[str, str]] = []
         entries.extend((f"char:{token}", token) for token in char_tokens)
@@ -62,12 +65,31 @@ class HybridTokenizer:
 
         seen_keys = set()
         next_id = BYTE_VOCAB_SIZE + len(self.special_tokens)
+        base_entry_keys: list[str] = []
         for key, value in entries:
             if key in seen_keys:
                 raise ValueError(f"duplicate vocab key {key!r}")
             seen_keys.add(key)
             self.token_to_id[key] = next_id
             self.id_to_token[next_id] = value
+            base_entry_keys.append(key)
+            next_id += 1
+
+        for base_id in range(BYTE_VOCAB_SIZE):
+            key = f"{LEADING_SPACE_KEY_PREFIX}byte:{base_id}"
+            self.token_to_id[key] = next_id
+            self.id_to_token[next_id] = bytes([base_id]).decode("utf-8", errors="replace")
+            self.leading_token_to_base[next_id] = base_id
+            self.base_token_to_leading[base_id] = next_id
+            next_id += 1
+
+        for base_key in base_entry_keys:
+            base_id = self.token_to_id[base_key]
+            key = f"{LEADING_SPACE_KEY_PREFIX}{base_key}"
+            self.token_to_id[key] = next_id
+            self.id_to_token[next_id] = self.id_to_token[base_id]
+            self.leading_token_to_base[next_id] = base_id
+            self.base_token_to_leading[base_id] = next_id
             next_id += 1
 
         self.char_tokens = sorted(set(char_tokens), key=len, reverse=True)
@@ -94,11 +116,22 @@ class HybridTokenizer:
     def decode_token_value(self, token_id: int) -> str:
         if token_id == self.pad_token_id or token_id == self.eos_token_id:
             return ""
+        if token_id in self.leading_token_to_base:
+            return " " + self.decode_token_value(self.leading_token_to_base[token_id])
         if 0 <= token_id < BYTE_VOCAB_SIZE:
             return bytes([token_id]).decode("utf-8", errors="replace")
         if token_id not in self.id_to_token:
             raise ValueError(f"unknown token id {token_id}")
         return self.id_to_token[token_id]
+
+    def is_leading_space_token(self, token_id: int) -> bool:
+        return token_id in self.leading_token_to_base
+
+    def leading_space_token_id(self, token_id: int) -> int:
+        try:
+            return self.base_token_to_leading[token_id]
+        except KeyError as exc:
+            raise ValueError(f"token id {token_id} has no leading-space variant") from exc
 
     def match_literal(self, text: str, pos: int, tokens: list[str]) -> str | None:
         for token in tokens:
@@ -187,14 +220,50 @@ class HybridTokenizer:
             pieces=(TokenPiece(self.token_to_id[key], value, start, end, kind),),
         )
 
+    def apply_leading_space(self, segment: TokenSegment) -> TokenSegment:
+        pieces = list(segment.pieces)
+        first = pieces[0]
+        pieces[0] = TokenPiece(
+            self.leading_space_token_id(first.token_id),
+            first.text,
+            first.start,
+            first.end,
+            first.kind,
+        )
+        return TokenSegment(segment.text, segment.start, segment.end, segment.kind, tuple(pieces))
+
+    def space_segment(self, pos: int) -> TokenSegment:
+        return TokenSegment(" ", pos, pos + 1, "space", self.piece_fallback(" ", pos, "space"))
+
     def encode_segments(self, text: str, add_eos: bool = False) -> list[TokenSegment]:
         segments: list[TokenSegment] = []
         pos = 0
+        pending_leading_space = False
+
+        def append_segment(segment: TokenSegment):
+            nonlocal pending_leading_space
+            if pending_leading_space:
+                segment = self.apply_leading_space(segment)
+                pending_leading_space = False
+            segments.append(segment)
+
         while pos < len(text):
+            if text[pos] == " ":
+                end = pos + 1
+                while end < len(text) and text[end] == " ":
+                    end += 1
+                if end == len(text):
+                    segments.extend(self.space_segment(space_pos) for space_pos in range(pos, end))
+                else:
+                    segments.extend(self.space_segment(space_pos) for space_pos in range(pos, end - 1))
+                    pending_leading_space = True
+                pos = end
+                continue
+
             surface = self.match_literal(text, pos, self.surface_tokens)
             if surface is not None:
                 end = pos + len(surface)
-                segments.append(self.single_piece_segment(f"surface:{surface}", surface, pos, end, "surface"))
+                append_segment(self.single_piece_segment(f"surface:{surface}", surface, pos, end, "surface"))
                 pos = end
                 continue
 
@@ -204,40 +273,39 @@ class HybridTokenizer:
                 left_ok = pos == 0 or not text[pos - 1].isdigit()
                 right_ok = end == len(text) or not text[end].isdigit()
                 if left_ok and right_ok:
-                    segments.append(self.single_piece_segment(f"number:{numeric}", numeric, pos, end, "number"))
+                    append_segment(self.single_piece_segment(f"number:{numeric}", numeric, pos, end, "number"))
                     pos = end
                     continue
 
             common_word = self.match_standalone_word(text, pos)
             if common_word is not None:
                 end = pos + len(common_word)
-                segments.append(
-                    self.single_piece_segment(
-                        f"common_word:{common_word}",
-                        common_word,
-                        pos,
-                        end,
-                        "word",
-                    )
+                segment = self.single_piece_segment(
+                    f"common_word:{common_word}",
+                    common_word,
+                    pos,
+                    end,
+                    "word",
                 )
+                append_segment(segment)
                 pos = end
                 continue
 
             if text[pos] == ".":
                 name = self.dot_kind(text, pos)
-                segments.append(self.single_piece_segment(f"context:{name}", ".", pos, pos + 1, name.lower()))
+                append_segment(self.single_piece_segment(f"context:{name}", ".", pos, pos + 1, name.lower()))
                 pos += 1
                 continue
 
             if text[pos].isspace():
                 value = text[pos]
-                segments.append(TokenSegment(value, pos, pos + 1, "space", self.piece_fallback(value, pos, "space")))
+                append_segment(TokenSegment(value, pos, pos + 1, "space", self.piece_fallback(value, pos, "space")))
                 pos += 1
                 continue
 
             value, kind = self.plain_segment(text, pos)
             end = pos + len(value)
-            segments.append(TokenSegment(value, pos, end, kind, self.piece_fallback(value, pos, "piece")))
+            append_segment(TokenSegment(value, pos, end, kind, self.piece_fallback(value, pos, "piece")))
             pos = end
 
         if add_eos:
@@ -266,6 +334,15 @@ class HybridTokenizer:
                 continue
             if token_id == self.eos_token_id:
                 break
+            if token_id in self.leading_token_to_base:
+                base_id = self.leading_token_to_base[token_id]
+                flush_bytes()
+                output.append(" ")
+                if 0 <= base_id < BYTE_VOCAB_SIZE:
+                    byte_buffer.append(base_id)
+                else:
+                    output.append(self.decode_token_value(base_id))
+                continue
             if 0 <= token_id < BYTE_VOCAB_SIZE:
                 byte_buffer.append(token_id)
                 continue

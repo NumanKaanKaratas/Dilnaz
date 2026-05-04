@@ -11,75 +11,48 @@ from byte_trainer_utils import COMPILE_MODE_CHOICES, compile_forward, validate_c
 from models.configuration_dil import DilConfig
 from models.configuration_naz import NazConfig
 from models.modeling_naz import Naz
-from tokenization import HybridTokenizer
+from tokenization import HybridTokenizer, TokenSegment
 
 
-RIGHT_ATTACHED = set(".,;:!?%)]}")
-LEFT_ATTACHED = set("([{")
-CHECKPOINT_FORMAT_VERSION = 10
+CHECKPOINT_FORMAT_VERSION = 11
 
 
-def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[str]:
-    tokens = [
-        segment.text
+def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
+    segments = [
+        segment
         for segment in tokenizer.encode_segments(text)
-        if segment.kind != "space"
+        if segment.piece_len > 0
     ]
-    if not tokens:
+    if not segments:
         raise ValueError("text produced no tokens")
-    return tokens
+    return segments
 
 
-def join_tokens(tokens: list[str]) -> str:
-    text = ""
-    for token in tokens:
-        if not text:
-            text = token
-        elif token in RIGHT_ATTACHED:
-            text += token
-        elif text[-1] in LEFT_ATTACHED:
-            text += token
-        else:
-            text += " " + token
-    return text
-
-
-def format_next_token(current_text: str, token: str) -> str:
-    if not current_text:
-        return token
-    if token in RIGHT_ATTACHED:
-        return token
-    if current_text[-1] in LEFT_ATTACHED:
-        return token
-    return " " + token
-
-
-def make_batch(tokens: list[str], tokenizer: HybridTokenizer, config: NazConfig, device: torch.device):
+def make_batch(segments: list[TokenSegment], tokenizer: HybridTokenizer, config: NazConfig, device: torch.device):
     input_ids = torch.full(
-        (1, len(tokens), config.max_word_bytes),
+        (1, len(segments), config.max_word_bytes),
         config.pad_token_id,
         dtype=torch.long,
         device=device,
     )
     word_masks = torch.zeros(
-        (1, len(tokens), config.max_word_bytes),
+        (1, len(segments), config.max_word_bytes),
         dtype=torch.bool,
         device=device,
     )
     byte_lengths = []
-    for unit_idx, token in enumerate(tokens):
-        segment = tokenizer.encode_segments(token)[0]
+    for unit_idx, segment in enumerate(segments):
         token_ids = segment.token_ids
         if len(token_ids) > config.max_word_bytes:
             raise ValueError(
-                f"token {unit_idx} '{token}' has {len(token_ids)} pieces; "
+                f"token {unit_idx} {tokenizer.decode(token_ids)!r} has {len(token_ids)} pieces; "
                 f"max_word_bytes={config.max_word_bytes}"
             )
         ids = torch.tensor(token_ids, dtype=torch.long, device=device)
         input_ids[0, unit_idx, : ids.numel()] = ids
         word_masks[0, unit_idx, : ids.numel()] = True
         byte_lengths.append(ids.numel())
-    unit_mask = torch.ones((1, len(tokens)), dtype=torch.bool, device=device)
+    unit_mask = torch.ones((1, len(segments)), dtype=torch.bool, device=device)
     return input_ids, word_masks, unit_mask, byte_lengths
 
 
@@ -119,12 +92,12 @@ def generate_text(
     model: Naz,
     config: NazConfig,
     tokenizer: HybridTokenizer,
-    prompt_tokens: list[str],
+    prompt_segments: list[TokenSegment],
     device: torch.device,
     max_new_tokens: int,
     num_samples: int,
 ):
-    input_ids, word_masks, unit_mask, _ = make_batch(prompt_tokens, tokenizer, config, device)
+    input_ids, word_masks, unit_mask, _ = make_batch(prompt_segments, tokenizer, config, device)
     outputs = model.generate(
         input_ids=input_ids,
         word_masks=word_masks,
@@ -136,7 +109,7 @@ def generate_text(
         decode_token_ids(tokenizer, outputs.sequences[0, idx], outputs.word_masks[0, idx])
         for idx in range(outputs.sequences.shape[1])
     ]
-    return join_tokens(tokens)
+    return "".join(tokens)
 
 
 def parse_flush_schedule(value: str) -> list[int]:
@@ -151,15 +124,15 @@ def stream_text(
     model: Naz,
     config: NazConfig,
     tokenizer: HybridTokenizer,
-    prompt_tokens: list[str],
+    prompt_segments: list[TokenSegment],
     device: torch.device,
     max_new_tokens: int,
     num_samples: int,
     flush_schedule: list[int],
 ):
     del num_samples
-    input_ids, word_masks, unit_mask, _ = make_batch(prompt_tokens, tokenizer, config, device)
-    current_text = join_tokens(prompt_tokens)
+    input_ids, word_masks, unit_mask, _ = make_batch(prompt_segments, tokenizer, config, device)
+    current_text = tokenizer.decode([piece.token_id for segment in prompt_segments for piece in segment.pieces])
     sys.stdout.write(current_text)
     sys.stdout.flush()
 
@@ -177,10 +150,9 @@ def stream_text(
             token = decode_token_ids(tokenizer, token_ids[0, token_idx], masks[0, token_idx])
             if not token:
                 continue
-            piece = format_next_token(current_text, token)
-            sys.stdout.write(piece)
+            sys.stdout.write(token)
             sys.stdout.flush()
-            current_text += piece
+            current_text += token
         pending_latents.clear()
 
     with torch.inference_mode():
@@ -244,14 +216,14 @@ def main():
     text = args.text_file.read_text(encoding="utf-8") if args.text_file else args.text
     if text is None:
         raise ValueError("--text or --text-file is required")
-    tokens = tokenize_text(text, tokenizer)
+    segments = tokenize_text(text, tokenizer)
 
     if args.no_stream:
         generated_text = generate_text(
             model,
             config,
             tokenizer,
-            tokens,
+            segments,
             device,
             args.max_new_tokens,
             args.num_samples,
@@ -263,7 +235,7 @@ def main():
         model,
         config,
         tokenizer,
-        tokens,
+        segments,
         device,
         args.max_new_tokens,
         args.num_samples,

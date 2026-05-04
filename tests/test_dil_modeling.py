@@ -194,7 +194,7 @@ def test_naz_uses_dil_encoder_target_log_std(tmp_path):
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
-            "format_version": 7,
+            "format_version": dil_config.checkpoint_format_version,
             "model_state_dict": dil_model.state_dict(),
         },
         tmp_path / "checkpoint.pt",
@@ -241,7 +241,7 @@ def test_naz_input_uses_frozen_dil_semantic_embeddings(tmp_path):
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
-            "format_version": 7,
+            "format_version": dil_config.checkpoint_format_version,
             "model_state_dict": dil_model.state_dict(),
         },
         tmp_path / "checkpoint.pt",
@@ -292,7 +292,7 @@ def test_naz_distribution_head_outputs_mean_and_log_std(tmp_path):
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
-            "format_version": 7,
+            "format_version": dil_config.checkpoint_format_version,
             "model_state_dict": dil_model.state_dict(),
         },
         tmp_path / "checkpoint.pt",
@@ -315,7 +315,7 @@ def test_naz_hybrid_backbone_uses_native_layer_pattern(tmp_path):
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
-            "format_version": 7,
+            "format_version": dil_config.checkpoint_format_version,
             "model_state_dict": dil_model.state_dict(),
         },
         tmp_path / "checkpoint.pt",
@@ -342,7 +342,7 @@ def test_naz_hybrid_backbone_cache_matches_full_forward(tmp_path):
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
-            "format_version": 7,
+            "format_version": dil_config.checkpoint_format_version,
             "model_state_dict": dil_model.state_dict(),
         },
         tmp_path / "checkpoint.pt",
@@ -383,7 +383,7 @@ def test_naz_forward_samples_energy_from_predicted_distribution(tmp_path):
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
-            "format_version": 7,
+            "format_version": dil_config.checkpoint_format_version,
             "model_state_dict": dil_model.state_dict(),
         },
         tmp_path / "checkpoint.pt",
@@ -423,7 +423,7 @@ def test_naz_semantic_loop_generation_does_not_reencode_generated_tokens(tmp_pat
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
-            "format_version": 7,
+            "format_version": dil_config.checkpoint_format_version,
             "model_state_dict": dil_model.state_dict(),
         },
         tmp_path / "checkpoint.pt",
@@ -466,7 +466,7 @@ def test_naz_decode_latent_tokens_uses_chunked_batch_shape(tmp_path):
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
-            "format_version": 7,
+            "format_version": dil_config.checkpoint_format_version,
             "model_state_dict": dil_model.state_dict(),
         },
         tmp_path / "checkpoint.pt",

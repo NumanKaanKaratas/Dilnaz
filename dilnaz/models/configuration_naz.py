@@ -8,7 +8,7 @@ class NazConfig(PretrainedConfig):
         self,
         dil_path=None,
         byte_vocab_size=256,
-        vocab_size=355,
+        vocab_size=778,
         pad_token_id=256,
         eos_token_id=257,
         max_word_bytes=32,

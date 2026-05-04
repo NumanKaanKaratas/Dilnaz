@@ -7,7 +7,7 @@ class DilConfig(PretrainedConfig):
     def __init__(
         self,
         byte_vocab_size=256,
-        vocab_size=355,
+        vocab_size=778,
         pad_token_id=256,
         eos_token_id=257,
         hidden_size=512,
@@ -32,7 +32,7 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=7,
+        checkpoint_format_version=8,
         **kwargs,
     ):
         self.byte_vocab_size = byte_vocab_size
