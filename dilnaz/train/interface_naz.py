@@ -61,6 +61,56 @@ def decode_token_ids(tokenizer: HybridTokenizer, token_ids: torch.Tensor, token_
     return tokenizer.decode(ids)
 
 
+@torch.no_grad()
+def delayed_prompt_state(
+    model: Naz,
+    input_ids: torch.LongTensor,
+    word_masks: torch.Tensor,
+    unit_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    prompt_embeddings = model.semantic_embeddings(input_ids, word_masks, unit_mask)
+    sequence_length = prompt_embeddings.shape[1]
+    warmup_tokens = min(model.dil_config.context_radius, max(sequence_length - 1, 0))
+    prefill_length = sequence_length - warmup_tokens
+    forced_embeddings = prompt_embeddings[:, prefill_length : sequence_length - 1]
+    return prompt_embeddings[:, :prefill_length], forced_embeddings, warmup_tokens
+
+
+def generate_latent_steps(
+    model: Naz,
+    prefill_embeddings: torch.Tensor,
+    forced_embeddings: torch.Tensor,
+    step_count: int,
+):
+    outputs = model.transformer(
+        inputs_embeds=prefill_embeddings,
+        past_key_values=None,
+        use_cache=True,
+    )
+    past_key_values = outputs.past_key_values
+    hidden_state = outputs.last_hidden_state[:, -1, :]
+
+    for step_idx in range(step_count):
+        next_mean, next_log_std = model.generative_head.sample_distribution(hidden_state)
+        yield next_mean, next_log_std
+
+        if step_idx < forced_embeddings.shape[1]:
+            current_input_embeds = forced_embeddings[:, step_idx : step_idx + 1]
+        else:
+            current_input_embeds = model.student_core.embed_distribution(
+                next_mean,
+                next_log_std,
+            ).unsqueeze(1)
+
+        outputs = model.transformer(
+            inputs_embeds=current_input_embeds,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        hidden_state = outputs.last_hidden_state[:, -1, :]
+
+
 def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
     checkpoint_dir = checkpoint_dir.resolve()
     config = NazConfig.from_pretrained(checkpoint_dir)
@@ -98,18 +148,35 @@ def generate_text(
     num_samples: int,
 ):
     input_ids, word_masks, unit_mask, _ = make_batch(prompt_segments, tokenizer, config, device)
-    outputs = model.generate(
-        input_ids=input_ids,
-        word_masks=word_masks,
-        unit_mask=unit_mask,
-        max_new_tokens=max_new_tokens,
-        num_samples=num_samples,
+    del num_samples
+    prefill_embeddings, forced_embeddings, warmup_tokens = delayed_prompt_state(
+        model,
+        input_ids,
+        word_masks,
+        unit_mask,
     )
-    tokens = [
-        decode_token_ids(tokenizer, outputs.sequences[0, idx], outputs.word_masks[0, idx])
-        for idx in range(outputs.sequences.shape[1])
+    visible_latents = [
+        next_mean.squeeze(0)
+        for step_idx, (next_mean, _) in enumerate(
+            generate_latent_steps(
+                model,
+                prefill_embeddings,
+                forced_embeddings,
+                warmup_tokens + max_new_tokens,
+            )
+        )
+        if step_idx >= warmup_tokens
     ]
-    return "".join(tokens)
+    if not visible_latents:
+        return "".join(tokenizer.decode(segment.token_ids) for segment in prompt_segments)
+    latents = torch.stack(visible_latents, dim=0).unsqueeze(0)
+    token_ids, masks, _ = model.decode_latent_tokens(latents)
+    generated_tokens = [
+        decode_token_ids(tokenizer, token_ids[0, token_idx], masks[0, token_idx])
+        for token_idx in range(token_ids.shape[1])
+    ]
+    prompt_text = "".join(tokenizer.decode(segment.token_ids) for segment in prompt_segments)
+    return prompt_text + "".join(generated_tokens)
 
 
 def parse_flush_schedule(value: str) -> list[int]:
@@ -139,6 +206,12 @@ def stream_text(
     pending_latents = []
     schedule_idx = 0
     flush_size = flush_schedule[schedule_idx]
+    prefill_embeddings, forced_embeddings, warmup_tokens = delayed_prompt_state(
+        model,
+        input_ids,
+        word_masks,
+        unit_mask,
+    )
 
     def flush_pending():
         nonlocal current_text
@@ -156,23 +229,16 @@ def stream_text(
         pending_latents.clear()
 
     with torch.inference_mode():
-        current_input_embeds = model.semantic_embeddings(input_ids, word_masks, unit_mask)
-        past_key_values = None
-        for _ in range(max_new_tokens):
-            outputs = model.transformer(
-                inputs_embeds=current_input_embeds,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-            past_key_values = outputs.past_key_values
-            next_mean, next_log_std = model.generative_head.sample_distribution(
-                outputs.last_hidden_state[:, -1, :]
-            )
+        latent_steps = generate_latent_steps(
+            model,
+            prefill_embeddings,
+            forced_embeddings,
+            warmup_tokens + max_new_tokens,
+        )
+        for step_idx, (next_mean, _) in enumerate(latent_steps):
+            if step_idx < warmup_tokens:
+                continue
             pending_latents.append(next_mean.squeeze(0))
-            current_input_embeds = model.student_core.embed_distribution(
-                next_mean,
-                next_log_std,
-            ).unsqueeze(1)
 
             if len(pending_latents) >= flush_size:
                 flush_pending()
