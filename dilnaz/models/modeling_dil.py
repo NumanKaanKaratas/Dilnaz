@@ -67,12 +67,19 @@ class DilLayer(nn.Module):
         return residual + hidden_states
 
 
+def dil_context_attention_heads(hidden_size: int) -> int:
+    return next(heads for heads in (8, 4, 2, 1) if hidden_size % heads == 0)
+
+
 class DilEncoderCore(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.max_word_bytes = config.max_word_bytes
         self.context_size = config.context_size
+        self.target_index = config.target_index
         self.latent_size = config.latent_size
+        self.context_attention_heads = dil_context_attention_heads(config.hidden_size)
+        self.context_head_dim = config.hidden_size // self.context_attention_heads
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.encoder_layers = nn.ModuleList(
@@ -83,23 +90,26 @@ class DilEncoderCore(nn.Module):
             config.max_word_bytes * config.hidden_size,
             config.hidden_size,
         )
+        self.context_offset_embeddings = nn.Embedding(config.context_size, config.hidden_size)
         self.context_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.target_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.context_fusion = nn.Sequential(
-            nn.Linear(config.hidden_size * 4, config.hidden_size * 2),
-            nn.SiLU(),
-            nn.Linear(config.hidden_size * 2, config.hidden_size),
-        )
+        self.context_q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.context_k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.context_v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.context_out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.context_gate = nn.Linear(config.hidden_size * 4, config.hidden_size)
         self.hidden_to_latent = nn.Linear(config.hidden_size, config.latent_size * 2)
         self.norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        indices = torch.arange(config.context_size)
+        self.register_buffer("context_indices", indices[indices != self.target_index], persistent=False)
 
     def pooled_target_vector(
         self,
         hidden_states: torch.Tensor,
         word_masks: torch.Tensor,
     ) -> torch.Tensor:
-        target_states = hidden_states[:, -1]
-        target_masks = word_masks[:, -1].unsqueeze(-1).to(target_states.dtype)
+        target_states = hidden_states[:, self.target_index]
+        target_masks = word_masks[:, self.target_index].unsqueeze(-1).to(target_states.dtype)
         denom = target_masks.sum(dim=1).clamp_min(1.0)
         return (target_states * target_masks).sum(dim=1) / denom
 
@@ -108,28 +118,47 @@ class DilEncoderCore(nn.Module):
         token_states: torch.Tensor,
         token_mask: torch.Tensor,
     ) -> torch.Tensor:
-        target_state = token_states[:, -1]
-        context_states = token_states[:, :-1]
-        context_mask = token_mask[:, :-1]
+        target_state = token_states[:, self.target_index]
+        context_states = token_states.index_select(1, self.context_indices)
+        context_mask = token_mask.index_select(1, self.context_indices)
         if context_states.shape[1] == 0:
             return target_state
 
-        query = self.target_norm(target_state).unsqueeze(1)
-        keys = self.context_norm(context_states)
-        scores = (query * keys).sum(dim=-1) / (keys.shape[-1] ** 0.5)
+        batch_size = target_state.shape[0]
+        query = self.context_q_proj(self.target_norm(target_state)).reshape(
+            batch_size,
+            self.context_attention_heads,
+            self.context_head_dim,
+        )
+        keys = self.context_k_proj(self.context_norm(context_states)).reshape(
+            batch_size,
+            context_states.shape[1],
+            self.context_attention_heads,
+            self.context_head_dim,
+        )
+        values = self.context_v_proj(context_states).reshape(
+            batch_size,
+            context_states.shape[1],
+            self.context_attention_heads,
+            self.context_head_dim,
+        )
+        scores = torch.einsum("bhd,bchd->bhc", query, keys) / (self.context_head_dim ** 0.5)
+        context_mask = context_mask.unsqueeze(1)
         scores = scores.masked_fill(~context_mask, torch.finfo(scores.dtype).min)
-        attention = torch.softmax(scores, dim=-1).masked_fill(~context_mask, 0.0)
-        context_state = torch.sum(context_states * attention.unsqueeze(-1), dim=1)
-        fusion_input = torch.cat(
+        attention = torch.softmax(scores.float(), dim=-1).to(scores.dtype).masked_fill(~context_mask, 0.0)
+        context_delta = torch.einsum("bhc,bchd->bhd", attention, values).reshape(batch_size, -1)
+        context_delta = self.context_out_proj(context_delta)
+        gate_input = torch.cat(
             [
                 target_state,
-                context_state,
-                target_state * context_state,
-                target_state - context_state,
+                context_delta,
+                target_state * context_delta,
+                target_state - context_delta,
             ],
             dim=-1,
         )
-        return target_state + self.context_fusion(fusion_input)
+        gate = torch.sigmoid(self.context_gate(gate_input))
+        return target_state + gate * context_delta
 
     def forward(
         self,
@@ -160,6 +189,8 @@ class DilEncoderCore(nn.Module):
 
         hidden_states = hidden_states.reshape(batch_size, context_size, -1)
         token_states = self.token_squeeze(hidden_states)
+        offsets = torch.arange(context_size, device=token_states.device)
+        token_states = token_states + self.context_offset_embeddings(offsets).unsqueeze(0)
         token_mask = word_masks.any(dim=-1)
         hidden_states = self.target_conditioned_by_context(token_states, token_mask)
 

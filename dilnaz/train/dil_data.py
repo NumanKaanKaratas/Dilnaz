@@ -19,7 +19,7 @@ SENTENCE_CHUNK_PATTERN = re.compile(r".+?(?:[.!?]+(?:\s+|$)|\n+|$)", re.UNICODE 
 NLLB_LAYER_GROUPS = ((1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12))
 TEACHER_CENTERED_ADD_WEIGHT = 0.5
 NLLB_DEFAULT_MAX_ENCODER_TOKENS = 1024
-DILNAZ_READY_FORMAT = "dilnaz-ready-teacher-v1"
+DILNAZ_READY_FORMAT = "dilnaz-ready-teacher-v2"
 DILNAZ_READY_REQUIRED_COLUMNS = [
     "input_ids",
     "word_masks",
@@ -111,8 +111,9 @@ def validate_dilnaz_ready_parquet(path: Path, config: DilConfig, vocab_path: Pat
         "pad_token_id": config.pad_token_id,
         "eos_token_id": config.eos_token_id,
         "max_word_bytes": config.max_word_bytes,
-        "context_left_radius": config.context_left_radius,
+        "context_radius": config.context_radius,
         "context_size": config.context_size,
+        "target_index": config.target_index,
         "teacher_dim": 1024,
         "teacher_layer_count": len(NLLB_LAYER_GROUPS),
     }
@@ -214,6 +215,10 @@ def segment_piece_ids(segment: TokenSegment) -> list[int]:
     return [piece.token_id for piece in segment.pieces]
 
 
+def context_offsets(context_radius: int) -> range:
+    return range(-context_radius, context_radius + 1)
+
+
 def trainable_segments(tokenizer: HybridTokenizer, text: str, max_word_bytes: int) -> list[TokenSegment]:
     return [
         segment
@@ -270,7 +275,7 @@ class HybridDilBatchDataset(IterableDataset):
     ):
         super().__init__()
         self.train_file = train_file
-        self.context_left_radius = config.context_left_radius
+        self.context_radius = config.context_radius
         self.context_size = config.context_size
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
@@ -329,9 +334,8 @@ class HybridDilBatchDataset(IterableDataset):
             token_idx = ref.token_idx
             segment = segments[token_idx]
             source_line_ids[row_idx] = line_ids[ref.text_idx]
-            for context_idx, source_idx in enumerate(
-                range(token_idx - self.context_left_radius, token_idx + 1)
-            ):
+            for context_idx, offset in enumerate(context_offsets(self.context_radius)):
+                source_idx = token_idx + offset
                 if 0 <= source_idx < len(segments):
                     self.write_segment(input_ids, word_masks, row_idx, context_idx, segments[source_idx])
 

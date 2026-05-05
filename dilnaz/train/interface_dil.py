@@ -10,13 +10,13 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add
+from dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add, context_offsets
 from models.configuration_dil import DilConfig
 from models.modeling_dil import Dil
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 8
+CHECKPOINT_FORMAT_VERSION = 9
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -53,9 +53,8 @@ def make_batch(segments: list[TokenSegment], tokenizer: HybridTokenizer, config:
             )
         ids = torch.tensor(token_ids, dtype=torch.long, device=device)
         byte_lengths.append(ids.numel())
-        for context_idx, source_idx in enumerate(
-            range(row_idx - config.context_left_radius, row_idx + 1)
-        ):
+        for context_idx, offset in enumerate(context_offsets(config.context_radius)):
+            source_idx = row_idx + offset
             if source_idx < 0 or source_idx >= len(segments):
                 continue
             context_ids = segments[source_idx].token_ids

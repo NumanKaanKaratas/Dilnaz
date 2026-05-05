@@ -184,20 +184,23 @@ def build_resident_semantic_cache(
     lengths = surface_batcher.lengths
     token_count = surface_batcher.token_count
     positions = surface_batcher.positions.reshape(1, 1, surface_batcher.max_word_bytes)
-    context_left_radius = model.dil_config.context_left_radius
+    context_radius = model.dil_config.context_radius
     means = []
     log_stds = []
     for start in range(0, token_count, chunk_tokens):
         end = min(start + chunk_tokens, token_count)
-        prefix_start = max(0, start - context_left_radius)
-        ids = byte_ids[prefix_start:end].unsqueeze(0)
-        token_lengths = lengths[prefix_start:end].reshape(1, -1, 1)
+        context_start = max(0, start - context_radius)
+        context_end = min(end + context_radius, token_count)
+        ids = byte_ids[context_start:context_end].unsqueeze(0)
+        token_lengths = lengths[context_start:context_end].reshape(1, -1, 1)
         masks = positions < token_lengths
         unit_mask = torch.ones(ids.shape[:2], dtype=torch.bool, device=ids.device)
         with autocast_context(autocast_enabled):
             mean, log_std = model.latent_distribution(ids, masks, unit_mask)
-        mean = mean.reshape(1, end - prefix_start, -1)[:, start - prefix_start :]
-        log_std = log_std.reshape(1, end - prefix_start, -1)[:, start - prefix_start :]
+        local_start = start - context_start
+        local_end = local_start + end - start
+        mean = mean.reshape(1, context_end - context_start, -1)[:, local_start:local_end]
+        log_std = log_std.reshape(1, context_end - context_start, -1)[:, local_start:local_end]
         means.append(mean.squeeze(0).float())
         log_stds.append(log_std.squeeze(0).float())
     mean_cache = torch.cat(means, dim=0)

@@ -1,15 +1,19 @@
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz" / "train"))
 
 from models.configuration_dil import DilConfig
 from models.configuration_naz import NazConfig
 from models.modeling_dil import Dil, DilGatedMLP, DilRMSNorm
 from models.modeling_naz import Naz
 from models.naz_backbone import SemanticDeltaMixer, SemanticGlobalAttention, ZeroCenteredRMSNorm
+from naz_data import ResidentNazBatcher
+from train_naz import build_resident_semantic_cache
 
 
 def grad_abs_sum(parameter: torch.nn.Parameter) -> float:
@@ -29,7 +33,7 @@ def tiny_config() -> DilConfig:
         num_decoder_layers=2,
         latent_size=16,
         max_word_bytes=4,
-        context_left_radius=2,
+        context_radius=2,
         dil_dropout=0.0,
     )
 
@@ -61,13 +65,23 @@ def tiny_naz_config(tmp_path, dil_config: DilConfig) -> NazConfig:
     )
 
 
+def test_dil_config_uses_symmetric_context_contract():
+    config = tiny_config()
+
+    assert config.context_radius == 2
+    assert config.context_size == 5
+    assert config.target_index == 2
+    assert config.checkpoint_format_version == 9
+    assert not hasattr(config, "context_left_radius")
+
+
 def test_dil_forward_keeps_target_latent_shape():
     config = tiny_config()
     model = Dil(config)
     input_ids = torch.tensor(
         [
-            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0]],
-            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0]],
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
         ],
         dtype=torch.long,
     )
@@ -99,7 +113,7 @@ def test_dil_forward_keeps_target_latent_shape():
     assert torch.isfinite(outputs.loss)
 
 
-def test_dil_encoder_conditions_target_with_left_context():
+def test_dil_encoder_conditions_target_with_symmetric_context():
     config = tiny_config()
     model = Dil(config).eval()
     target = torch.tensor([5, 6, 7, 0], dtype=torch.long)
@@ -110,13 +124,17 @@ def test_dil_encoder_conditions_target_with_left_context():
                     torch.tensor([2, 0, 0, 0]),
                     torch.tensor([3, 4, 0, 0]),
                     target,
+                    torch.tensor([14, 0, 0, 0]),
+                    torch.tensor([15, 0, 0, 0]),
                 ]
             ),
             torch.stack(
                 [
-                    torch.tensor([8, 0, 0, 0]),
-                    torch.tensor([9, 10, 0, 0]),
+                    torch.tensor([2, 0, 0, 0]),
+                    torch.tensor([3, 4, 0, 0]),
                     target,
+                    torch.tensor([16, 0, 0, 0]),
+                    torch.tensor([17, 0, 0, 0]),
                 ]
             ),
         ]
@@ -130,13 +148,47 @@ def test_dil_encoder_conditions_target_with_left_context():
     assert not torch.allclose(mean[0], mean[1])
 
 
+def test_dil_encoder_uses_offset_order_for_context():
+    config = tiny_config()
+    model = Dil(config).eval()
+    target = torch.tensor([5, 6, 7, 0], dtype=torch.long)
+    input_ids = torch.stack(
+        [
+            torch.stack(
+                [
+                    torch.tensor([2, 0, 0, 0]),
+                    torch.tensor([3, 0, 0, 0]),
+                    target,
+                    torch.tensor([4, 0, 0, 0]),
+                    torch.tensor([5, 0, 0, 0]),
+                ]
+            ),
+            torch.stack(
+                [
+                    torch.tensor([5, 0, 0, 0]),
+                    torch.tensor([4, 0, 0, 0]),
+                    target,
+                    torch.tensor([3, 0, 0, 0]),
+                    torch.tensor([2, 0, 0, 0]),
+                ]
+            ),
+        ]
+    )
+    word_masks = input_ids.ne(config.pad_token_id)
+
+    with torch.no_grad():
+        mean, _ = torch.chunk(model.encoder(input_ids=input_ids, word_masks=word_masks), 2, dim=-1)
+
+    assert not torch.allclose(mean[0], mean[1])
+
+
 def test_reconstruction_loss_updates_vae_encoder():
     config = tiny_config()
     model = Dil(config)
     input_ids = torch.tensor(
         [
-            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0]],
-            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0]],
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
         ],
         dtype=torch.long,
     )
@@ -163,8 +215,8 @@ def test_semantic_losses_update_semantic_encoder():
     model = Dil(config)
     input_ids = torch.tensor(
         [
-            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0]],
-            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0]],
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
         ],
         dtype=torch.long,
     )
@@ -181,6 +233,8 @@ def test_semantic_losses_update_semantic_encoder():
     (outputs.kl_loss * config.kl_weight + outputs.distill_loss).backward()
 
     assert model.encoder.embed_tokens.weight.grad is not None
+    assert model.encoder.context_q_proj.weight.grad is not None
+    assert model.encoder.context_gate.weight.grad is not None
     assert model.decoder.latent_to_hidden.weight.grad is None
 
 
@@ -458,6 +512,62 @@ def test_naz_semantic_loop_generation_does_not_reencode_generated_tokens(tmp_pat
     assert outputs.generated_mean.shape == (1, 4, dil_config.latent_size)
     assert outputs.generated_log_std.shape == (1, 4, dil_config.latent_size)
     assert outputs.generated_lengths.shape == (1, 4)
+
+
+def test_resident_semantic_cache_matches_full_symmetric_context_pass(tmp_path):
+    dil_config = tiny_config()
+    dil_model = Dil(dil_config)
+    dil_config.save_pretrained(tmp_path)
+    torch.save(
+        {
+            "format_version": dil_config.checkpoint_format_version,
+            "model_state_dict": dil_model.state_dict(),
+        },
+        tmp_path / "checkpoint.pt",
+    )
+    naz_config = tiny_naz_config(tmp_path, dil_config)
+    model = Naz(naz_config).eval()
+    byte_ids = torch.tensor(
+        [
+            [2, 0, 0, 0],
+            [3, 4, 0, 0],
+            [5, 6, 7, 0],
+            [8, 0, 0, 0],
+            [9, 10, 0, 0],
+            [11, 12, 13, 0],
+        ],
+        dtype=torch.long,
+    )
+    lengths = byte_ids.ne(dil_config.pad_token_id).sum(dim=-1)
+    ids_path = tmp_path / "ids.npy"
+    lengths_path = tmp_path / "lengths.npy"
+    np.save(ids_path, byte_ids.numpy())
+    np.save(lengths_path, lengths.numpy())
+    batcher = ResidentNazBatcher(
+        ids_path,
+        lengths_path,
+        token_count=byte_ids.shape[0],
+        config=dil_config,
+        sequence_length=3,
+        batch_size=1,
+        device=torch.device("cpu"),
+        seed=1,
+    )
+
+    semantic_states, mean_cache, log_std_cache = build_resident_semantic_cache(
+        model,
+        batcher,
+        chunk_tokens=2,
+        autocast_enabled=False,
+    )
+    positions = torch.arange(dil_config.max_word_bytes).reshape(1, 1, -1)
+    masks = positions < lengths.reshape(1, -1, 1)
+    unit_mask = torch.ones((1, byte_ids.shape[0]), dtype=torch.bool)
+    full_mean, full_log_std = model.latent_distribution(byte_ids.unsqueeze(0), masks, unit_mask)
+
+    assert torch.allclose(mean_cache, full_mean.reshape(byte_ids.shape[0], -1))
+    assert torch.allclose(log_std_cache, full_log_std.reshape(byte_ids.shape[0], -1))
+    assert torch.allclose(semantic_states, torch.cat((mean_cache, log_std_cache), dim=-1))
 
 
 def test_naz_decode_latent_tokens_uses_chunked_batch_shape(tmp_path):

@@ -16,7 +16,7 @@ class DilConfig(PretrainedConfig):
         num_decoder_layers=2,
         latent_size=128,
         max_word_bytes=32,
-        context_left_radius=2,
+        context_radius=2,
         dil_dropout=0.15,
         kl_clamp=0.5,
         kl_weight=1e-3,
@@ -32,9 +32,15 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=8,
+        checkpoint_format_version=9,
         **kwargs,
     ):
+        if "context_left_radius" in kwargs:
+            raise ValueError("context_left_radius is not supported; use context_radius")
+        kwargs.pop("context_size", None)
+        kwargs.pop("target_index", None)
+        if context_radius < 0:
+            raise ValueError("context_radius must be >= 0")
         self.byte_vocab_size = byte_vocab_size
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
@@ -45,8 +51,9 @@ class DilConfig(PretrainedConfig):
         self.num_decoder_layers = num_decoder_layers
         self.latent_size = latent_size
         self.max_word_bytes = max_word_bytes
-        self.context_left_radius = context_left_radius
-        self.context_size = context_left_radius + 1
+        self.context_radius = context_radius
+        self.context_size = context_radius * 2 + 1
+        self.target_index = context_radius
         self.dil_dropout = dil_dropout
         self.kl_clamp = kl_clamp
         self.kl_weight = kl_weight

@@ -45,7 +45,7 @@ from models.modeling_dil import Dil
 from tokenization import default_vocab_path
 
 
-CHECKPOINT_FORMAT_VERSION = 8
+CHECKPOINT_FORMAT_VERSION = 9
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -115,7 +115,8 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "pad_token_id": config.pad_token_id,
         "eos_token_id": config.eos_token_id,
         "max_word_bytes": config.max_word_bytes,
-        "context_left_radius": config.context_left_radius,
+        "context_radius": config.context_radius,
+        "target_index": config.target_index,
         "latent_size": config.latent_size,
         "ce_weight": config.ce_weight,
         "distillation_weight": config.distillation_weight,
@@ -162,9 +163,15 @@ def restore_checkpoint(path: Path, model, optimizer, scheduler, device: torch.de
     if checkpoint["format_version"] != CHECKPOINT_FORMAT_VERSION:
         raise ValueError(f"unsupported checkpoint format_version={checkpoint.get('format_version')}")
     model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    restore_rng_state(checkpoint["rng_state"])
+    optimizer_state = checkpoint.get("optimizer_state_dict")
+    scheduler_state = checkpoint.get("scheduler_state_dict")
+    rng = checkpoint.get("rng_state")
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+    if scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
+    if rng is not None:
+        restore_rng_state(rng)
     training_state = checkpoint["training_state"]
     return int(training_state["step"]), dict(training_state["metrics"])
 
@@ -307,7 +314,7 @@ def parse_args():
     parser.add_argument("--num-decoder-layers", type=int, default=DIL_MODEL_DEFAULTS["num_decoder_layers"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
     parser.add_argument("--max-word-bytes", type=int, default=DIL_MODEL_DEFAULTS["max_word_bytes"])
-    parser.add_argument("--context-left-radius", type=int, default=DIL_MODEL_DEFAULTS["context_left_radius"])
+    parser.add_argument("--context-radius", type=int, default=DIL_MODEL_DEFAULTS["context_radius"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
     parser.add_argument("--kl-clamp", type=float, default=DIL_MODEL_DEFAULTS["kl_clamp"])
     parser.add_argument("--kl-weight", type=float, default=DIL_MODEL_DEFAULTS["kl_weight"])
@@ -335,8 +342,8 @@ def validate_args(args):
         raise ValueError("--ce-weight must be > 0")
     if args.text_read_chars <= 0:
         raise ValueError("--text-read-chars must be > 0")
-    if args.context_left_radius < 0:
-        raise ValueError("--context-left-radius must be >= 0")
+    if args.context_radius < 0:
+        raise ValueError("--context-radius must be >= 0")
     if args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
     if args.prefetch_factor <= 0:
@@ -368,7 +375,7 @@ def build_config(args, tokenizer):
         num_decoder_layers=args.num_decoder_layers,
         latent_size=args.latent_size,
         max_word_bytes=args.max_word_bytes,
-        context_left_radius=args.context_left_radius,
+        context_radius=args.context_radius,
         dil_dropout=args.dil_dropout,
         kl_clamp=args.kl_clamp,
         kl_weight=args.kl_weight,

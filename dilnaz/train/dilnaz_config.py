@@ -8,7 +8,7 @@ DIL_MODEL_DEFAULTS = {
     "num_decoder_layers": 4,
     "latent_size": 128,
     "max_word_bytes": 32,
-    "context_left_radius": 2,
+    "context_radius": 2,
     "dil_dropout": 0.15,
     "kl_clamp": 0.5,
     "kl_weight": 1e-3,

@@ -303,7 +303,7 @@ class Naz(PreTrainedModel):
         unit_mask: torch.Tensor,
     ) -> tuple[torch.LongTensor, torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, byte_width = target_input_ids.shape
-        context_left_radius = self.dil_config.context_left_radius
+        context_radius = self.dil_config.context_radius
         context_size = self.dil_config.context_size
         context_ids = torch.full(
             (batch_size, sequence_length, context_size, byte_width),
@@ -316,10 +316,13 @@ class Naz(PreTrainedModel):
             dtype=target_word_masks.dtype,
             device=target_word_masks.device,
         )
-        for context_idx, offset in enumerate(range(-context_left_radius, 1)):
+        for context_idx, offset in enumerate(range(-context_radius, context_radius + 1)):
             if offset < 0:
                 dst = slice(-offset, sequence_length)
                 src = slice(0, sequence_length + offset)
+            elif offset > 0:
+                dst = slice(0, sequence_length - offset)
+                src = slice(offset, sequence_length)
             else:
                 dst = slice(0, sequence_length)
                 src = slice(0, sequence_length)

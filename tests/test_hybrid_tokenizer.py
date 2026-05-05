@@ -186,11 +186,16 @@ def test_dil_batch_labels_decode_with_tokenizer_contract():
     )
 
     decoded_labels = []
+    decoded_targets = []
     for row in batch["labels"]:
         ids = [int(token_id) for token_id in row.tolist() if int(token_id) != -100]
         decoded_labels.append(tokenizer.decode(ids))
+    for row in batch["input_ids"][:, config.target_index]:
+        ids = [int(token_id) for token_id in row.tolist() if int(token_id) != tokenizer.pad_token_id]
+        decoded_targets.append(tokenizer.decode(ids))
 
     assert "".join(decoded_labels) == text
+    assert decoded_targets == decoded_labels
     sayilari = next(segment for segment in segments if segment.text == "sayıları")
     assert tokenizer.is_leading_space_token(sayilari.token_ids[0])
     assert sayilari.start == text.index("sayıları")
