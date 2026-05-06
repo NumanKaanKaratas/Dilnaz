@@ -37,7 +37,7 @@ from models.configuration_dil import DilConfig
 from models.modeling_dil import Dil
 
 
-CHECKPOINT_FORMAT_VERSION = 11
+CHECKPOINT_FORMAT_VERSION = 12
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 

@@ -45,7 +45,7 @@ from models.modeling_dil import Dil
 from tokenization import default_vocab_path
 
 
-CHECKPOINT_FORMAT_VERSION = 11
+CHECKPOINT_FORMAT_VERSION = 12
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 

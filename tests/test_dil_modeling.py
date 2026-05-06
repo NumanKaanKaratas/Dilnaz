@@ -66,13 +66,13 @@ def tiny_naz_config(tmp_path, dil_config: DilConfig) -> NazConfig:
     )
 
 
-def test_dil_config_uses_symmetric_context_contract():
+def test_dil_config_uses_left_context_contract():
     config = tiny_config()
 
     assert config.context_radius == 2
-    assert config.context_size == 5
+    assert config.context_size == 3
     assert config.target_index == 2
-    assert config.checkpoint_format_version == 11
+    assert config.checkpoint_format_version == 12
     assert not hasattr(config, "context_left_radius")
 
 
@@ -81,8 +81,8 @@ def test_dil_forward_keeps_target_latent_shape():
     model = Dil(config)
     input_ids = torch.tensor(
         [
-            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
-            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0]],
         ],
         dtype=torch.long,
     )
@@ -115,7 +115,7 @@ def test_dil_forward_keeps_target_latent_shape():
     assert torch.isfinite(outputs.loss)
 
 
-def test_dil_encoder_conditions_target_with_symmetric_context():
+def test_dil_encoder_conditions_target_with_left_context():
     config = tiny_config()
     model = Dil(config).eval()
     target = torch.tensor([5, 6, 7, 0], dtype=torch.long)
@@ -126,17 +126,13 @@ def test_dil_encoder_conditions_target_with_symmetric_context():
                     torch.tensor([2, 0, 0, 0]),
                     torch.tensor([3, 4, 0, 0]),
                     target,
-                    torch.tensor([14, 0, 0, 0]),
-                    torch.tensor([15, 0, 0, 0]),
                 ]
             ),
             torch.stack(
                 [
-                    torch.tensor([2, 0, 0, 0]),
-                    torch.tensor([3, 4, 0, 0]),
-                    target,
                     torch.tensor([16, 0, 0, 0]),
                     torch.tensor([17, 0, 0, 0]),
+                    target,
                 ]
             ),
         ]
@@ -161,17 +157,13 @@ def test_dil_encoder_uses_offset_order_for_context():
                     torch.tensor([2, 0, 0, 0]),
                     torch.tensor([3, 0, 0, 0]),
                     target,
-                    torch.tensor([4, 0, 0, 0]),
-                    torch.tensor([5, 0, 0, 0]),
                 ]
             ),
             torch.stack(
                 [
-                    torch.tensor([5, 0, 0, 0]),
-                    torch.tensor([4, 0, 0, 0]),
-                    target,
                     torch.tensor([3, 0, 0, 0]),
                     torch.tensor([2, 0, 0, 0]),
+                    target,
                 ]
             ),
         ]
@@ -189,8 +181,8 @@ def test_reconstruction_loss_updates_vae_encoder():
     model = Dil(config)
     input_ids = torch.tensor(
         [
-            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
-            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0]],
         ],
         dtype=torch.long,
     )
@@ -216,8 +208,8 @@ def test_semantic_losses_update_semantic_encoder():
     model = Dil(config)
     input_ids = torch.tensor(
         [
-            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
-            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0]],
         ],
         dtype=torch.long,
     )
@@ -244,8 +236,8 @@ def test_writer_only_step_freezes_encoder_and_trains_separate_writer():
     model = Dil(config)
     input_ids = torch.tensor(
         [
-            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
-            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0]],
         ],
         dtype=torch.long,
     )
@@ -566,7 +558,7 @@ def test_naz_semantic_loop_generation_does_not_reencode_generated_tokens(tmp_pat
     assert outputs.roundtrip_cosine is None
 
 
-def test_resident_semantic_cache_matches_full_symmetric_context_pass(tmp_path):
+def test_resident_semantic_cache_matches_full_left_context_pass(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
     dil_config.save_pretrained(tmp_path)

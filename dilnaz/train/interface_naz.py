@@ -14,7 +14,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 12
+CHECKPOINT_FORMAT_VERSION = 13
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -70,10 +70,8 @@ def delayed_prompt_state(
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     prompt_embeddings = model.semantic_embeddings(input_ids, word_masks, unit_mask)
     sequence_length = prompt_embeddings.shape[1]
-    warmup_tokens = min(model.dil_config.context_radius, max(sequence_length - 1, 0))
-    prefill_length = sequence_length - warmup_tokens
-    forced_embeddings = prompt_embeddings[:, prefill_length : sequence_length - 1]
-    return prompt_embeddings[:, :prefill_length], forced_embeddings, warmup_tokens
+    forced_embeddings = prompt_embeddings[:, sequence_length:sequence_length]
+    return prompt_embeddings, forced_embeddings, 0
 
 
 def generate_latent_steps(

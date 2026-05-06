@@ -41,7 +41,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer
 
 
-CHECKPOINT_FORMAT_VERSION = 12
+CHECKPOINT_FORMAT_VERSION = 13
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -191,7 +191,7 @@ def build_resident_semantic_cache(
     for start in range(0, token_count, chunk_tokens):
         end = min(start + chunk_tokens, token_count)
         context_start = max(0, start - context_radius)
-        context_end = min(end + context_radius, token_count)
+        context_end = end
         ids = byte_ids[context_start:context_end].unsqueeze(0)
         token_lengths = lengths[context_start:context_end].reshape(1, -1, 1)
         masks = positions < token_lengths

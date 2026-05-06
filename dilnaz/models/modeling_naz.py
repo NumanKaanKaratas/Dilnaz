@@ -318,13 +318,10 @@ class Naz(PreTrainedModel):
             dtype=target_word_masks.dtype,
             device=target_word_masks.device,
         )
-        for context_idx, offset in enumerate(range(-context_radius, context_radius + 1)):
+        for context_idx, offset in enumerate(range(-context_radius, 1)):
             if offset < 0:
                 dst = slice(-offset, sequence_length)
                 src = slice(0, sequence_length + offset)
-            elif offset > 0:
-                dst = slice(0, sequence_length - offset)
-                src = slice(offset, sequence_length)
             else:
                 dst = slice(0, sequence_length)
                 src = slice(0, sequence_length)

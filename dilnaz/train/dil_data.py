@@ -215,7 +215,7 @@ def segment_piece_ids(segment: TokenSegment) -> list[int]:
 
 
 def context_offsets(context_radius: int) -> range:
-    return range(-context_radius, context_radius + 1)
+    return range(-context_radius, 1)
 
 
 def trainable_segments(tokenizer: HybridTokenizer, text: str, max_word_bytes: int) -> list[TokenSegment]:

@@ -243,9 +243,9 @@ def test_migrate_dil_context_checkpoint_writes_v2_model_checkpoint(tmp_path):
     migrated_model = Dil(migrated_config)
     migrated_model.load_state_dict(checkpoint["model_state_dict"])
 
-    assert migrated_config.context_size == 3
+    assert migrated_config.context_size == 2
     assert migrated_config.target_index == 1
-    assert checkpoint["format_version"] == 11
+    assert checkpoint["format_version"] == 12
     assert checkpoint["optimizer_state_dict"] is None
     assert checkpoint["training_state"]["step"] == 0
     assert checkpoint["training_state"]["migrated_from_step"] == 123

@@ -37,7 +37,7 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=11,
+        checkpoint_format_version=12,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:
@@ -57,7 +57,7 @@ class DilConfig(PretrainedConfig):
         self.latent_size = latent_size
         self.max_word_bytes = max_word_bytes
         self.context_radius = context_radius
-        self.context_size = context_radius * 2 + 1
+        self.context_size = context_radius + 1
         self.target_index = context_radius
         self.dil_dropout = dil_dropout
         self.kl_clamp = kl_clamp

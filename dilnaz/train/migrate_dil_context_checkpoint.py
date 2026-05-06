@@ -14,7 +14,7 @@ from models.modeling_dil import Dil  # noqa: E402
 
 
 SOURCE_FORMAT_VERSION = 8
-TARGET_FORMAT_VERSION = 11
+TARGET_FORMAT_VERSION = 12
 
 
 def load_json(path: Path) -> dict:
