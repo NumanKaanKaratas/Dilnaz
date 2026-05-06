@@ -45,7 +45,7 @@ from models.modeling_dil import Dil
 from tokenization import default_vocab_path
 
 
-CHECKPOINT_FORMAT_VERSION = 9
+CHECKPOINT_FORMAT_VERSION = 11
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -120,6 +120,8 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "latent_size": config.latent_size,
         "ce_weight": config.ce_weight,
         "distillation_weight": config.distillation_weight,
+        "semantic_normalizer_momentum": config.semantic_normalizer_momentum,
+        "semantic_normalizer_z_clip": config.semantic_normalizer_z_clip,
     }
 
 
@@ -186,7 +188,6 @@ def model_inputs(batch: dict) -> dict:
         "input_ids": batch["input_ids"],
         "word_masks": batch["word_masks"],
         "labels": batch["labels"],
-        "length_labels": batch["length_labels"],
         "teacher_layers": batch["teacher_layers"],
         "teacher_mask": batch["teacher_mask"],
     }
@@ -199,7 +200,6 @@ def evaluate(model, eval_loader, teacher, device, autocast_enabled: bool, cuda_p
         "loss": 0.0,
         "ce": 0.0,
         "ce_weighted": 0.0,
-        "len": 0.0,
         "kl": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
@@ -208,7 +208,6 @@ def evaluate(model, eval_loader, teacher, device, autocast_enabled: bool, cuda_p
         "geom_mean": 0.0,
         "var": 0.0,
         "byte_acc": 0.0,
-        "len_acc": 0.0,
         "batches": 0,
     }
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
@@ -223,7 +222,6 @@ def evaluate(model, eval_loader, teacher, device, autocast_enabled: bool, cuda_p
         total["loss"] += float(outputs.loss.detach().cpu())
         total["ce"] += float(outputs.ce_loss.detach().cpu())
         total["ce_weighted"] += float((outputs.ce_loss * model.config.ce_weight).detach().cpu())
-        total["len"] += float(outputs.length_loss.detach().cpu())
         total["kl"] += float(outputs.kl_loss.detach().cpu())
         layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
         for idx in range(4):
@@ -231,7 +229,6 @@ def evaluate(model, eval_loader, teacher, device, autocast_enabled: bool, cuda_p
         total["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
         total["var"] += float(outputs.variance_loss.detach().cpu())
         total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
-        total["len_acc"] += float(outputs.length_acc.detach().cpu())
         total["batches"] += 1
         if batch_idx >= max_batches:
             break
@@ -247,10 +244,8 @@ def format_log(step, metrics):
         f"loss={metrics['loss']:.4f}",
         f"ce={metrics['ce']:.4f}",
         f"ce_w={metrics['ce_weighted']:.4f}",
-        f"len={metrics['len']:.4f}",
         f"kl={metrics['kl']:.2f}",
         f"kl_w={metrics['kl_weighted']:.4f}",
-        f"len_w={metrics['length_weighted']:.4f}",
         f"geom_l1={metrics['geom_l1']:.4f}",
         f"geom_l2={metrics['geom_l2']:.4f}",
         f"geom_l3={metrics['geom_l3']:.4f}",
@@ -258,7 +253,6 @@ def format_log(step, metrics):
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
-        f"len_acc={metrics['len_acc']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -323,7 +317,11 @@ def parse_args():
     parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
-    parser.add_argument("--length-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["length_loss_weight"])
+    parser.add_argument("--semantic-normalizer-momentum", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_momentum"])
+    parser.add_argument("--semantic-normalizer-eps", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_eps"])
+    parser.add_argument("--semantic-normalizer-z-clip", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_z_clip"])
+    parser.add_argument("--normalized-log-std-min", type=float, default=DIL_MODEL_DEFAULTS["normalized_log_std_min"])
+    parser.add_argument("--normalized-log-std-max", type=float, default=DIL_MODEL_DEFAULTS["normalized_log_std_max"])
     parser.add_argument("--nllb-model-name", default="facebook/nllb-200-distilled-600M")
     parser.add_argument("--nllb-src-lang", default="tur_Latn")
     return parser.parse_args()
@@ -356,6 +354,14 @@ def validate_args(args):
         raise ValueError("--max-eval-batches must be > 0")
     if args.data_mode == "resident" and args.max_samples > 0:
         raise ValueError("--max-samples is not supported with --data-mode resident")
+    if args.semantic_normalizer_momentum <= 0.0 or args.semantic_normalizer_momentum > 1.0:
+        raise ValueError("--semantic-normalizer-momentum must be in (0, 1]")
+    if args.semantic_normalizer_eps <= 0.0:
+        raise ValueError("--semantic-normalizer-eps must be > 0")
+    if args.semantic_normalizer_z_clip <= 0.0:
+        raise ValueError("--semantic-normalizer-z-clip must be > 0")
+    if args.normalized_log_std_min >= args.normalized_log_std_max:
+        raise ValueError("--normalized-log-std-min must be smaller than --normalized-log-std-max")
 
 
 def is_parquet_path(path: Path | None) -> bool:
@@ -384,7 +390,11 @@ def build_config(args, tokenizer):
         layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
-        length_loss_weight=args.length_loss_weight,
+        semantic_normalizer_momentum=args.semantic_normalizer_momentum,
+        semantic_normalizer_eps=args.semantic_normalizer_eps,
+        semantic_normalizer_z_clip=args.semantic_normalizer_z_clip,
+        normalized_log_std_min=args.normalized_log_std_min,
+        normalized_log_std_max=args.normalized_log_std_max,
         tokenizer_vocab_file=args.tokenizer_vocab.name,
         nllb_model_name=args.nllb_model_name,
         nllb_src_lang=args.nllb_src_lang,
@@ -578,10 +588,8 @@ def main():
         "loss": 0.0,
         "ce": 0.0,
         "ce_weighted": 0.0,
-        "len": 0.0,
         "kl": 0.0,
         "kl_weighted": 0.0,
-        "length_weighted": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
         "geom_l3": 0.0,
@@ -589,7 +597,6 @@ def main():
         "geom_mean": 0.0,
         "var": 0.0,
         "byte_acc": 0.0,
-        "len_acc": 0.0,
     }
     completed_step = start_step
     current_batch = None
@@ -651,19 +658,14 @@ def main():
             metric_sums["loss"] += float(outputs.loss.detach().cpu())
             metric_sums["ce"] += float(outputs.ce_loss.detach().cpu())
             metric_sums["ce_weighted"] += float((outputs.ce_loss * config.ce_weight).detach().cpu())
-            metric_sums["len"] += float(outputs.length_loss.detach().cpu())
             metric_sums["kl"] += float(outputs.kl_loss.detach().cpu())
             metric_sums["kl_weighted"] += float((outputs.kl_loss * config.kl_weight).detach().cpu())
-            metric_sums["length_weighted"] += float(
-                (outputs.length_loss * config.length_loss_weight).detach().cpu()
-            )
             layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
             for idx in range(4):
                 metric_sums[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
             metric_sums["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
             metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
             metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
-            metric_sums["len_acc"] += float(outputs.length_acc.detach().cpu())
 
             should_log = step % args.log_every == 0 or step == start_step + 1 or step == args.max_steps
             should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0

@@ -43,7 +43,11 @@ def tiny_parallel_config(tokenizer) -> DilConfig:
 def decoded_labels(tokenizer, labels: torch.Tensor) -> list[str]:
     rows = []
     for row in labels:
-        ids = [int(token_id) for token_id in row.tolist() if int(token_id) != -100]
+        ids = [
+            int(token_id)
+            for token_id in row.tolist()
+            if int(token_id) not in (-100, tokenizer.eos_token_id)
+        ]
         rows.append(tokenizer.decode(ids))
     return rows
 
@@ -92,6 +96,35 @@ def test_parallel_batch_keeps_pair_rows_together_and_decodes_surfaces(tmp_path):
     assert target_slot_surfaces == surfaces
     assert batch["row_pair_indices"].unique().tolist() == [0]
     assert set(batch["row_side_ids"].tolist()) == {0, 1}
+
+
+def test_parallel_batches_fill_fixed_training_shape(tmp_path):
+    data_file = tmp_path / "tr-en.txt"
+    data_file.write_text(
+        "\n".join(
+            [
+                "eng\ttur\tcar\taraba",
+                "eng\ttur\thouse\tev",
+                "eng\ttur\troad\tyol",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tokenizer = load_hybrid_tokenizer()
+    config = tiny_parallel_config(tokenizer)
+    dataset = ParallelDilBatchDataset(
+        data_file,
+        config,
+        tokenizer,
+        batch_size=3,
+        repeat=False,
+    )
+
+    batches = list(dataset.iter_once(worker_id=0, worker_count=1))
+
+    assert [batch["labels"].shape[0] for batch in batches] == [3, 3]
+    assert all(batch["input_ids"].shape[:2] == (3, config.context_size) for batch in batches)
 
 
 def test_one_to_one_alignment_shares_teacher_vector():
@@ -166,7 +199,6 @@ def test_parallel_dil_mock_teacher_forward_backward(tmp_path):
     assert torch.isfinite(loss)
     assert torch.isfinite(alignment)
     assert outputs.ce_loss is not None
-    assert outputs.length_loss is not None
     assert outputs.kl_loss is not None
     assert outputs.distill_loss is not None
     assert model.encoder.embed_tokens.weight.grad is not None
@@ -213,7 +245,7 @@ def test_migrate_dil_context_checkpoint_writes_v2_model_checkpoint(tmp_path):
 
     assert migrated_config.context_size == 3
     assert migrated_config.target_index == 1
-    assert checkpoint["format_version"] == 9
+    assert checkpoint["format_version"] == 11
     assert checkpoint["optimizer_state_dict"] is None
     assert checkpoint["training_state"]["step"] == 0
     assert checkpoint["training_state"]["migrated_from_step"] == 123

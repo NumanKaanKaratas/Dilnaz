@@ -72,7 +72,7 @@ def test_dil_config_uses_symmetric_context_contract():
     assert config.context_radius == 2
     assert config.context_size == 5
     assert config.target_index == 2
-    assert config.checkpoint_format_version == 9
+    assert config.checkpoint_format_version == 11
     assert not hasattr(config, "context_left_radius")
 
 
@@ -89,8 +89,8 @@ def test_dil_forward_keeps_target_latent_shape():
     word_masks = input_ids.ne(config.pad_token_id)
     labels = torch.tensor(
         [
-            [5, 6, 7, -100],
-            [11, 12, 13, -100],
+            [5, 6, 7, 1],
+            [11, 12, 13, 1],
         ],
         dtype=torch.long,
     )
@@ -110,7 +110,8 @@ def test_dil_forward_keeps_target_latent_shape():
     assert outputs.logits.shape == (2, config.max_word_bytes, config.vocab_size)
     assert isinstance(model.encoder.encoder_layers[0].mlp, DilGatedMLP)
     assert isinstance(model.encoder.encoder_layers[0].layernorm, DilRMSNorm)
-    assert model.decoder.lm_head_weight is model.encoder.embed_tokens.weight
+    assert model.decoder.embed_tokens.weight is not model.encoder.embed_tokens.weight
+    assert model.semantic_normalizer.initialized
     assert torch.isfinite(outputs.loss)
 
 
@@ -196,19 +197,18 @@ def test_reconstruction_loss_updates_vae_encoder():
     word_masks = input_ids.ne(config.pad_token_id)
     labels = torch.tensor(
         [
-            [5, 6, 7, -100],
-            [11, 12, 13, -100],
+            [5, 6, 7, 1],
+            [11, 12, 13, 1],
         ],
         dtype=torch.long,
     )
 
     outputs = model(input_ids=input_ids, word_masks=word_masks, labels=labels)
-    (outputs.ce_loss + outputs.length_loss).backward()
+    outputs.ce_loss.backward()
 
     assert grad_abs_sum(model.encoder.embed_tokens.weight) > 0.0
     assert grad_abs_sum(model.encoder.hidden_to_latent.weight) > 0.0
     assert model.decoder.latent_to_hidden.weight.grad is not None
-    assert model.length_head[-1].weight.grad is not None
 
 
 def test_semantic_losses_update_semantic_encoder():
@@ -239,7 +239,7 @@ def test_semantic_losses_update_semantic_encoder():
     assert model.decoder.latent_to_hidden.weight.grad is None
 
 
-def test_writer_only_step_freezes_encoder_and_tied_output_head():
+def test_writer_only_step_freezes_encoder_and_trains_separate_writer():
     config = tiny_config()
     model = Dil(config)
     input_ids = torch.tensor(
@@ -251,8 +251,8 @@ def test_writer_only_step_freezes_encoder_and_tied_output_head():
     )
     labels = torch.tensor(
         [
-            [5, 6, 7, -100],
-            [11, 12, 13, -100],
+            [5, 6, 7, 1],
+            [11, 12, 13, 1],
         ],
         dtype=torch.long,
     )
@@ -260,13 +260,12 @@ def test_writer_only_step_freezes_encoder_and_tied_output_head():
         "input_ids": input_ids,
         "word_masks": input_ids.ne(config.pad_token_id),
         "labels": labels,
-        "length_labels": labels.ne(-100).sum(dim=-1) - 1,
     }
     encoder_before = {
         name: parameter.detach().clone()
         for name, parameter in model.encoder.named_parameters()
     }
-    tied_head_before = model.decoder.lm_head_weight.detach().clone()
+    writer_embed_before = model.decoder.embed_tokens.weight.detach().clone()
     decoder_before = model.decoder.latent_to_hidden.weight.detach().clone()
 
     configure_writer_only_training(model)
@@ -278,15 +277,14 @@ def test_writer_only_step_freezes_encoder_and_tied_output_head():
     assert torch.isfinite(outputs.loss)
     assert not hasattr(outputs, "kl_loss")
     assert model.encoder.embed_tokens.weight.grad is None
-    assert model.decoder.lm_head_weight.grad is None
+    assert model.decoder.embed_tokens.weight.grad is not None
     assert grad_abs_sum(model.decoder.latent_to_hidden.weight) > 0.0
-    assert grad_abs_sum(model.length_head[-1].weight) > 0.0
 
     optimizer.step()
 
     for name, parameter in model.encoder.named_parameters():
         assert torch.allclose(parameter, encoder_before[name])
-    assert torch.allclose(model.decoder.lm_head_weight, tied_head_before)
+    assert not torch.allclose(model.decoder.embed_tokens.weight, writer_embed_before)
     assert not torch.allclose(model.decoder.latent_to_hidden.weight, decoder_before)
 
 
@@ -389,6 +387,7 @@ def test_naz_input_uses_frozen_dil_semantic_embeddings(tmp_path):
     assert embeddings.shape == (1, 3, naz_config.hidden_size)
     assert model.student_core.semantic_embed_proj[-2].weight.grad is not None
     assert grad_abs_sum(model.dil_model.encoder.embed_tokens.weight) == 0.0
+    assert grad_abs_sum(model.dil_model.semantic_normalizer.center) == 0.0
     assert not hasattr(model, "byte_embed_tokens")
 
 
@@ -564,6 +563,7 @@ def test_naz_semantic_loop_generation_does_not_reencode_generated_tokens(tmp_pat
     assert outputs.generated_mean.shape == (1, 4, dil_config.latent_size)
     assert outputs.generated_log_std.shape == (1, 4, dil_config.latent_size)
     assert outputs.generated_lengths.shape == (1, 4)
+    assert outputs.roundtrip_cosine is None
 
 
 def test_resident_semantic_cache_matches_full_symmetric_context_pass(tmp_path):
@@ -617,8 +617,8 @@ def test_resident_semantic_cache_matches_full_symmetric_context_pass(tmp_path):
     unit_mask = torch.ones((1, byte_ids.shape[0]), dtype=torch.bool)
     full_mean, full_log_std = model.latent_distribution(byte_ids.unsqueeze(0), masks, unit_mask)
 
-    assert torch.allclose(mean_cache, full_mean.reshape(byte_ids.shape[0], -1))
-    assert torch.allclose(log_std_cache, full_log_std.reshape(byte_ids.shape[0], -1))
+    assert torch.allclose(mean_cache, full_mean.reshape(byte_ids.shape[0], -1), atol=1e-6, rtol=1e-5)
+    assert torch.allclose(log_std_cache, full_log_std.reshape(byte_ids.shape[0], -1), atol=1e-6, rtol=1e-5)
     assert torch.allclose(semantic_states, torch.cat((mean_cache, log_std_cache), dim=-1))
 
 

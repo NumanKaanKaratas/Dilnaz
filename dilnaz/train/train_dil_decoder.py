@@ -37,7 +37,7 @@ from models.configuration_dil import DilConfig
 from models.modeling_dil import Dil
 
 
-CHECKPOINT_FORMAT_VERSION = 9
+CHECKPOINT_FORMAT_VERSION = 11
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -45,11 +45,8 @@ DATALOADER_WORKER_EXIT = "DataLoader worker"
 class WriterOnlyOutput:
     loss: torch.Tensor
     logits: torch.Tensor
-    length_logits: torch.Tensor
     ce_loss: torch.Tensor
-    length_loss: torch.Tensor
     byte_acc: torch.Tensor
-    length_acc: torch.Tensor
 
 
 def make_scheduler(optimizer, learning_rate: float, warmup_steps: int):
@@ -67,16 +64,11 @@ def configure_writer_only_training(model: Dil):
     for param in model.parameters():
         param.requires_grad = False
 
-    for name, param in model.decoder.named_parameters():
-        if name != "lm_head_weight":
-            param.requires_grad = True
-
-    for param in model.length_head.parameters():
+    for param in model.decoder.parameters():
         param.requires_grad = True
 
     model.encoder.eval()
     model.decoder.train()
-    model.length_head.train()
 
 
 def writer_trainable_parameters(model: Dil):
@@ -89,13 +81,11 @@ def writer_trainable_parameters(model: Dil):
 def writer_train_mode(model: Dil):
     model.encoder.eval()
     model.decoder.train()
-    model.length_head.train()
 
 
 def writer_eval_mode(model: Dil):
     model.encoder.eval()
     model.decoder.eval()
-    model.length_head.eval()
 
 
 def writer_only_forward(model: Dil, batch: dict) -> WriterOnlyOutput:
@@ -108,31 +98,25 @@ def writer_only_forward(model: Dil, batch: dict) -> WriterOnlyOutput:
         mean, _ = torch.chunk(latent_states, 2, dim=-1)
         latent_states = mean.detach()
 
-    logits, length_logits = model.decode_from_latents(latent_states)
+    decoder_input_ids = model.decoder_inputs_from_labels(batch["labels"].to(latent_states.device))
+    logits = model.decode_from_latents(latent_states, decoder_input_ids)
     logits = logits.float()
-    length_logits = length_logits.float()
     labels = batch["labels"].to(logits.device)
-    length_labels = batch["length_labels"].to(length_logits.device)
     ce_loss = F.cross_entropy(
         logits.reshape(-1, model.config.vocab_size),
         labels.reshape(-1),
         ignore_index=-100,
     )
-    length_loss = F.cross_entropy(length_logits, length_labels)
-    loss = ce_loss + length_loss
+    loss = ce_loss
 
     valid = labels.ne(-100)
     correct = logits.argmax(dim=-1).eq(labels) & valid
     byte_acc = correct.sum().float() / valid.sum().clamp_min(1).float()
-    length_acc = length_logits.argmax(dim=-1).eq(length_labels).float().mean()
     return WriterOnlyOutput(
         loss=loss,
         logits=logits,
-        length_logits=length_logits,
         ce_loss=ce_loss,
-        length_loss=length_loss,
         byte_acc=byte_acc,
-        length_acc=length_acc,
     )
 
 
@@ -150,7 +134,8 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "context_radius": config.context_radius,
         "target_index": config.target_index,
         "latent_size": config.latent_size,
-        "trainable": "decoder_inner_and_length_head",
+        "semantic_normalizer_z_clip": config.semantic_normalizer_z_clip,
+        "trainable": "autoregressive_writer",
     }
 
 
@@ -234,9 +219,7 @@ def evaluate(model, eval_loader, autocast_enabled: bool, cuda_prefetch: bool, de
     total = {
         "loss": 0.0,
         "ce": 0.0,
-        "len": 0.0,
         "byte_acc": 0.0,
-        "len_acc": 0.0,
         "batches": 0,
     }
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
@@ -244,9 +227,7 @@ def evaluate(model, eval_loader, autocast_enabled: bool, cuda_prefetch: bool, de
             outputs = writer_only_forward(model, batch)
         total["loss"] += float(outputs.loss.detach().cpu())
         total["ce"] += float(outputs.ce_loss.detach().cpu())
-        total["len"] += float(outputs.length_loss.detach().cpu())
         total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
-        total["len_acc"] += float(outputs.length_acc.detach().cpu())
         total["batches"] += 1
         if batch_idx >= max_batches:
             break
@@ -261,9 +242,7 @@ def format_log(step: int, metrics: dict) -> str:
         f"step={step}",
         f"loss={metrics['loss']:.4f}",
         f"ce={metrics['ce']:.4f}",
-        f"len={metrics['len']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
-        f"len_acc={metrics['len_acc']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -453,9 +432,7 @@ def main():
     metric_sums = {
         "loss": 0.0,
         "ce": 0.0,
-        "len": 0.0,
         "byte_acc": 0.0,
-        "len_acc": 0.0,
     }
     last_metrics = {}
     completed_step = 0
@@ -502,9 +479,7 @@ def main():
             log_steps += 1
             metric_sums["loss"] += float(outputs.loss.detach().cpu())
             metric_sums["ce"] += float(outputs.ce_loss.detach().cpu())
-            metric_sums["len"] += float(outputs.length_loss.detach().cpu())
             metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
-            metric_sums["len_acc"] += float(outputs.length_acc.detach().cpu())
 
             should_log = step % args.log_every == 0 or step == 1 or step == args.max_steps
             should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0

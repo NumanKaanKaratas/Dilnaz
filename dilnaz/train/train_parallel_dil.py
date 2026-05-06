@@ -131,7 +131,11 @@ def parse_args():
     parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
-    parser.add_argument("--length-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["length_loss_weight"])
+    parser.add_argument("--semantic-normalizer-momentum", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_momentum"])
+    parser.add_argument("--semantic-normalizer-eps", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_eps"])
+    parser.add_argument("--semantic-normalizer-z-clip", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_z_clip"])
+    parser.add_argument("--normalized-log-std-min", type=float, default=DIL_MODEL_DEFAULTS["normalized_log_std_min"])
+    parser.add_argument("--normalized-log-std-max", type=float, default=DIL_MODEL_DEFAULTS["normalized_log_std_max"])
     parser.add_argument("--parallel-alignment-weight", type=float, default=1.0)
     parser.add_argument("--nllb-model-name", default=DEFAULT_PARALLEL_NLLB_MODEL)
     parser.add_argument("--source-lang", default=DEFAULT_SOURCE_LANG)
@@ -165,6 +169,14 @@ def validate_args(args):
         raise ValueError("--eval-file is required when --eval-every > 0")
     if args.max_eval_batches <= 0:
         raise ValueError("--max-eval-batches must be > 0")
+    if args.semantic_normalizer_momentum <= 0.0 or args.semantic_normalizer_momentum > 1.0:
+        raise ValueError("--semantic-normalizer-momentum must be in (0, 1]")
+    if args.semantic_normalizer_eps <= 0.0:
+        raise ValueError("--semantic-normalizer-eps must be > 0")
+    if args.semantic_normalizer_z_clip <= 0.0:
+        raise ValueError("--semantic-normalizer-z-clip must be > 0")
+    if args.normalized_log_std_min >= args.normalized_log_std_max:
+        raise ValueError("--normalized-log-std-min must be smaller than --normalized-log-std-max")
 
 
 def build_config(args, tokenizer):
@@ -189,7 +201,11 @@ def build_config(args, tokenizer):
         layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
-        length_loss_weight=args.length_loss_weight,
+        semantic_normalizer_momentum=args.semantic_normalizer_momentum,
+        semantic_normalizer_eps=args.semantic_normalizer_eps,
+        semantic_normalizer_z_clip=args.semantic_normalizer_z_clip,
+        normalized_log_std_min=args.normalized_log_std_min,
+        normalized_log_std_max=args.normalized_log_std_max,
         tokenizer_vocab_file=args.tokenizer_vocab.name,
         nllb_model_name=args.nllb_model_name,
         nllb_src_lang=args.source_lang,
@@ -211,10 +227,8 @@ def format_parallel_log(step: int, metrics: dict) -> str:
         f"parallel_w={metrics['parallel_weighted']:.4f}",
         f"ce={metrics['ce']:.4f}",
         f"ce_w={metrics['ce_weighted']:.4f}",
-        f"len={metrics['len']:.4f}",
         f"kl={metrics['kl']:.2f}",
         f"kl_w={metrics['kl_weighted']:.4f}",
-        f"len_w={metrics['length_weighted']:.4f}",
         f"geom_l1={metrics['geom_l1']:.4f}",
         f"geom_l2={metrics['geom_l2']:.4f}",
         f"geom_l3={metrics['geom_l3']:.4f}",
@@ -222,7 +236,6 @@ def format_parallel_log(step: int, metrics: dict) -> str:
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
-        f"len_acc={metrics['len_acc']:.4f}",
         f"align_groups={metrics['align_groups']:.1f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
@@ -246,10 +259,8 @@ def empty_metric_sums() -> dict[str, float]:
         "parallel_weighted": 0.0,
         "ce": 0.0,
         "ce_weighted": 0.0,
-        "len": 0.0,
         "kl": 0.0,
         "kl_weighted": 0.0,
-        "length_weighted": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
         "geom_l3": 0.0,
@@ -257,7 +268,6 @@ def empty_metric_sums() -> dict[str, float]:
         "geom_mean": 0.0,
         "var": 0.0,
         "byte_acc": 0.0,
-        "len_acc": 0.0,
         "align_groups": 0.0,
     }
 
@@ -269,17 +279,14 @@ def accumulate_metrics(metric_sums: dict[str, float], loss, outputs, parallel_lo
     metric_sums["parallel_weighted"] += float((parallel_loss * weight).detach().cpu())
     metric_sums["ce"] += float(outputs.ce_loss.detach().cpu())
     metric_sums["ce_weighted"] += float((outputs.ce_loss * config.ce_weight).detach().cpu())
-    metric_sums["len"] += float(outputs.length_loss.detach().cpu())
     metric_sums["kl"] += float(outputs.kl_loss.detach().cpu())
     metric_sums["kl_weighted"] += float((outputs.kl_loss * config.kl_weight).detach().cpu())
-    metric_sums["length_weighted"] += float((outputs.length_loss * config.length_loss_weight).detach().cpu())
     layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
     for idx in range(4):
         metric_sums[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
     metric_sums["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
     metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
-    metric_sums["len_acc"] += float(outputs.length_acc.detach().cpu())
     metric_sums["align_groups"] += float(batch["parallel_alignment_scores"].shape[0])
 
 

@@ -92,6 +92,13 @@ class ParallelPairSegments:
 
 
 @dataclass(frozen=True)
+class ParallelBatchRow:
+    item: ParallelPairSegments
+    side_id: int
+    token_idx: int
+
+
+@dataclass(frozen=True)
 class EncoderPiece:
     text: str
     start: int
@@ -212,15 +219,25 @@ class ParallelDilBatchDataset(IterableDataset):
         self.context_size = config.context_size
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
+        self.eos_token_id = config.eos_token_id
         self.batch_size = batch_size
         self.repeat = repeat
         self.max_samples = max_samples
         self.tokenizer = tokenizer
-        self._carry_items: list[ParallelPairSegments] = []
+        self._carry_rows: list[ParallelBatchRow] = []
         self._produced_pairs = 0
 
-    def make_batch(self, items: list[ParallelPairSegments]) -> dict:
-        size = sum(len(item.source_segments) + len(item.target_segments) for item in items)
+    def pair_rows(self, item: ParallelPairSegments) -> Iterator[ParallelBatchRow]:
+        source_count = len(item.source_segments)
+        target_count = len(item.target_segments)
+        for token_idx in range(max(source_count, target_count)):
+            if token_idx < source_count:
+                yield ParallelBatchRow(item, SOURCE_SIDE, token_idx)
+            if token_idx < target_count:
+                yield ParallelBatchRow(item, TARGET_SIDE, token_idx)
+
+    def make_batch(self, rows: list[ParallelBatchRow]) -> dict:
+        size = len(rows)
         input_ids = np.full(
             (size, self.context_size, self.max_word_bytes),
             self.pad_token_id,
@@ -228,7 +245,6 @@ class ParallelDilBatchDataset(IterableDataset):
         )
         word_masks = np.zeros((size, self.context_size, self.max_word_bytes), dtype=np.bool_)
         labels = np.full((size, self.max_word_bytes), -100, dtype=np.int64)
-        length_labels = np.zeros((size,), dtype=np.int64)
         teacher_text_indices = np.zeros((size,), dtype=np.int64)
         teacher_starts = np.zeros((size,), dtype=np.int64)
         teacher_ends = np.zeros((size,), dtype=np.int64)
@@ -239,55 +255,62 @@ class ParallelDilBatchDataset(IterableDataset):
         source_line_ids = np.zeros((size,), dtype=np.int64)
         teacher_texts: list[str] = []
         row_texts: list[str] = []
-        pair_text_indices = np.zeros((len(items), 2), dtype=np.int64)
+        pair_slots: dict[int, int] = {}
+        pair_items: list[ParallelPairSegments] = []
 
-        row_idx = 0
-        for pair_idx, item in enumerate(items):
+        for row in rows:
+            item_key = id(row.item)
+            if item_key in pair_slots:
+                continue
+            pair_slots[item_key] = len(pair_items)
+            pair_items.append(row.item)
+
+        pair_text_indices = np.zeros((len(pair_items), 2), dtype=np.int64)
+        for pair_idx, item in enumerate(pair_items):
             source_text_idx = len(teacher_texts)
             teacher_texts.append(item.pair.source_text)
             target_text_idx = len(teacher_texts)
             teacher_texts.append(item.pair.target_text)
             pair_text_indices[pair_idx] = (source_text_idx, target_text_idx)
-            for side_id, text_idx, segments in (
-                (SOURCE_SIDE, source_text_idx, item.source_segments),
-                (TARGET_SIDE, target_text_idx, item.target_segments),
-            ):
-                for token_idx, segment in enumerate(segments):
-                    for context_idx, offset in enumerate(context_offsets(self.context_radius)):
-                        source_idx = token_idx + offset
-                        if 0 <= source_idx < len(segments):
-                            write_segment(
-                                input_ids,
-                                word_masks,
-                                row_idx,
-                                context_idx,
-                                segments[source_idx],
-                                self.max_word_bytes,
-                            )
 
-                    piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
-                    labels[row_idx, : piece_ids.shape[0]] = piece_ids
-                    length_labels[row_idx] = piece_ids.shape[0] - 1
-                    teacher_text_indices[row_idx] = text_idx
-                    teacher_starts[row_idx] = segment.start
-                    teacher_ends[row_idx] = segment.end
-                    teacher_distill_mask[row_idx] = teacher_distill_segment(segment)
-                    row_pair_indices[row_idx] = pair_idx
-                    row_side_ids[row_idx] = side_id
-                    row_token_indices[row_idx] = token_idx
-                    source_line_ids[row_idx] = item.pair.index
-                    row_texts.append(segment.text)
-                    row_idx += 1
+        for row_idx, row in enumerate(rows):
+            pair_idx = pair_slots[id(row.item)]
+            segments = row.item.source_segments if row.side_id == SOURCE_SIDE else row.item.target_segments
+            text_idx = pair_text_indices[pair_idx, row.side_id]
+            segment = segments[row.token_idx]
+            for context_idx, offset in enumerate(context_offsets(self.context_radius)):
+                source_idx = row.token_idx + offset
+                if 0 <= source_idx < len(segments):
+                    write_segment(
+                        input_ids,
+                        word_masks,
+                        row_idx,
+                        context_idx,
+                        segments[source_idx],
+                        self.max_word_bytes,
+                    )
+
+            piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
+            labels[row_idx, : piece_ids.shape[0]] = piece_ids
+            labels[row_idx, piece_ids.shape[0]] = self.eos_token_id
+            teacher_text_indices[row_idx] = text_idx
+            teacher_starts[row_idx] = segment.start
+            teacher_ends[row_idx] = segment.end
+            teacher_distill_mask[row_idx] = teacher_distill_segment(segment)
+            row_pair_indices[row_idx] = pair_idx
+            row_side_ids[row_idx] = row.side_id
+            row_token_indices[row_idx] = row.token_idx
+            source_line_ids[row_idx] = row.item.pair.index
+            row_texts.append(segment.text)
 
         teacher_text_side_ids = np.asarray(
-            [side_id for _ in items for side_id in (SOURCE_SIDE, TARGET_SIDE)],
+            [side_id for _ in pair_items for side_id in (SOURCE_SIDE, TARGET_SIDE)],
             dtype=np.int64,
         )
         return {
             "input_ids": torch.from_numpy(input_ids),
             "word_masks": torch.from_numpy(word_masks),
             "labels": torch.from_numpy(labels),
-            "length_labels": torch.from_numpy(length_labels),
             "teacher_texts": teacher_texts,
             "teacher_text_side_ids": torch.from_numpy(teacher_text_side_ids),
             "teacher_text_indices": torch.from_numpy(teacher_text_indices),
@@ -303,9 +326,8 @@ class ParallelDilBatchDataset(IterableDataset):
         }
 
     def iter_once(self, worker_id: int, worker_count: int):
-        items = self._carry_items
-        current_size = sum(len(item.source_segments) + len(item.target_segments) for item in items)
-        self._carry_items = []
+        rows = self._carry_rows
+        self._carry_rows = []
 
         for pair in iter_parallel_pairs(self.train_file):
             if pair.index % worker_count != worker_id:
@@ -316,22 +338,21 @@ class ParallelDilBatchDataset(IterableDataset):
                 continue
 
             pair_item = ParallelPairSegments(pair, source_segments, target_segments)
-            pair_size = len(source_segments) + len(target_segments)
-            if items and current_size + pair_size > self.batch_size:
-                yield self.make_batch(items)
-                items = []
-                current_size = 0
-            items.append(pair_item)
-            current_size += pair_size
+            for row in self.pair_rows(pair_item):
+                rows.append(row)
+                if len(rows) == self.batch_size:
+                    yield self.make_batch(rows)
+                    rows = []
             self._produced_pairs += 1
             if self.max_samples > 0 and self._produced_pairs >= self.max_samples:
-                yield self.make_batch(items)
+                if rows:
+                    yield self.make_batch(rows)
                 return
 
-        if items and not self.repeat:
-            yield self.make_batch(items)
-        elif items:
-            self._carry_items = items
+        if rows and not self.repeat:
+            yield self.make_batch(rows)
+        elif rows:
+            self._carry_rows = rows
 
     def __iter__(self):
         worker = get_worker_info()
@@ -342,7 +363,7 @@ class ParallelDilBatchDataset(IterableDataset):
             for batch in self.iter_once(worker_id, worker_count):
                 yielded = True
                 yield batch
-            if not yielded and not self._carry_items:
+            if not yielded and not self._carry_rows:
                 raise ValueError(f"{self.train_file} produced no trainable parallel segments")
             if not self.repeat:
                 return

@@ -24,7 +24,6 @@ DILNAZ_READY_REQUIRED_COLUMNS = [
     "input_ids",
     "word_masks",
     "labels",
-    "length_label",
     "teacher_layers",
     "teacher_mask",
 ]
@@ -223,7 +222,7 @@ def trainable_segments(tokenizer: HybridTokenizer, text: str, max_word_bytes: in
     return [
         segment
         for segment in tokenizer.encode_segments(text)
-        if 0 < segment.piece_len <= max_word_bytes
+        if 0 < segment.piece_len < max_word_bytes
     ]
 
 
@@ -279,6 +278,7 @@ class HybridDilBatchDataset(IterableDataset):
         self.context_size = config.context_size
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
+        self.eos_token_id = config.eos_token_id
         self.batch_size = batch_size
         self.read_chars = read_chars
         self.repeat = repeat
@@ -322,7 +322,6 @@ class HybridDilBatchDataset(IterableDataset):
         )
         word_masks = np.zeros((size, self.context_size, self.max_word_bytes), dtype=np.bool_)
         labels = np.full((size, self.max_word_bytes), -100, dtype=np.int64)
-        length_labels = np.zeros((size,), dtype=np.int64)
         teacher_text_indices = np.zeros((size,), dtype=np.int64)
         teacher_starts = np.zeros((size,), dtype=np.int64)
         teacher_ends = np.zeros((size,), dtype=np.int64)
@@ -341,7 +340,7 @@ class HybridDilBatchDataset(IterableDataset):
 
             piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
             labels[row_idx, : piece_ids.shape[0]] = piece_ids
-            length_labels[row_idx] = piece_ids.shape[0] - 1
+            labels[row_idx, piece_ids.shape[0]] = self.eos_token_id
             teacher_text_indices[row_idx] = ref.text_idx
             teacher_starts[row_idx] = segment.start
             teacher_ends[row_idx] = segment.end
@@ -351,7 +350,6 @@ class HybridDilBatchDataset(IterableDataset):
             "input_ids": torch.from_numpy(input_ids),
             "word_masks": torch.from_numpy(word_masks),
             "labels": torch.from_numpy(labels),
-            "length_labels": torch.from_numpy(length_labels),
             "teacher_texts": texts,
             "teacher_text_indices": torch.from_numpy(teacher_text_indices),
             "teacher_starts": torch.from_numpy(teacher_starts),
@@ -541,7 +539,6 @@ class ReadyParquetDilBatchDataset(IterableDataset):
             len(rows),
             self.max_word_bytes,
         )
-        length_labels = np.asarray([row["length_label"] for row in rows], dtype=np.int64)
         teacher_layers = np.asarray([row["teacher_layers"] for row in rows], dtype=np.float32).reshape(
             len(rows),
             self.teacher_layer_count,
@@ -552,7 +549,6 @@ class ReadyParquetDilBatchDataset(IterableDataset):
             "input_ids": torch.from_numpy(input_ids),
             "word_masks": torch.from_numpy(word_masks),
             "labels": torch.from_numpy(labels),
-            "length_labels": torch.from_numpy(length_labels),
             "teacher_layers": torch.from_numpy(teacher_layers),
             "teacher_mask": torch.from_numpy(teacher_mask),
         }

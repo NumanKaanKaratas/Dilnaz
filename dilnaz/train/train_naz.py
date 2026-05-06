@@ -41,7 +41,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer
 
 
-CHECKPOINT_FORMAT_VERSION = 11
+CHECKPOINT_FORMAT_VERSION = 12
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -72,6 +72,7 @@ def json_training_state(config, step: int, metrics: dict, dil_checksum: str, com
         "compile_mode": compile_mode,
         "max_word_bytes": config.max_word_bytes,
         "latent_size": config.latent_size,
+        "semantic_space": "dil_normalized_distribution",
         "byte_vocab_size": config.byte_vocab_size,
         "vocab_size": config.vocab_size,
         "pad_token_id": config.pad_token_id,

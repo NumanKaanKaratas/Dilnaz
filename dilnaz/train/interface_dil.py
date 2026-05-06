@@ -16,7 +16,7 @@ from models.modeling_dil import Dil
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 9
+CHECKPOINT_FORMAT_VERSION = 11
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -120,10 +120,12 @@ def decode_logits(tokenizer: HybridTokenizer, logits: torch.Tensor, byte_length:
     return tokenizer.decode(ids)
 
 
-def predict_lengths(model: Dil, latents: torch.Tensor) -> list[int]:
-    _, length_logits = model.decode_from_latents(latents)
-    length_logits = length_logits.float()
-    return (length_logits.argmax(dim=-1) + 1).detach().cpu().tolist()
+def eos_lengths(token_ids: torch.Tensor, eos_token_id: int) -> list[int]:
+    lengths = []
+    for row in token_ids.detach().cpu():
+        eos_positions = (row == eos_token_id).nonzero(as_tuple=False)
+        lengths.append(int(eos_positions[0, 0]) if eos_positions.numel() else int(row.numel()))
+    return lengths
 
 
 def load_model(checkpoint_dir: Path, device: torch.device):
@@ -151,9 +153,10 @@ def encode_tokens(model: Dil, input_ids: torch.Tensor, word_masks: torch.Tensor)
 
 @torch.no_grad()
 def decode_latents(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor):
-    logits, _ = model.decode_from_latents(latents)
+    logits = model.decode_from_latents(latents)
     logits = logits.float()
-    byte_lengths = predict_lengths(model, latents)
+    token_ids = logits.argmax(dim=-1)
+    byte_lengths = eos_lengths(token_ids, model.config.eos_token_id)
     decoded = [
         decode_logits(tokenizer, logits[row_idx], byte_lengths[row_idx])
         for row_idx in range(logits.shape[0])

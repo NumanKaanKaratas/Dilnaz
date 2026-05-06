@@ -14,18 +14,15 @@ from .configuration_dil import DilConfig
 class DilOutput(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
-    length_logits: Optional[torch.FloatTensor] = None
     mean: Optional[torch.FloatTensor] = None
     log_std: Optional[torch.FloatTensor] = None
     ce_loss: Optional[torch.FloatTensor] = None
-    length_loss: Optional[torch.FloatTensor] = None
     kl_loss: Optional[torch.FloatTensor] = None
     distill_loss: Optional[torch.FloatTensor] = None
     layer_geometry_losses: Optional[torch.FloatTensor] = None
     mean_geometry_loss: Optional[torch.FloatTensor] = None
     variance_loss: Optional[torch.FloatTensor] = None
     byte_acc: Optional[torch.FloatTensor] = None
-    length_acc: Optional[torch.FloatTensor] = None
 
 
 class DilRMSNorm(nn.Module):
@@ -65,6 +62,74 @@ class DilLayer(nn.Module):
         hidden_states = self.layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
+
+
+class SemanticDistributionNormalizer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.momentum = config.semantic_normalizer_momentum
+        self.eps = config.semantic_normalizer_eps
+        self.z_clip = config.semantic_normalizer_z_clip
+        self.log_std_min = config.normalized_log_std_min
+        self.log_std_max = config.normalized_log_std_max
+        self.register_buffer("center", torch.zeros(config.latent_size))
+        self.register_buffer("scale", torch.ones(config.latent_size))
+        self.register_buffer("log_scale", torch.zeros(config.latent_size))
+        self.register_buffer("initialized", torch.zeros((), dtype=torch.bool))
+
+    @torch.no_grad()
+    def update(self, mean: torch.Tensor):
+        flat = mean.detach().float().reshape(-1, mean.shape[-1])
+        batch_center = flat.mean(dim=0)
+        batch_scale = flat.std(dim=0, unbiased=False).clamp_min(self.eps)
+        momentum = torch.where(
+            self.initialized,
+            torch.full((), self.momentum, device=self.center.device),
+            torch.ones((), device=self.center.device),
+        )
+        batch_center = batch_center.to(self.center.device)
+        batch_scale = batch_scale.to(self.scale.device)
+        self.center.copy_(self.center * (1.0 - momentum) + batch_center * momentum)
+        self.scale.copy_(self.scale * (1.0 - momentum) + batch_scale * momentum)
+        self.initialized.fill_(True)
+        self.scale.clamp_(min=self.eps)
+        self.log_scale.copy_(self.scale.log())
+
+    def normalize_mean(self, mean: torch.Tensor) -> torch.Tensor:
+        center = self.center.to(device=mean.device, dtype=mean.dtype)
+        scale = self.scale.to(device=mean.device, dtype=mean.dtype)
+        return (mean - center) / scale
+
+    def denormalize_mean(self, mean: torch.Tensor) -> torch.Tensor:
+        center = self.center.to(device=mean.device, dtype=mean.dtype)
+        scale = self.scale.to(device=mean.device, dtype=mean.dtype)
+        return mean * scale + center
+
+    def normalize_distribution(
+        self,
+        mean: torch.Tensor,
+        log_std: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        log_scale = self.log_scale.to(device=log_std.device, dtype=log_std.dtype)
+        return self.normalize_mean(mean), log_std - log_scale
+
+    def denormalize_distribution(
+        self,
+        mean: torch.Tensor,
+        log_std: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        log_scale = self.log_scale.to(device=log_std.device, dtype=log_std.dtype)
+        return self.denormalize_mean(mean), log_std + log_scale
+
+    def guard_distribution(
+        self,
+        mean: torch.Tensor,
+        log_std: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            mean.clamp(min=-self.z_clip, max=self.z_clip),
+            log_std.clamp(min=self.log_std_min, max=self.log_std_max),
+        )
 
 
 def dil_context_attention_heads(hidden_size: int) -> int:
@@ -206,43 +271,131 @@ class DilEncoderCore(nn.Module):
         return latent_states
 
 
-class DilDecoderRenderer(nn.Module):
+class DilAutoregressiveDecoderLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        heads = dil_context_attention_heads(config.hidden_size)
+        self.self_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.cross_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.memory_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = nn.MultiheadAttention(
+            config.hidden_size,
+            heads,
+            dropout=0.0,
+            bias=False,
+            batch_first=True,
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            config.hidden_size,
+            heads,
+            dropout=0.0,
+            bias=False,
+            batch_first=True,
+        )
+        self.mlp = DilGatedMLP(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        memory_states: torch.Tensor,
+        causal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.self_norm(hidden_states)
+        self_attn, _ = self.self_attn(
+            hidden_states,
+            hidden_states,
+            hidden_states,
+            attn_mask=causal_mask,
+            need_weights=False,
+        )
+        hidden_states = residual + self_attn
+
+        residual = hidden_states
+        cross_attn, _ = self.cross_attn(
+            self.cross_norm(hidden_states),
+            self.memory_norm(memory_states),
+            memory_states,
+            need_weights=False,
+        )
+        hidden_states = residual + cross_attn
+        return hidden_states + self.mlp(self.mlp_norm(hidden_states))
+
+
+class DilAutoregressiveWriter(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.max_word_bytes = config.max_word_bytes
-        self.num_stage_layers = config.num_decoder_layers // 2
-
+        self.pad_token_id = config.pad_token_id
+        self.decoder_start_token_id = config.decoder_start_token_id
         self.latent_to_hidden = nn.Linear(config.latent_size, config.hidden_size)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.position_embeddings = nn.Embedding(config.max_word_bytes, config.hidden_size)
         self.decoder_layers = nn.ModuleList(
-            [DilLayer(config) for _ in range(config.num_decoder_layers)]
-        )
-        self.expand_layer = nn.Linear(
-            config.hidden_size,
-            config.max_word_bytes * config.hidden_size,
+            [DilAutoregressiveDecoderLayer(config) for _ in range(config.num_decoder_layers)]
         )
         self.norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        causal_mask = torch.triu(
+            torch.ones(config.max_word_bytes, config.max_word_bytes, dtype=torch.bool),
+            diagonal=1,
+        )
+        self.register_buffer(
+            "causal_mask",
+            causal_mask,
+            persistent=False,
+        )
 
-    def forward(self, latent_states: torch.Tensor) -> torch.Tensor:
+    def teacher_forced_logits(
+        self,
+        latent_states: torch.Tensor,
+        decoder_input_ids: torch.LongTensor,
+    ) -> torch.Tensor:
         batch_size = latent_states.shape[0]
-        hidden_states = self.latent_to_hidden(latent_states).unsqueeze(1)
-
-        for layer_idx in range(self.num_stage_layers):
-            hidden_states = self.decoder_layers[layer_idx](hidden_states)
-
-        hidden_states = self.expand_layer(hidden_states)
-        hidden_states = hidden_states.reshape(batch_size, self.max_word_bytes, -1)
-
-        for layer_idx in range(self.num_stage_layers):
-            decoder_idx = self.num_stage_layers + layer_idx
-            hidden_states = self.decoder_layers[decoder_idx](hidden_states)
-
+        if decoder_input_ids.shape != (batch_size, self.max_word_bytes):
+            raise ValueError(
+                f"decoder_input_ids must be shaped {(batch_size, self.max_word_bytes)}"
+            )
+        positions = torch.arange(self.max_word_bytes, device=decoder_input_ids.device)
+        hidden_states = self.embed_tokens(decoder_input_ids)
+        hidden_states = hidden_states + self.position_embeddings(positions).unsqueeze(0)
+        memory_states = self.latent_to_hidden(latent_states).unsqueeze(1)
+        causal_mask = self.causal_mask.to(device=hidden_states.device)
+        for layer in self.decoder_layers:
+            hidden_states = layer(hidden_states, memory_states, causal_mask)
         hidden_states = self.norm(hidden_states)
-        return F.linear(hidden_states, self.lm_head_weight)
+        return F.linear(hidden_states, self.embed_tokens.weight)
+
+    def greedy_logits(self, latent_states: torch.Tensor) -> torch.Tensor:
+        batch_size = latent_states.shape[0]
+        decoder_input_ids = torch.full(
+            (batch_size, self.max_word_bytes),
+            self.pad_token_id,
+            dtype=torch.long,
+            device=latent_states.device,
+        )
+        decoder_input_ids[:, 0] = self.decoder_start_token_id
+        logits_by_position = []
+        for position in range(self.max_word_bytes):
+            logits = self.teacher_forced_logits(latent_states, decoder_input_ids)
+            next_logits = logits[:, position]
+            logits_by_position.append(next_logits)
+            if position + 1 < self.max_word_bytes:
+                decoder_input_ids[:, position + 1] = next_logits.argmax(dim=-1)
+        return torch.stack(logits_by_position, dim=1)
+
+    def forward(
+        self,
+        latent_states: torch.Tensor,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        if decoder_input_ids is None:
+            return self.greedy_logits(latent_states)
+        return self.teacher_forced_logits(latent_states, decoder_input_ids)
 
 
 class Dil(PreTrainedModel):
     config_class = DilConfig
-    _tied_weights_keys = ["decoder.lm_head_weight"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -250,17 +403,12 @@ class Dil(PreTrainedModel):
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
 
         self.encoder = DilEncoderCore(config)
-        self.decoder = DilDecoderRenderer(config)
-        self.decoder.lm_head_weight = self.encoder.embed_tokens.weight
-        self.length_head = nn.Sequential(
-            nn.LayerNorm(config.latent_size, eps=1e-6),
-            nn.Linear(config.latent_size, config.max_word_bytes),
-        )
+        self.decoder = DilAutoregressiveWriter(config)
+        self.semantic_normalizer = SemanticDistributionNormalizer(config)
         self.dil_dropout = config.dil_dropout
         self.kl_clamp = config.kl_clamp
         self.kl_weight = config.kl_weight
         self.ce_weight = config.ce_weight
-        self.length_loss_weight = config.length_loss_weight
         self.distillation_weight = config.distillation_weight
         self.layer_geometry_weight = config.layer_geometry_weight
         self.mean_geometry_weight = config.mean_geometry_weight
@@ -284,22 +432,57 @@ class Dil(PreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.encoder.embed_tokens = value
-        self.decoder.lm_head_weight = value.weight
+
+    def decoder_inputs_from_labels(self, labels: torch.LongTensor) -> torch.LongTensor:
+        clean_labels = labels.masked_fill(labels < 0, self.config.pad_token_id)
+        decoder_input_ids = torch.full_like(clean_labels, self.config.pad_token_id)
+        decoder_input_ids[:, 0] = self.config.decoder_start_token_id
+        decoder_input_ids[:, 1:] = clean_labels[:, :-1]
+        return decoder_input_ids
+
+    def update_semantic_normalizer(self, mean: torch.Tensor):
+        self.semantic_normalizer.update(mean)
+
+    def normalize_distribution(
+        self,
+        mean: torch.Tensor,
+        log_std: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.semantic_normalizer.normalize_distribution(mean, log_std)
+
+    def denormalize_distribution(
+        self,
+        mean: torch.Tensor,
+        log_std: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.semantic_normalizer.denormalize_distribution(mean, log_std)
+
+    def denormalize_mean(self, mean: torch.Tensor) -> torch.Tensor:
+        return self.semantic_normalizer.denormalize_mean(mean)
+
+    def guard_normalized_distribution(
+        self,
+        mean: torch.Tensor,
+        log_std: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.semantic_normalizer.guard_distribution(mean, log_std)
 
     def decode_from_latents(
         self,
         latent_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
         compiled_forward = getattr(self, "_compiled_decode_forward", None)
         if compiled_forward is not None:
-            return compiled_forward(latent_states)
-        return self._decode_from_latents_impl(latent_states)
+            return compiled_forward(latent_states, decoder_input_ids)
+        return self._decode_from_latents_impl(latent_states, decoder_input_ids)
 
     def _decode_from_latents_impl(
         self,
         latent_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.decoder(latent_states), self.length_head(latent_states.float())
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        return self.decoder(latent_states, decoder_input_ids)
 
     def encode(
         self,
@@ -360,7 +543,6 @@ class Dil(PreTrainedModel):
         labels: Optional[torch.LongTensor] = None,
         teacher_layers: Optional[torch.Tensor] = None,
         teacher_mask: Optional[torch.Tensor] = None,
-        length_labels: Optional[torch.LongTensor] = None,
     ) -> DilOutput:
         encoder_masks = word_masks
         if self.training and self.dil_dropout > 0:
@@ -373,6 +555,8 @@ class Dil(PreTrainedModel):
             output_hidden_states=True,
         )
         mean, log_std = torch.chunk(latent_states, 2, dim=-1)
+        if self.training:
+            self.update_semantic_normalizer(mean)
         std = torch.exp(log_std)
         latent_states = mean + torch.randn_like(mean) * std
         latent_states = F.dropout(latent_states, p=self.dil_dropout, training=self.training)
@@ -381,36 +565,30 @@ class Dil(PreTrainedModel):
         kl_loss = torch.clamp(kl_loss, min=self.kl_clamp)
         kl_loss = torch.mean(torch.sum(kl_loss, dim=-1))
 
-        logits, length_logits = self.decode_from_latents(latent_states)
+        decoder_input_ids = (
+            self.decoder_inputs_from_labels(labels.to(latent_states.device))
+            if labels is not None
+            else None
+        )
+        logits = self.decode_from_latents(latent_states, decoder_input_ids)
         logits = logits.float()
-        length_logits = length_logits.float()
         ce_loss = None
-        length_loss = None
         distill_loss = None
         layer_geometry_losses = None
         mean_geometry_loss = None
         variance_loss = None
         byte_acc = None
-        length_acc = None
         loss = None
 
         if labels is not None:
-            if length_labels is None:
-                length_labels = labels.ne(-100).sum(dim=-1).clamp(
-                    min=1,
-                    max=self.config.max_word_bytes,
-                ) - 1
             ce_loss = F.cross_entropy(
                 logits.reshape(-1, self.config.vocab_size),
                 labels.reshape(-1).to(logits.device),
                 ignore_index=-100,
             )
-            length_labels = length_labels.to(length_logits.device)
-            length_loss = F.cross_entropy(length_logits, length_labels)
             valid = labels.ne(-100)
             correct = logits.argmax(dim=-1).eq(labels.to(logits.device)) & valid.to(logits.device)
             byte_acc = correct.sum().float() / valid.to(logits.device).sum().clamp_min(1).float()
-            length_acc = length_logits.argmax(dim=-1).eq(length_labels).float().mean()
 
         if teacher_layers is not None:
             teacher_layers = teacher_layers.to(mean.device, dtype=torch.float32)
@@ -442,10 +620,9 @@ class Dil(PreTrainedModel):
                 + variance_loss * self.variance_weight
             )
 
-        if ce_loss is not None and length_loss is not None and distill_loss is not None:
+        if ce_loss is not None and distill_loss is not None:
             loss = (
                 ce_loss * self.ce_weight
-                + length_loss * self.length_loss_weight
                 + kl_loss * self.kl_weight
                 + distill_loss * self.distillation_weight
             )
@@ -453,17 +630,14 @@ class Dil(PreTrainedModel):
         return DilOutput(
             loss=loss,
             logits=logits,
-            length_logits=length_logits,
             mean=mean,
             log_std=log_std,
             ce_loss=ce_loss,
-            length_loss=length_loss,
             kl_loss=kl_loss,
             distill_loss=distill_loss,
             layer_geometry_losses=layer_geometry_losses,
             mean_geometry_loss=mean_geometry_loss,
             variance_loss=variance_loss,
             byte_acc=byte_acc,
-            length_acc=length_acc,
         )
 

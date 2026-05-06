@@ -17,7 +17,11 @@ DIL_MODEL_DEFAULTS = {
     "layer_geometry_weight": 2.0,
     "mean_geometry_weight": 4.0,
     "variance_weight": 0.05,
-    "length_loss_weight": 0.5,
+    "semantic_normalizer_momentum": 0.01,
+    "semantic_normalizer_eps": 1e-4,
+    "semantic_normalizer_z_clip": 6.0,
+    "normalized_log_std_min": -8.0,
+    "normalized_log_std_max": 4.0,
 }
 
 

@@ -35,6 +35,8 @@ class NazGenerationOutput(ModelOutput):
     generated_lengths: Optional[torch.LongTensor] = None
     generated_mean: Optional[torch.FloatTensor] = None
     generated_log_std: Optional[torch.FloatTensor] = None
+    generated_raw_mean: Optional[torch.FloatTensor] = None
+    roundtrip_cosine: Optional[torch.FloatTensor] = None
 
 
 class NazMLPBlock(nn.Module):
@@ -353,7 +355,8 @@ class Naz(PreTrainedModel):
             word_masks=context_masks,
         )
         mean, log_std = torch.chunk(latent_states, 2, dim=-1)
-        return mean.float().clone(), log_std.float().clone()
+        mean, log_std = self.dil_model.normalize_distribution(mean.float(), log_std.float())
+        return mean.clone(), log_std.clone()
 
     def semantic_states(
         self,
@@ -391,8 +394,10 @@ class Naz(PreTrainedModel):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         compiled_forward = getattr(self, "_student_core_forward", None)
         if compiled_forward is not None:
-            return compiled_forward(semantic_states, unit_mask)
-        return self.student_core(semantic_states, unit_mask)
+            mean, log_std = compiled_forward(semantic_states, unit_mask)
+        else:
+            mean, log_std = self.student_core(semantic_states, unit_mask)
+        return self.dil_model.guard_normalized_distribution(mean, log_std)
 
     def predict_distribution(
         self,
@@ -488,32 +493,59 @@ class Naz(PreTrainedModel):
     ) -> tuple[torch.LongTensor, torch.Tensor, torch.LongTensor]:
         latent_shape = latents.shape[:-1]
         flat_latents = latents.reshape(-1, latents.shape[-1])
+        flat_latents = self.dil_model.denormalize_mean(flat_latents)
         decode_chunk_size = chunk_size or self.decode_chunk_size
         if decode_chunk_size > 0 and flat_latents.shape[0] > decode_chunk_size:
             logits_list = []
-            length_logits_list = []
             for start in range(0, flat_latents.shape[0], decode_chunk_size):
-                logits_chunk, length_logits_chunk = self.dil_model.decode_from_latents(
+                logits_chunk = self.dil_model.decode_from_latents(
                     flat_latents[start : start + decode_chunk_size]
                 )
                 logits_list.append(logits_chunk)
-                length_logits_list.append(length_logits_chunk)
             logits = torch.cat(logits_list, dim=0)
-            length_logits = torch.cat(length_logits_list, dim=0)
         else:
-            logits, length_logits = self.dil_model.decode_from_latents(flat_latents)
+            logits = self.dil_model.decode_from_latents(flat_latents)
         logits = logits.float()
-        length_logits = length_logits.float()
-        lengths = length_logits.argmax(dim=-1) + 1
         token_ids = logits.argmax(dim=-1)
-        positions = torch.arange(self.max_word_bytes, device=latents.device)
-        masks = positions.unsqueeze(0) < lengths.unsqueeze(-1)
+        eos_mask = token_ids.eq(self.config.eos_token_id)
+        positions = torch.arange(self.max_word_bytes, device=latents.device).unsqueeze(0)
+        first_eos = torch.where(
+            eos_mask.any(dim=-1),
+            eos_mask.float().argmax(dim=-1),
+            torch.full(token_ids.shape[:1], self.max_word_bytes, device=latents.device),
+        ).long()
+        masks = positions < first_eos.unsqueeze(-1)
+        lengths = first_eos
         token_ids = token_ids.masked_fill(~masks, self.pad_token_id)
         return (
             token_ids.reshape(*latent_shape, self.max_word_bytes),
             masks.reshape(*latent_shape, self.max_word_bytes),
             lengths.reshape(*latent_shape),
         )
+
+    @torch.no_grad()
+    def roundtrip_semantic_cosine(
+        self,
+        normalized_latents: torch.Tensor,
+        token_ids: torch.LongTensor,
+        token_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        unit_mask = token_masks.any(dim=-1)
+        context_ids, context_masks, active = self.dil_context_inputs(
+            token_ids,
+            token_masks,
+            unit_mask,
+        )
+        latent_states = self.dil_model.encode(
+            input_ids=context_ids,
+            word_masks=context_masks,
+        )
+        mean, log_std = torch.chunk(latent_states, 2, dim=-1)
+        mean, _ = self.dil_model.normalize_distribution(mean.float(), log_std.float())
+        flat_latents = normalized_latents.reshape(-1, normalized_latents.shape[-1])
+        scores = torch.zeros(flat_latents.shape[0], dtype=mean.dtype, device=mean.device)
+        scores[active] = F.cosine_similarity(mean, flat_latents[active].float(), dim=-1)
+        return scores.reshape(normalized_latents.shape[:-1])
 
     @torch.no_grad()
     def generate(
@@ -523,6 +555,7 @@ class Naz(PreTrainedModel):
         unit_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 16,
         num_samples: int = 64,
+        roundtrip_check: bool = False,
     ) -> NazGenerationOutput:
         self.eval()
         if max_new_tokens <= 0:
@@ -551,6 +584,10 @@ class Naz(PreTrainedModel):
             past_key_values = outputs.past_key_values
             last_hidden = outputs.last_hidden_state[:, -1, :]
             next_mean, next_log_std = self.generative_head.sample_distribution(last_hidden)
+            next_mean, next_log_std = self.dil_model.guard_normalized_distribution(
+                next_mean,
+                next_log_std,
+            )
             generated_means.append(next_mean)
             generated_log_stds.append(next_log_std)
             current_input_embeds = self.student_core.embed_distribution(
@@ -560,7 +597,13 @@ class Naz(PreTrainedModel):
 
         generated_mean = torch.stack(generated_means, dim=1)
         generated_log_std = torch.stack(generated_log_stds, dim=1)
+        generated_raw_mean = self.dil_model.denormalize_mean(generated_mean)
         generated_ids, generated_masks, generated_lengths = self.decode_latent_tokens(generated_mean)
+        roundtrip_cosine = (
+            self.roundtrip_semantic_cosine(generated_mean, generated_ids, generated_masks)
+            if roundtrip_check
+            else None
+        )
         sequences = torch.cat((input_ids, generated_ids), dim=1)
         sequence_word_masks = torch.cat((word_masks, generated_masks), dim=1)
         sequence_unit_mask = torch.cat(
@@ -582,6 +625,8 @@ class Naz(PreTrainedModel):
             generated_lengths=generated_lengths,
             generated_mean=generated_mean,
             generated_log_std=generated_log_std,
+            generated_raw_mean=generated_raw_mean,
+            roundtrip_cosine=roundtrip_cosine,
         )
 
     def forward(

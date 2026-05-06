@@ -14,7 +14,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 11
+CHECKPOINT_FORMAT_VERSION = 12
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -92,6 +92,7 @@ def generate_latent_steps(
 
     for step_idx in range(step_count):
         next_mean, next_log_std = model.generative_head.sample_distribution(hidden_state)
+        next_mean, next_log_std = model.dil_model.guard_normalized_distribution(next_mean, next_log_std)
         yield next_mean, next_log_std
 
         if step_idx < forced_embeddings.shape[1]:
@@ -123,7 +124,9 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
         raise ValueError(f"unsupported checkpoint format_version={checkpoint.get('format_version')}")
     dil_path = Path(config.dil_path)
     if not dil_path.is_absolute():
-        dil_path = (checkpoint_dir / dil_path).resolve()
+        cwd_relative = dil_path.resolve()
+        checkpoint_relative = (checkpoint_dir / dil_path).resolve()
+        dil_path = cwd_relative if cwd_relative.exists() else checkpoint_relative
     config.dil_path = str(dil_path)
     model = Naz(config).to(device)
     model.load_trainable_state_dict(checkpoint["model_state_dict"])

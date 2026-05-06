@@ -25,14 +25,19 @@ class DilConfig(PretrainedConfig):
         layer_geometry_weight=4.0,
         mean_geometry_weight=8.0,
         variance_weight=0.05,
-        length_loss_weight=0.5,
+        semantic_normalizer_momentum=0.01,
+        semantic_normalizer_eps=1e-4,
+        semantic_normalizer_z_clip=6.0,
+        normalized_log_std_min=-8.0,
+        normalized_log_std_max=4.0,
+        decoder_start_token_id=None,
         tokenizer_vocab_file="hybrid_surface_vocab.json",
         nllb_model_name="facebook/nllb-200-distilled-600M",
         nllb_src_lang="tur_Latn",
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=9,
+        checkpoint_format_version=11,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:
@@ -62,7 +67,12 @@ class DilConfig(PretrainedConfig):
         self.layer_geometry_weight = layer_geometry_weight
         self.mean_geometry_weight = mean_geometry_weight
         self.variance_weight = variance_weight
-        self.length_loss_weight = length_loss_weight
+        self.semantic_normalizer_momentum = semantic_normalizer_momentum
+        self.semantic_normalizer_eps = semantic_normalizer_eps
+        self.semantic_normalizer_z_clip = semantic_normalizer_z_clip
+        self.normalized_log_std_min = normalized_log_std_min
+        self.normalized_log_std_max = normalized_log_std_max
+        resolved_decoder_start_token_id = eos_token_id if decoder_start_token_id is None else decoder_start_token_id
         self.tokenizer_vocab_file = tokenizer_vocab_file
         self.nllb_model_name = nllb_model_name
         self.nllb_src_lang = nllb_src_lang
@@ -71,4 +81,10 @@ class DilConfig(PretrainedConfig):
         self.mlp_bias = mlp_bias
         self.checkpoint_format_version = checkpoint_format_version
 
-        super().__init__(pad_token_id=pad_token_id, eos_token_id=eos_token_id, **kwargs)
+        super().__init__(
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            decoder_start_token_id=resolved_decoder_start_token_id,
+            **kwargs,
+        )
+        self.decoder_start_token_id = resolved_decoder_start_token_id

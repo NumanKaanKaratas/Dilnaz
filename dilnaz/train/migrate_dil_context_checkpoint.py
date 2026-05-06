@@ -14,7 +14,7 @@ from models.modeling_dil import Dil  # noqa: E402
 
 
 SOURCE_FORMAT_VERSION = 8
-TARGET_FORMAT_VERSION = 9
+TARGET_FORMAT_VERSION = 11
 
 
 def load_json(path: Path) -> dict:
@@ -41,6 +41,8 @@ def copied_state_dict(source_state: dict[str, torch.Tensor], target_state: dict[
     copied = []
     merged = dict(target_state)
     for key, source_tensor in source_state.items():
+        if not key.startswith("encoder."):
+            continue
         target_tensor = target_state.get(key)
         if target_tensor is not None and target_tensor.shape == source_tensor.shape:
             merged[key] = source_tensor.to(device=target_tensor.device, dtype=target_tensor.dtype)
