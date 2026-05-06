@@ -13,6 +13,7 @@ from models.modeling_dil import Dil, DilGatedMLP, DilRMSNorm
 from models.modeling_naz import Naz
 from models.naz_backbone import SemanticDeltaMixer, SemanticGlobalAttention, ZeroCenteredRMSNorm
 from naz_data import ResidentNazBatcher
+from train_dil_decoder import configure_writer_only_training, writer_only_forward, writer_trainable_parameters
 from train_naz import build_resident_semantic_cache
 
 
@@ -236,6 +237,57 @@ def test_semantic_losses_update_semantic_encoder():
     assert model.encoder.context_q_proj.weight.grad is not None
     assert model.encoder.context_gate.weight.grad is not None
     assert model.decoder.latent_to_hidden.weight.grad is None
+
+
+def test_writer_only_step_freezes_encoder_and_tied_output_head():
+    config = tiny_config()
+    model = Dil(config)
+    input_ids = torch.tensor(
+        [
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
+        ],
+        dtype=torch.long,
+    )
+    labels = torch.tensor(
+        [
+            [5, 6, 7, -100],
+            [11, 12, 13, -100],
+        ],
+        dtype=torch.long,
+    )
+    batch = {
+        "input_ids": input_ids,
+        "word_masks": input_ids.ne(config.pad_token_id),
+        "labels": labels,
+        "length_labels": labels.ne(-100).sum(dim=-1) - 1,
+    }
+    encoder_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.encoder.named_parameters()
+    }
+    tied_head_before = model.decoder.lm_head_weight.detach().clone()
+    decoder_before = model.decoder.latent_to_hidden.weight.detach().clone()
+
+    configure_writer_only_training(model)
+    optimizer = torch.optim.AdamW(writer_trainable_parameters(model), lr=1e-2)
+    optimizer.zero_grad(set_to_none=True)
+    outputs = writer_only_forward(model, batch)
+    outputs.loss.backward()
+
+    assert torch.isfinite(outputs.loss)
+    assert not hasattr(outputs, "kl_loss")
+    assert model.encoder.embed_tokens.weight.grad is None
+    assert model.decoder.lm_head_weight.grad is None
+    assert grad_abs_sum(model.decoder.latent_to_hidden.weight) > 0.0
+    assert grad_abs_sum(model.length_head[-1].weight) > 0.0
+
+    optimizer.step()
+
+    for name, parameter in model.encoder.named_parameters():
+        assert torch.allclose(parameter, encoder_before[name])
+    assert torch.allclose(model.decoder.lm_head_weight, tied_head_before)
+    assert not torch.allclose(model.decoder.latent_to_hidden.weight, decoder_before)
 
 
 def test_naz_uses_dil_encoder_target_log_std(tmp_path):
