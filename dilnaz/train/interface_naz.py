@@ -14,7 +14,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 16
+CHECKPOINT_FORMAT_VERSION = 18
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -101,7 +101,6 @@ def stream_text(
     max_new_tokens: int,
     num_samples: int,
     min_new_tokens: int,
-    stop_threshold: float,
     repetition_cos_threshold: float,
 ):
     if max_new_tokens <= 0:
@@ -119,7 +118,6 @@ def stream_text(
         max_new_tokens=max_new_tokens,
         num_samples=num_samples,
         min_new_tokens=min_new_tokens,
-        stop_threshold=stop_threshold,
         repetition_cos_threshold=repetition_cos_threshold,
     ):
         token = decode_token_ids(tokenizer, step.token_ids[0], step.word_masks[0])
@@ -138,7 +136,6 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--min-new-tokens", type=int, default=None)
-    parser.add_argument("--stop-threshold", type=float, default=None)
     parser.add_argument("--repetition-cos-threshold", type=float, default=None)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", type=str, default="auto")
@@ -171,7 +168,6 @@ def main():
         args.max_new_tokens,
         args.num_samples,
         config.min_new_tokens if args.min_new_tokens is None else args.min_new_tokens,
-        config.stop_threshold if args.stop_threshold is None else args.stop_threshold,
         config.repetition_cos_threshold if args.repetition_cos_threshold is None else args.repetition_cos_threshold,
     )
 

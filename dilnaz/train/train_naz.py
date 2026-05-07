@@ -41,7 +41,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer
 
 
-CHECKPOINT_FORMAT_VERSION = 16
+CHECKPOINT_FORMAT_VERSION = 18
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -139,7 +139,6 @@ def evaluate(model, eval_loader, device, autocast_enabled: bool, max_batches: in
         "mean_loss": 0.0,
         "cosine_loss": 0.0,
         "writer_loss": 0.0,
-        "stop_loss": 0.0,
         "latent_cos": 0.0,
         "candidate_cos": 0.0,
         "byte_acc": 0.0,
@@ -154,7 +153,6 @@ def evaluate(model, eval_loader, device, autocast_enabled: bool, max_batches: in
         total["mean_loss"] += float(outputs.mean_loss.detach().cpu())
         total["cosine_loss"] += float(outputs.cosine_loss.detach().cpu())
         total["writer_loss"] += float(outputs.writer_loss.detach().cpu())
-        total["stop_loss"] += float(outputs.stop_loss.detach().cpu())
         total["latent_cos"] += float(outputs.latent_cos.detach().cpu())
         total["candidate_cos"] += float(outputs.candidate_cos.detach().cpu())
         total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
@@ -176,7 +174,6 @@ def format_log(step: int, metrics: dict) -> str:
         f"mean_loss={metrics['mean_loss']:.4f}",
         f"cosine_loss={metrics['cosine_loss']:.4f}",
         f"writer_loss={metrics['writer_loss']:.4f}",
-        f"stop_loss={metrics['stop_loss']:.4f}",
         f"latent_cos={metrics['latent_cos']:.4f}",
         f"candidate_cos={metrics['candidate_cos']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
@@ -226,9 +223,8 @@ def build_resident_semantic_cache(
     mean_cache = torch.cat(means, dim=0)
     log_std_cache = torch.cat(log_stds, dim=0)
     semantic_states = mean_cache
-    stop_cache = surface_batcher.terminal_flags.bool()
     model.train()
-    return semantic_states, mean_cache, log_std_cache, stop_cache, surface_batcher.byte_ids, surface_batcher.lengths
+    return semantic_states, mean_cache, log_std_cache, surface_batcher.byte_ids, surface_batcher.lengths
 
 
 def run_naz_batch(model, batch, training_step: int | None = None):
@@ -240,7 +236,6 @@ def run_naz_batch(model, batch, training_step: int | None = None):
             unit_mask=batch["unit_mask"],
             target_input_ids=batch["target_input_ids"],
             target_word_masks=batch["target_word_masks"],
-            stop_targets=batch["stop_targets"],
             training_step=training_step,
         )
     return model(**batch, training_step=training_step)
@@ -308,7 +303,6 @@ def parse_args():
     parser.add_argument("--writer-target-warmup-steps", type=int, default=NAZ_MODEL_DEFAULTS["writer_target_warmup_steps"])
     parser.add_argument("--writer-candidate-start-step", type=int, default=NAZ_MODEL_DEFAULTS["writer_candidate_start_step"])
     parser.add_argument("--writer-candidate-probability", type=float, default=NAZ_MODEL_DEFAULTS["writer_candidate_probability"])
-    parser.add_argument("--stop-loss-weight", type=float, default=NAZ_MODEL_DEFAULTS["stop_loss_weight"])
     return parser.parse_args()
 
 
@@ -350,9 +344,8 @@ def validate_args(args):
         or args.cosine_loss_weight < 0.0
         or args.energy_loss_weight < 0.0
         or args.writer_loss_weight < 0.0
-        or args.stop_loss_weight < 0.0
     ):
-        raise ValueError("--mean-loss-weight, --cosine-loss-weight, --energy-loss-weight, --writer-loss-weight and --stop-loss-weight must be >= 0")
+        raise ValueError("--mean-loss-weight, --cosine-loss-weight, --energy-loss-weight and --writer-loss-weight must be >= 0")
     if args.writer_target_warmup_steps < 0 or args.writer_candidate_start_step < 0:
         raise ValueError("--writer-target-warmup-steps and --writer-candidate-start-step must be >= 0")
     if not 0.0 <= args.writer_candidate_probability <= 1.0:
@@ -402,7 +395,6 @@ def build_config(args, dil_config: DilConfig):
         writer_target_warmup_steps=args.writer_target_warmup_steps,
         writer_candidate_start_step=args.writer_candidate_start_step,
         writer_candidate_probability=args.writer_candidate_probability,
-        stop_loss_weight=args.stop_loss_weight,
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         num_hidden_layers=args.num_hidden_layers,
@@ -444,7 +436,7 @@ def main():
     tokenizer = HybridTokenizer.from_file(dil_checkpoint_dir / dil_config.tokenizer_vocab_file)
 
     token_cache_dir = args.token_cache_dir or args.output_dir / "naz_token_cache"
-    train_ids_path, train_lengths_path, train_terminal_path, train_token_count = build_token_cache(
+    train_ids_path, train_lengths_path, train_token_count = build_token_cache(
         args.train_file,
         tokenizer,
         dil_config.max_word_bytes,
@@ -505,7 +497,6 @@ def main():
         train_surface = ResidentNazBatcher(
             train_ids_path,
             train_lengths_path,
-            train_terminal_path,
             train_token_count,
             dil_config,
             args.sequence_length,
@@ -527,11 +518,10 @@ def main():
         )
         eval_loader = None
         if eval_cache is not None:
-            eval_ids_path, eval_lengths_path, eval_terminal_path, eval_token_count = eval_cache
+            eval_ids_path, eval_lengths_path, eval_token_count = eval_cache
             eval_surface = ResidentNazBatcher(
                 eval_ids_path,
                 eval_lengths_path,
-                eval_terminal_path,
                 eval_token_count,
                 dil_config,
                 args.sequence_length,
@@ -558,7 +548,6 @@ def main():
             RandomWindowNazDataset(
                 train_ids_path,
                 train_lengths_path,
-                train_terminal_path,
                 train_token_count,
                 dil_config,
                 args.sequence_length,
@@ -571,12 +560,11 @@ def main():
         )
         eval_loader = None
         if eval_cache is not None:
-            eval_ids_path, eval_lengths_path, eval_terminal_path, eval_token_count = eval_cache
+            eval_ids_path, eval_lengths_path, eval_token_count = eval_cache
             eval_loader = make_naz_loader(
                 RandomWindowNazDataset(
                     eval_ids_path,
                     eval_lengths_path,
-                    eval_terminal_path,
                     eval_token_count,
                     dil_config,
                     args.sequence_length,
@@ -601,7 +589,6 @@ def main():
         "mean_loss": 0.0,
         "cosine_loss": 0.0,
         "writer_loss": 0.0,
-        "stop_loss": 0.0,
         "latent_cos": 0.0,
         "candidate_cos": 0.0,
         "byte_acc": 0.0,
@@ -662,7 +649,6 @@ def main():
             metric_sums["mean_loss"] += float(outputs.mean_loss.detach().cpu())
             metric_sums["cosine_loss"] += float(outputs.cosine_loss.detach().cpu())
             metric_sums["writer_loss"] += float(outputs.writer_loss.detach().cpu())
-            metric_sums["stop_loss"] += float(outputs.stop_loss.detach().cpu())
             metric_sums["latent_cos"] += float(outputs.latent_cos.detach().cpu())
             metric_sums["candidate_cos"] += float(outputs.candidate_cos.detach().cpu())
             metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())

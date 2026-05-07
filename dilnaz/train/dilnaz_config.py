@@ -78,8 +78,6 @@ NAZ_MODEL_DEFAULTS = {
     "writer_target_warmup_steps": 200,
     "writer_candidate_start_step": 300,
     "writer_candidate_probability": 0.25,
-    "stop_loss_weight": 0.1,
-    "stop_threshold": 0.65,
     "repetition_cos_threshold": 0.985,
     "min_new_tokens": 1,
 }

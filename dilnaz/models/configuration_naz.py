@@ -27,8 +27,6 @@ class NazConfig(PretrainedConfig):
         writer_target_warmup_steps=200,
         writer_candidate_start_step=1000,
         writer_candidate_probability=0.25,
-        stop_loss_weight=0.1,
-        stop_threshold=0.65,
         repetition_cos_threshold=0.985,
         min_new_tokens=1,
         hidden_size=512,
@@ -78,8 +76,6 @@ class NazConfig(PretrainedConfig):
         self.writer_target_warmup_steps = writer_target_warmup_steps
         self.writer_candidate_start_step = writer_candidate_start_step
         self.writer_candidate_probability = writer_candidate_probability
-        self.stop_loss_weight = stop_loss_weight
-        self.stop_threshold = stop_threshold
         self.repetition_cos_threshold = repetition_cos_threshold
         self.min_new_tokens = min_new_tokens
         self.hidden_size = hidden_size

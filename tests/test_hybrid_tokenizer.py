@@ -214,9 +214,10 @@ def test_naz_token_stream_preserves_extra_spaces(tmp_path):
 
     token_ids = list(stream_token_pieces(train_file, tokenizer, max_word_bytes=32, read_chars=2))
 
-    assert "".join(tokenizer.decode(ids) for ids in token_ids) == text
+    assert token_ids[-1] == [tokenizer.eos_token_id]
+    assert "".join(tokenizer.decode(ids) for ids in token_ids[:-1]) == text
     assert tokenizer.is_leading_space_token(token_ids[2][0])
-    assert tokenizer.is_leading_space_token(token_ids[-1][0])
+    assert tokenizer.is_leading_space_token(token_ids[-2][0])
 
 
 def test_interfaces_do_not_keep_manual_join_logic():

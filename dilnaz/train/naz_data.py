@@ -13,7 +13,7 @@ from tokenization import HybridTokenizer
 
 
 WHITESPACE_PATTERN = re.compile(r"\s+", re.UNICODE)
-TOKEN_CACHE_FORMAT_VERSION = 4
+TOKEN_CACHE_FORMAT_VERSION = 5
 
 
 def last_whitespace_end(text: str) -> int:
@@ -78,22 +78,18 @@ def stream_text_lines(path: Path, read_chars: int):
 
 
 def stream_token_pieces(path: Path, tokenizer: HybridTokenizer, max_word_bytes: int, read_chars: int):
-    for token_ids, _ in stream_token_terminal_pieces(path, tokenizer, max_word_bytes, read_chars):
-        yield token_ids
-
-
-def stream_token_terminal_pieces(path: Path, tokenizer: HybridTokenizer, max_word_bytes: int, read_chars: int):
     for line in stream_text_lines(path, read_chars):
-        emitted = []
+        emitted = False
         for segment in tokenizer.encode_segments(line):
             if segment.piece_len > max_word_bytes:
                 continue
             token_ids = [piece.token_id for piece in segment.pieces]
             if not token_ids:
                 continue
-            emitted.append(token_ids)
-        for idx, token_ids in enumerate(emitted):
-            yield token_ids, idx == len(emitted) - 1
+            emitted = True
+            yield token_ids
+        if emitted:
+            yield [tokenizer.eos_token_id]
 
 
 def vocab_fingerprint(tokenizer: HybridTokenizer) -> str:
@@ -126,11 +122,10 @@ def token_cache_key(
     return hashlib.sha256(encoded).hexdigest()[:24]
 
 
-def token_cache_paths(cache_dir: Path, key: str) -> tuple[Path, Path, Path, Path]:
+def token_cache_paths(cache_dir: Path, key: str) -> tuple[Path, Path, Path]:
     return (
         cache_dir / f"{key}.ids.npy",
         cache_dir / f"{key}.lengths.npy",
-        cache_dir / f"{key}.terminal.npy",
         cache_dir / f"{key}.json",
     )
 
@@ -142,32 +137,28 @@ def build_token_cache(
     pad_token_id: int,
     read_chars: int,
     cache_dir: Path,
-) -> tuple[Path, Path, Path, int]:
+) -> tuple[Path, Path, int]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     key = token_cache_key(path, tokenizer, max_word_bytes, read_chars)
-    ids_path, lengths_path, terminal_path, meta_path = token_cache_paths(cache_dir, key)
-    if ids_path.exists() and lengths_path.exists() and terminal_path.exists() and meta_path.exists():
+    ids_path, lengths_path, meta_path = token_cache_paths(cache_dir, key)
+    if ids_path.exists() and lengths_path.exists() and meta_path.exists():
         with meta_path.open("r", encoding="utf-8") as handle:
             meta = json.load(handle)
         if meta["format_version"] == TOKEN_CACHE_FORMAT_VERSION:
-            return ids_path, lengths_path, terminal_path, int(meta["token_count"])
+            return ids_path, lengths_path, int(meta["token_count"])
 
-    token_count = sum(1 for _ in stream_token_terminal_pieces(path, tokenizer, max_word_bytes, read_chars))
+    token_count = sum(1 for _ in stream_token_pieces(path, tokenizer, max_word_bytes, read_chars))
     if token_count < 2:
         raise ValueError(f"{path} needs at least two tokens for sequence training")
     byte_ids = np.lib.format.open_memmap(ids_path, mode="w+", dtype=np.uint16, shape=(token_count, max_word_bytes))
     lengths = np.lib.format.open_memmap(lengths_path, mode="w+", dtype=np.uint8, shape=(token_count,))
-    terminal_flags = np.lib.format.open_memmap(terminal_path, mode="w+", dtype=np.bool_, shape=(token_count,))
     byte_ids[:] = pad_token_id
-    terminal_flags[:] = False
-    for token_idx, (ids, is_terminal) in enumerate(stream_token_terminal_pieces(path, tokenizer, max_word_bytes, read_chars)):
+    for token_idx, ids in enumerate(stream_token_pieces(path, tokenizer, max_word_bytes, read_chars)):
         width = len(ids)
         byte_ids[token_idx, :width] = np.asarray(ids, dtype=np.uint16)
         lengths[token_idx] = width
-        terminal_flags[token_idx] = is_terminal
     byte_ids.flush()
     lengths.flush()
-    terminal_flags.flush()
 
     stat = path.stat()
     meta = {
@@ -183,7 +174,7 @@ def build_token_cache(
     }
     with meta_path.open("w", encoding="utf-8") as handle:
         json.dump(meta, handle, indent=2)
-    return ids_path, lengths_path, terminal_path, token_count
+    return ids_path, lengths_path, token_count
 
 
 class RandomWindowNazDataset(IterableDataset):
@@ -191,7 +182,6 @@ class RandomWindowNazDataset(IterableDataset):
         self,
         ids_path: Path,
         lengths_path: Path,
-        terminal_path: Path,
         token_count: int,
         config: DilConfig,
         sequence_length: int,
@@ -201,7 +191,6 @@ class RandomWindowNazDataset(IterableDataset):
         super().__init__()
         self.ids_path = ids_path
         self.lengths_path = lengths_path
-        self.terminal_path = terminal_path
         self.token_count = token_count
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
@@ -210,7 +199,6 @@ class RandomWindowNazDataset(IterableDataset):
         self.seed = seed
         self._byte_ids = None
         self._lengths = None
-        self._terminal_flags = None
         self.offsets = np.arange(sequence_length, dtype=np.int64).reshape(1, sequence_length)
         self.positions = torch.arange(self.max_word_bytes).reshape(1, 1, self.max_word_bytes)
 
@@ -226,12 +214,6 @@ class RandomWindowNazDataset(IterableDataset):
             self._lengths = np.load(self.lengths_path, mmap_mode="r")
         return self._lengths
 
-    @property
-    def terminal_flags(self):
-        if self._terminal_flags is None:
-            self._terminal_flags = np.load(self.terminal_path, mmap_mode="r")
-        return self._terminal_flags
-
     def make_batch(self, starts: list[int]):
         starts_array = np.asarray(starts, dtype=np.int64).reshape(-1, 1)
         source_idx = starts_array + self.offsets
@@ -243,7 +225,6 @@ class RandomWindowNazDataset(IterableDataset):
         target_input_ids = torch.from_numpy(np.asarray(self.byte_ids[target_idx], dtype=np.int64))
         source_lengths = torch.from_numpy(np.asarray(self.lengths[source_idx], dtype=np.int64))
         target_lengths = torch.from_numpy(np.asarray(self.lengths[target_idx], dtype=np.int64))
-        stop_targets = torch.from_numpy(np.asarray(self.terminal_flags[target_idx], dtype=np.bool_))
         unit_mask = torch.from_numpy(unit_mask_np)
         word_masks = (self.positions < source_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
         target_word_masks = (self.positions < target_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
@@ -253,7 +234,6 @@ class RandomWindowNazDataset(IterableDataset):
             "target_input_ids": target_input_ids,
             "target_word_masks": target_word_masks,
             "unit_mask": unit_mask,
-            "stop_targets": stop_targets & unit_mask,
         }
 
     def sample_start(self, rng: random.Random) -> int:
@@ -286,7 +266,6 @@ class ResidentNazBatcher:
         self,
         ids_path: Path,
         lengths_path: Path,
-        terminal_path: Path,
         token_count: int,
         config: DilConfig,
         sequence_length: int,
@@ -296,7 +275,6 @@ class ResidentNazBatcher:
     ):
         self.byte_ids = torch.from_numpy(np.array(np.load(ids_path, mmap_mode="r"), dtype=np.int64, copy=True)).to(device)
         self.lengths = torch.from_numpy(np.array(np.load(lengths_path, mmap_mode="r"), dtype=np.int64, copy=True)).to(device)
-        self.terminal_flags = torch.from_numpy(np.array(np.load(terminal_path, mmap_mode="r"), dtype=np.bool_, copy=True)).to(device)
         self.token_count = token_count
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
@@ -356,7 +334,6 @@ class ResidentNazBatcher:
             "target_input_ids": target_input_ids,
             "target_word_masks": (self.positions < target_lengths) & unit_mask.unsqueeze(-1),
             "unit_mask": unit_mask,
-            "stop_targets": self.terminal_flags.index_select(0, target_idx.reshape(-1)).reshape(batch_size, self.sequence_length) & unit_mask,
         }
 
 
@@ -378,7 +355,6 @@ class ResidentNazSemanticBatcher:
         semantic_states: torch.Tensor,
         target_mean: torch.Tensor,
         target_log_std: torch.Tensor,
-        stop_targets: torch.Tensor,
         byte_ids: torch.LongTensor,
         lengths: torch.LongTensor,
         sequence_length: int,
@@ -389,14 +365,11 @@ class ResidentNazSemanticBatcher:
             raise ValueError("semantic and target caches must have matching token dimensions")
         if target_mean.shape != target_log_std.shape:
             raise ValueError("target mean/log_std caches must have matching shape")
-        if stop_targets.shape != semantic_states.shape[:-1]:
-            raise ValueError("stop target cache must match token dimensions")
         if byte_ids.shape[0] != semantic_states.shape[0] or lengths.shape[0] != semantic_states.shape[0]:
             raise ValueError("surface cache must match semantic token count")
         self.semantic_states = semantic_states
         self.target_mean = target_mean
         self.target_log_std = target_log_std
-        self.stop_targets = stop_targets.bool()
         self.byte_ids = byte_ids.long()
         self.lengths = lengths.long()
         self.token_count = semantic_states.shape[0]
@@ -456,10 +429,6 @@ class ResidentNazSemanticBatcher:
                 self.sequence_length,
                 -1,
             ),
-            "stop_targets": self.stop_targets.index_select(0, target_idx.reshape(-1)).reshape(
-                batch_size,
-                self.sequence_length,
-            ) & unit_mask,
             "target_input_ids": target_input_ids,
             "target_word_masks": (self.positions < target_lengths) & unit_mask.unsqueeze(-1),
             "unit_mask": unit_mask,

@@ -23,13 +23,11 @@ class NazOutput(ModelOutput):
     mean_loss: Optional[torch.FloatTensor] = None
     cosine_loss: Optional[torch.FloatTensor] = None
     writer_loss: Optional[torch.FloatTensor] = None
-    stop_loss: Optional[torch.FloatTensor] = None
     latent_cos: Optional[torch.FloatTensor] = None
     candidate_cos: Optional[torch.FloatTensor] = None
     byte_acc: Optional[torch.FloatTensor] = None
     latent_predictions: Optional[torch.FloatTensor] = None
     predicted_mean: Optional[torch.FloatTensor] = None
-    stop_prob: Optional[torch.FloatTensor] = None
     target_mean: Optional[torch.FloatTensor] = None
     target_log_std: Optional[torch.FloatTensor] = None
 
@@ -54,7 +52,6 @@ class NazGenerationStep(ModelOutput):
     feedback_latent: Optional[torch.FloatTensor] = None
     roundtrip_score: Optional[torch.FloatTensor] = None
     likelihood_score: Optional[torch.FloatTensor] = None
-    stop_probability: Optional[torch.FloatTensor] = None
     should_stop: Optional[torch.Tensor] = None
 
 
@@ -165,13 +162,26 @@ class NazContextualWriter(nn.Module):
         if 0 <= pad_token_id < self.embed_tokens.num_embeddings:
             self.embed_tokens.weight.data[pad_token_id].zero_()
 
-    def forward(self, latents: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        if latents.dim() == hidden_states.dim() + 1:
-            hidden_states = hidden_states.unsqueeze(0).expand(*latents.shape[:-1], hidden_states.shape[-1])
+    def match_leading_shape(self, tensor: torch.Tensor, leading_shape: torch.Size) -> torch.Tensor:
+        while tensor.dim() - 1 < len(leading_shape):
+            tensor = tensor.unsqueeze(0)
+        if tensor.shape[:-1] != leading_shape:
+            tensor = tensor.expand(*leading_shape, tensor.shape[-1])
+        return tensor
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
         latent_shape = latents.shape[:-1]
+        hidden_states = self.match_leading_shape(hidden_states, latent_shape)
         flat_latents = latents.reshape(-1, latents.shape[-1])
         flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
-        fused = self.fuse_norm(self.latent_proj(flat_latents) + self.hidden_proj(flat_hidden))
+        fused = self.fuse_norm(
+            self.latent_proj(flat_latents)
+            + self.hidden_proj(flat_hidden)
+        )
         byte_states = self.expand_layer(fused).reshape(flat_latents.shape[0], self.max_word_bytes, -1)
         positions = torch.arange(self.max_word_bytes, device=latents.device)
         byte_states = byte_states + self.position_embeddings(positions).unsqueeze(0)
@@ -194,10 +204,6 @@ class NazStudentCore(nn.Module):
         self.mean_head = NazFinalLayer(config.hidden_size, config.latent_size)
         self.generative_head = NazLatentGenerator(config)
         self.writer = NazContextualWriter(config)
-        self.stop_head = nn.Sequential(
-            nn.LayerNorm(config.hidden_size, eps=1e-6),
-            nn.Linear(config.hidden_size, 1, bias=True),
-        )
 
     def initialize_weights(self, config: NazConfig):
         self.generative_head.initialize_weights()
@@ -244,8 +250,6 @@ class Naz(PreTrainedModel):
         self.writer_target_warmup_steps = config.writer_target_warmup_steps
         self.writer_candidate_start_step = config.writer_candidate_start_step
         self.writer_candidate_probability = config.writer_candidate_probability
-        self.stop_loss_weight = config.stop_loss_weight
-        self.stop_threshold = config.stop_threshold
         self.repetition_cos_threshold = config.repetition_cos_threshold
         self.min_new_tokens = config.min_new_tokens
 
@@ -274,10 +278,6 @@ class Naz(PreTrainedModel):
     @property
     def writer(self):
         return self.student_core.writer
-
-    @property
-    def stop_head(self):
-        return self.student_core.stop_head
 
     def _validate_dil_config(
         self,
@@ -508,15 +508,22 @@ class Naz(PreTrainedModel):
         unit_mask: torch.Tensor,
     ) -> torch.LongTensor:
         labels = torch.full_like(target_input_ids, -100)
-        labels = torch.where(target_word_masks, target_input_ids, labels)
+        eos_unit = target_word_masks[..., 0] & target_input_ids[..., 0].eq(self.config.eos_token_id)
+        labels = torch.where(target_word_masks & ~eos_unit.unsqueeze(-1), target_input_ids, labels)
+        eos_batch_idx, eos_unit_idx = torch.where(unit_mask & eos_unit)
+        labels[eos_batch_idx, eos_unit_idx, 0] = self.config.eos_token_id
         lengths = target_word_masks.long().sum(dim=-1)
         eos_positions = lengths.clamp_max(self.max_word_bytes - 1)
-        eos_valid = unit_mask & lengths.lt(self.max_word_bytes)
+        eos_valid = unit_mask & ~eos_unit & lengths.lt(self.max_word_bytes)
         batch_idx, unit_idx = torch.where(eos_valid)
         labels[batch_idx, unit_idx, eos_positions[eos_valid]] = self.config.eos_token_id
         return labels.masked_fill(~unit_mask.unsqueeze(-1), -100)
 
-    def writer_logits(self, latents: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    def writer_logits(
+        self,
+        latents: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
         compiled_forward = getattr(self, "_compiled_writer_forward", None)
         if compiled_forward is not None:
             return compiled_forward(latents, hidden_states)
@@ -622,53 +629,74 @@ class Naz(PreTrainedModel):
         unit_mask: torch.Tensor,
         target_input_ids: torch.LongTensor,
         target_word_masks: torch.Tensor,
-        stop_targets: Optional[torch.Tensor] = None,
         training_step: Optional[int] = None,
     ) -> NazOutput:
         hidden_states = self._student_hidden(semantic_states, unit_mask)
+        predicted_mean_full = self.guard_normalized_latents(self.mean_head(hidden_states).float())
         active_hidden = hidden_states[unit_mask]
-        active_target_mean = target_mean if target_mean.dim() == 2 else target_mean[unit_mask]
-        active_target_log_std = target_log_std if target_log_std.dim() == 2 else target_log_std[unit_mask]
-        predicted_mean = self.guard_normalized_latents(self.mean_head(hidden_states).float())[unit_mask]
-        anchor_prediction = predicted_mean.unsqueeze(0)
+        target_eos = target_word_masks[..., 0] & target_input_ids[..., 0].eq(self.config.eos_token_id)
+        active_target_eos = target_eos[unit_mask]
+        active_unit_target_mean = target_mean if target_mean.dim() == 2 else target_mean[unit_mask]
+        active_unit_target_log_std = target_log_std if target_log_std.dim() == 2 else target_log_std[unit_mask]
+        predicted_mean_active = predicted_mean_full[unit_mask]
         sample_count = self.num_samples - 1
         repeated_hidden = active_hidden.unsqueeze(0).repeat(sample_count, 1, 1)
         sampled_offsets = self.generative_head.sample(repeated_hidden).float()
-        sample_predictions = self.guard_normalized_latents(
-            predicted_mean.unsqueeze(0) + sampled_offsets
-        )
-        energy = self.energy_score(
-            sample_predictions,
-            active_target_mean,
-            active_target_log_std,
-        ).mean()
-        energy_loss = -energy
-        mean_loss = F.mse_loss(predicted_mean, active_target_mean)
-        cosine = F.cosine_similarity(
-            predicted_mean,
-            active_target_mean,
-            dim=-1,
-        )
-        latent_cos = cosine.mean()
-        expanded_sample_target_mean = active_target_mean.unsqueeze(0).expand_as(sample_predictions)
-        candidate_cos = F.cosine_similarity(
-            sample_predictions.detach(),
-            expanded_sample_target_mean,
-            dim=-1,
-        ).mean()
-        cosine_loss = (1.0 - cosine).mean()
+        sample_predictions_active = self.guard_normalized_latents(predicted_mean_active.unsqueeze(0) + sampled_offsets)
+        semantic_target_mask = ~active_target_eos
+        active_target_mean = active_unit_target_mean[semantic_target_mask]
+        active_target_log_std = active_unit_target_log_std[semantic_target_mask]
+        predicted_mean = predicted_mean_active[semantic_target_mask]
+        sample_predictions = sample_predictions_active[:, semantic_target_mask]
+        anchor_prediction = predicted_mean_active.unsqueeze(0)
+        if active_target_mean.shape[0] == 0:
+            energy = active_hidden.new_zeros(())
+            energy_loss = active_hidden.new_zeros(())
+            mean_loss = active_hidden.new_zeros(())
+            cosine_loss = active_hidden.new_zeros(())
+            latent_cos = active_hidden.new_zeros(())
+            candidate_cos = active_hidden.new_zeros(())
+        else:
+            energy = self.energy_score(
+                sample_predictions,
+                active_target_mean,
+                active_target_log_std,
+            ).mean()
+            energy_loss = -energy
+            mean_loss = F.mse_loss(predicted_mean, active_target_mean)
+            cosine = F.cosine_similarity(
+                predicted_mean,
+                active_target_mean,
+                dim=-1,
+            )
+            latent_cos = cosine.mean()
+            expanded_sample_target_mean = active_target_mean.unsqueeze(0).expand_as(sample_predictions)
+            candidate_cos = F.cosine_similarity(
+                sample_predictions.detach(),
+                expanded_sample_target_mean,
+                dim=-1,
+            ).mean()
+            cosine_loss = (1.0 - cosine).mean()
         writer_loss = active_hidden.new_zeros(())
         byte_acc = active_hidden.new_zeros(())
         if self.writer_loss_weight > 0.0:
             labels = self.writer_labels(target_input_ids, target_word_masks, unit_mask)
             active_labels = labels[unit_mask].to(active_hidden.device)
             writer_latents = self.writer_training_latents(
-                active_target_mean,
-                predicted_mean,
-                sample_predictions,
+                active_unit_target_mean,
+                predicted_mean_active,
+                sample_predictions_active,
                 training_step,
             )
-            writer_logits = self.writer_logits(writer_latents, active_hidden.detach()).float()
+            writer_latents = torch.where(
+                active_target_eos.unsqueeze(-1),
+                predicted_mean_active.detach(),
+                writer_latents,
+            )
+            writer_logits = self.writer_logits(
+                writer_latents,
+                active_hidden.detach(),
+            ).float()
             writer_loss = F.cross_entropy(
                 writer_logits.reshape(-1, self.config.vocab_size),
                 active_labels.reshape(-1),
@@ -677,17 +705,11 @@ class Naz(PreTrainedModel):
             valid_labels = active_labels.ne(-100)
             byte_correct = writer_logits.argmax(dim=-1).eq(active_labels) & valid_labels
             byte_acc = byte_correct.sum().float() / valid_labels.sum().clamp_min(1).float()
-        stop_logits = self.stop_head(hidden_states).squeeze(-1)
-        if stop_targets is None:
-            stop_targets = torch.zeros_like(unit_mask, dtype=stop_logits.dtype)
-        active_stop_targets = stop_targets.to(stop_logits.device, dtype=stop_logits.dtype)[unit_mask]
-        stop_loss = F.binary_cross_entropy_with_logits(stop_logits[unit_mask].float(), active_stop_targets.float())
         loss = (
             self.energy_loss_weight * energy_loss
             + self.mean_loss_weight * mean_loss
             + self.cosine_loss_weight * cosine_loss
             + self.writer_loss_weight * writer_loss
-            + self.stop_loss_weight * stop_loss
         )
         return NazOutput(
             loss=loss,
@@ -696,13 +718,11 @@ class Naz(PreTrainedModel):
             mean_loss=mean_loss,
             cosine_loss=cosine_loss,
             writer_loss=writer_loss,
-            stop_loss=stop_loss,
             latent_cos=latent_cos,
             candidate_cos=candidate_cos,
             byte_acc=byte_acc,
-            latent_predictions=torch.cat((anchor_prediction, sample_predictions), dim=0),
-            predicted_mean=predicted_mean,
-            stop_prob=torch.sigmoid(stop_logits[unit_mask].float()),
+            latent_predictions=torch.cat((anchor_prediction, sample_predictions_active), dim=0),
+            predicted_mean=predicted_mean_active,
             target_mean=active_target_mean,
             target_log_std=active_target_log_std,
         )
@@ -715,8 +735,7 @@ class Naz(PreTrainedModel):
     ) -> tuple[torch.LongTensor, torch.Tensor, torch.LongTensor]:
         latent_shape = latents.shape[:-1]
         flat_latents = latents.reshape(-1, latents.shape[-1])
-        if latents.dim() == hidden_states.dim() + 1:
-            hidden_states = hidden_states.unsqueeze(0).expand(*latents.shape[:-1], hidden_states.shape[-1])
+        hidden_states = self.writer.match_leading_shape(hidden_states, latent_shape)
         flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
         decode_chunk_size = chunk_size or self.decode_chunk_size
         if decode_chunk_size > 0 and flat_latents.shape[0] > decode_chunk_size:
@@ -802,7 +821,6 @@ class Naz(PreTrainedModel):
         candidate_lengths: torch.LongTensor,
         feedback_means: torch.Tensor,
         feedback_log_stds: torch.Tensor,
-        stop_probability: Optional[torch.Tensor] = None,
         should_stop: Optional[torch.Tensor] = None,
     ) -> NazGenerationStep:
         scores = F.cosine_similarity(candidate_latents, feedback_means, dim=-1)
@@ -840,7 +858,6 @@ class Naz(PreTrainedModel):
             feedback_latent=feedback_means.gather(0, latent_index).squeeze(0),
             roundtrip_score=scores.gather(0, scalar_index).squeeze(0),
             likelihood_score=likelihood_scores.gather(0, scalar_index).squeeze(0),
-            stop_probability=stop_probability,
             should_stop=should_stop,
         )
 
@@ -877,7 +894,6 @@ class Naz(PreTrainedModel):
         num_samples: int = 4,
         roundtrip_check: bool = False,
         min_new_tokens: Optional[int] = None,
-        stop_threshold: Optional[float] = None,
         repetition_cos_threshold: Optional[float] = None,
     ) -> NazGenerationOutput:
         self.eval()
@@ -907,7 +923,6 @@ class Naz(PreTrainedModel):
             max_new_tokens=max_new_tokens,
             num_samples=num_samples,
             min_new_tokens=min_new_tokens,
-            stop_threshold=stop_threshold,
             repetition_cos_threshold=repetition_cos_threshold,
         ):
             generated_latents.append(step.latent)
@@ -956,7 +971,6 @@ class Naz(PreTrainedModel):
         max_new_tokens: int = 16,
         num_samples: int = 4,
         min_new_tokens: Optional[int] = None,
-        stop_threshold: Optional[float] = None,
         repetition_cos_threshold: Optional[float] = None,
     ):
         with torch.no_grad():
@@ -966,7 +980,6 @@ class Naz(PreTrainedModel):
             if num_samples <= 0:
                 raise ValueError("num_samples must be > 0")
             min_new_tokens = self.min_new_tokens if min_new_tokens is None else min_new_tokens
-            stop_threshold = self.stop_threshold if stop_threshold is None else stop_threshold
             repetition_cos_threshold = (
                 self.repetition_cos_threshold if repetition_cos_threshold is None else repetition_cos_threshold
             )
@@ -999,9 +1012,11 @@ class Naz(PreTrainedModel):
                 )
                 past_key_values = outputs.past_key_values
                 last_hidden = outputs.last_hidden_state[:, -1, :]
-                stop_probability = torch.sigmoid(self.stop_head(last_hidden).squeeze(-1).float())
                 candidate_latents = self.sample_next_latents(last_hidden, num_samples)
-                candidate_ids, candidate_masks, candidate_lengths = self.decode_latent_tokens(candidate_latents, last_hidden)
+                candidate_ids, candidate_masks, candidate_lengths = self.decode_latent_tokens(
+                    candidate_latents,
+                    last_hidden,
+                )
                 feedback_means, feedback_log_stds = self.feedback_distribution_for_candidates(
                     sequences,
                     sequence_word_masks,
@@ -1026,11 +1041,11 @@ class Naz(PreTrainedModel):
                     selected.word_masks.eq(previous_token_masks)
                     & selected.token_ids.eq(previous_token_ids)
                 ).all(dim=-1)
+                wrote_eos = selected.lengths.eq(0)
                 should_stop = (
-                    (stop_probability.ge(stop_threshold) | repeated_latent | repeated_surface)
+                    (wrote_eos | repeated_latent | repeated_surface)
                     & torch.full_like(repeated_latent, generated_idx + 1 >= min_new_tokens)
                 )
-                selected.stop_probability = stop_probability
                 selected.should_stop = should_stop
 
                 yield selected
@@ -1062,7 +1077,6 @@ class Naz(PreTrainedModel):
         target_input_ids: torch.LongTensor,
         target_word_masks: torch.Tensor,
         unit_mask: torch.Tensor,
-        stop_targets: Optional[torch.Tensor] = None,
         training_step: Optional[int] = None,
     ) -> NazOutput:
         target_mean, target_log_std = self.target_distribution(
@@ -1077,7 +1091,6 @@ class Naz(PreTrainedModel):
             unit_mask,
             target_input_ids=target_input_ids,
             target_word_masks=target_word_masks,
-            stop_targets=stop_targets,
             training_step=training_step,
         )
 

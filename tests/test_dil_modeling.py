@@ -522,10 +522,8 @@ def test_naz_forward_samples_energy_from_noise_generator(tmp_path):
     assert torch.isfinite(outputs.mean_loss)
     assert torch.isfinite(outputs.cosine_loss)
     assert torch.isfinite(outputs.writer_loss)
-    assert torch.isfinite(outputs.stop_loss)
     assert torch.isfinite(outputs.candidate_cos)
     assert torch.isfinite(outputs.byte_acc)
-    assert outputs.stop_prob.shape == (3,)
     assert not hasattr(outputs, "log_std_loss")
     assert not hasattr(outputs, "predicted_log_std")
     assert not hasattr(outputs, "refiner_loss")
@@ -560,6 +558,29 @@ def test_naz_writer_schedule_warms_up_then_uses_predicted_and_candidate_latents(
     assert torch.equal(warmup, target)
     assert torch.equal(predicted_phase, predicted)
     assert torch.equal(candidate_phase, samples[0])
+
+
+def test_naz_writer_labels_use_first_position_eos_as_sequence_stop(tmp_path):
+    dil_config = tiny_config()
+    dil_model = Dil(dil_config)
+    mark_dil_normalizer_fitted(dil_model)
+    dil_config.save_pretrained(tmp_path)
+    torch.save(
+        {
+            "format_version": dil_config.checkpoint_format_version,
+            "model_state_dict": dil_model.state_dict(),
+        },
+        tmp_path / "checkpoint.pt",
+    )
+    model = Naz(tiny_naz_config(tmp_path, dil_config))
+    target_input_ids = torch.tensor([[[2, 3, 0, 0], [1, 0, 0, 0]]], dtype=torch.long)
+    target_word_masks = torch.tensor([[[True, True, False, False], [True, False, False, False]]])
+    unit_mask = torch.ones((1, 2), dtype=torch.bool)
+
+    labels = model.writer_labels(target_input_ids, target_word_masks, unit_mask)
+
+    assert torch.equal(labels[0, 0], torch.tensor([2, 3, 1, -100]))
+    assert torch.equal(labels[0, 1], torch.tensor([1, -100, -100, -100]))
 
 
 def test_naz_generation_reencodes_written_feedback_tokens(tmp_path):
@@ -692,7 +713,6 @@ def test_naz_generate_stream_yields_each_written_token(tmp_path):
         assert step.feedback_latent.shape == (1, dil_config.latent_size)
         assert step.roundtrip_score.shape == (1,)
         assert step.likelihood_score.shape == (1,)
-        assert step.stop_probability.shape == (1,)
         assert step.should_stop.shape == (1,)
 
 
@@ -724,14 +744,11 @@ def test_resident_semantic_cache_matches_full_left_context_pass(tmp_path):
     lengths = byte_ids.ne(dil_config.pad_token_id).sum(dim=-1)
     ids_path = tmp_path / "ids.npy"
     lengths_path = tmp_path / "lengths.npy"
-    terminal_path = tmp_path / "terminal.npy"
     np.save(ids_path, byte_ids.numpy())
     np.save(lengths_path, lengths.numpy())
-    np.save(terminal_path, np.asarray([False, False, True, False, False, True], dtype=np.bool_))
     batcher = ResidentNazBatcher(
         ids_path,
         lengths_path,
-        terminal_path,
         token_count=byte_ids.shape[0],
         config=dil_config,
         sequence_length=3,
@@ -740,7 +757,7 @@ def test_resident_semantic_cache_matches_full_left_context_pass(tmp_path):
         seed=1,
     )
 
-    semantic_states, mean_cache, log_std_cache, stop_cache, cached_byte_ids, cached_lengths = build_resident_semantic_cache(
+    semantic_states, mean_cache, log_std_cache, cached_byte_ids, cached_lengths = build_resident_semantic_cache(
         model,
         batcher,
         chunk_tokens=2,
@@ -754,17 +771,14 @@ def test_resident_semantic_cache_matches_full_left_context_pass(tmp_path):
     assert torch.allclose(mean_cache, full_mean.reshape(byte_ids.shape[0], -1), atol=1e-6, rtol=1e-5)
     assert torch.allclose(log_std_cache, full_log_std.reshape(byte_ids.shape[0], -1), atol=1e-6, rtol=1e-5)
     assert torch.allclose(semantic_states, mean_cache)
-    assert stop_cache.dtype == torch.bool
-    assert torch.equal(stop_cache.bool().cpu(), torch.tensor([False, False, True, False, False, True]))
     assert torch.equal(cached_byte_ids.cpu(), byte_ids)
     assert torch.equal(cached_lengths.cpu(), lengths)
 
 
-def test_resident_naz_semantic_batcher_uses_bool_stop_targets():
+def test_resident_naz_semantic_batcher_surfaces_next_units():
     semantic_states = torch.randn(6, 4)
     target_mean = torch.randn(6, 4)
     target_log_std = torch.randn(6, 4)
-    stop_targets = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
     byte_ids = torch.tensor(
         [
             [2, 0, 0, 0],
@@ -781,7 +795,6 @@ def test_resident_naz_semantic_batcher_uses_bool_stop_targets():
         semantic_states,
         target_mean,
         target_log_std,
-        stop_targets,
         byte_ids,
         lengths,
         sequence_length=3,
@@ -791,18 +804,10 @@ def test_resident_naz_semantic_batcher_uses_bool_stop_targets():
 
     batch = batcher.make_batch(torch.tensor([[0], [2]]))
 
-    assert batch["stop_targets"].dtype == torch.bool
-    assert torch.equal(
-        batch["stop_targets"],
-        torch.tensor(
-            [
-                [False, True, False],
-                [False, True, False],
-            ]
-        ),
-    )
     assert batch["target_input_ids"].shape == (2, 3, 4)
     assert batch["target_word_masks"].dtype == torch.bool
+    assert torch.equal(batch["target_input_ids"][0, 0], byte_ids[1])
+    assert torch.equal(batch["target_input_ids"][1, 0], byte_ids[3])
 
 
 def test_naz_decode_latent_tokens_uses_chunked_batch_shape(tmp_path):
