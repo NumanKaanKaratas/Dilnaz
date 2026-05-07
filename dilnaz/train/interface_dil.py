@@ -16,7 +16,7 @@ from models.modeling_dil import Dil
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 12
+CHECKPOINT_FORMAT_VERSION = 15
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -115,19 +115,6 @@ def build_auto_mapping(tokens: list[str], similarities: list[list[float]]) -> di
     }
 
 
-def decode_logits(tokenizer: HybridTokenizer, logits: torch.Tensor, byte_length: int) -> str:
-    ids = logits[:byte_length].argmax(dim=-1).detach().cpu().tolist()
-    return tokenizer.decode(ids)
-
-
-def eos_lengths(token_ids: torch.Tensor, eos_token_id: int) -> list[int]:
-    lengths = []
-    for row in token_ids.detach().cpu():
-        eos_positions = (row == eos_token_id).nonzero(as_tuple=False)
-        lengths.append(int(eos_positions[0, 0]) if eos_positions.numel() else int(row.numel()))
-    return lengths
-
-
 def load_model(checkpoint_dir: Path, device: torch.device):
     config = DilConfig.from_pretrained(checkpoint_dir)
     tokenizer = HybridTokenizer.from_file(checkpoint_dir / config.tokenizer_vocab_file)
@@ -149,19 +136,6 @@ def encode_tokens(model: Dil, input_ids: torch.Tensor, word_masks: torch.Tensor)
     latent_states = model.encode(input_ids=input_ids, word_masks=word_masks)
     mean, _ = torch.chunk(latent_states, 2, dim=-1)
     return mean.float()
-
-
-@torch.no_grad()
-def decode_latents(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor):
-    logits = model.decode_from_latents(latents)
-    logits = logits.float()
-    token_ids = logits.argmax(dim=-1)
-    byte_lengths = eos_lengths(token_ids, model.config.eos_token_id)
-    decoded = [
-        decode_logits(tokenizer, logits[row_idx], byte_lengths[row_idx])
-        for row_idx in range(logits.shape[0])
-    ]
-    return decoded, byte_lengths
 
 
 def similarity_matrix(latents: torch.Tensor) -> list[list[float]]:
@@ -261,13 +235,6 @@ def main():
     similarities = similarity_matrix(latents)
     mapping = build_auto_mapping(tokens, similarities)
 
-    baseline, baseline_lengths = decode_latents(model, tokenizer, latents)
-    source_indices = [mapping.get(row_idx, row_idx) for row_idx in range(len(tokens))]
-    swapped_latents = latents[source_indices]
-    expected_lengths = [byte_lengths[source_idx] for source_idx in source_indices]
-    swapped, swapped_lengths = decode_latents(model, tokenizer, swapped_latents)
-    expected = [decoded_tokens[source_idx] for source_idx in source_indices]
-
     print(f"tokens={decoded_tokens!r}")
     print()
     nllb_sim = nllb_similarity(config, args.text, segments, device)
@@ -281,7 +248,7 @@ def main():
         print(f"[{target_idx}]{tokens[target_idx]} <- [{source_idx}]{tokens[source_idx]}")
     print()
 
-    print("comparison:")
+    print("encoder_units:")
     rows = []
     for idx in range(len(tokens)):
         rows.append(
@@ -289,43 +256,20 @@ def main():
                 f"[{idx}]",
                 decoded_tokens[idx],
                 str(byte_lengths[idx]),
-                baseline[idx],
-                str(baseline_lengths[idx]),
-                str(baseline[idx] == decoded_tokens[idx]),
-                swapped[idx],
-                expected[idx],
-                str(expected_lengths[idx]),
-                str(swapped_lengths[idx]),
-                str(swapped[idx] == expected[idx]),
+                str(mapping.get(idx, idx)),
             ]
         )
     format_table(
         [
             "index",
             "target",
-            "true_len",
-            "baseline",
-            "pred_len",
-            "b_match",
-            "swapped",
-            "expected",
-            "exp_len",
-            "s_pred_len",
-            "s_match",
+            "piece_len",
+            "mapped_source",
         ],
         rows,
     )
     print()
-
-    baseline_text = "".join(baseline)
-    swapped_text = "".join(swapped)
-    print(f"baseline_reconstructed_text={baseline_text!r}")
-    print(f"swapped_reconstructed_text={swapped_text!r}")
-    print()
-
-    base_status = "Başarılı" if all(row[5] == "True" for row in rows) else "Hatalı"
-    swapped_status = "Başarılı" if all(row[10] == "True" for row in rows) else "Hatalı"
-    print(f"%x Base {base_status}. %x Swapped {swapped_status}.")
+    print("DIL encoder-only: surface writing is handled by NAZ writer.")
 
 
 if __name__ == "__main__":

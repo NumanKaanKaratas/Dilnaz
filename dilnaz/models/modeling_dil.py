@@ -13,16 +13,13 @@ from .configuration_dil import DilConfig
 @dataclass
 class DilOutput(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
     mean: Optional[torch.FloatTensor] = None
     log_std: Optional[torch.FloatTensor] = None
-    ce_loss: Optional[torch.FloatTensor] = None
     kl_loss: Optional[torch.FloatTensor] = None
     distill_loss: Optional[torch.FloatTensor] = None
     layer_geometry_losses: Optional[torch.FloatTensor] = None
     mean_geometry_loss: Optional[torch.FloatTensor] = None
     variance_loss: Optional[torch.FloatTensor] = None
-    byte_acc: Optional[torch.FloatTensor] = None
 
 
 class DilRMSNorm(nn.Module):
@@ -67,40 +64,50 @@ class DilLayer(nn.Module):
 class SemanticDistributionNormalizer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.momentum = config.semantic_normalizer_momentum
         self.eps = config.semantic_normalizer_eps
         self.z_clip = config.semantic_normalizer_z_clip
+        self.quantile_min = config.semantic_normalizer_quantile_min
+        self.quantile_max = config.semantic_normalizer_quantile_max
         self.log_std_min = config.normalized_log_std_min
         self.log_std_max = config.normalized_log_std_max
         self.register_buffer("center", torch.zeros(config.latent_size))
         self.register_buffer("scale", torch.ones(config.latent_size))
         self.register_buffer("log_scale", torch.zeros(config.latent_size))
         self.register_buffer("initialized", torch.zeros((), dtype=torch.bool))
+        self.register_buffer("fitted", torch.zeros((), dtype=torch.bool))
 
     @torch.no_grad()
-    def update(self, mean: torch.Tensor):
+    def fit(self, mean: torch.Tensor):
         flat = mean.detach().float().reshape(-1, mean.shape[-1])
-        batch_center = flat.mean(dim=0)
-        batch_scale = flat.std(dim=0, unbiased=False).clamp_min(self.eps)
-        momentum = torch.where(
-            self.initialized,
-            torch.full((), self.momentum, device=self.center.device),
-            torch.ones((), device=self.center.device),
+        if flat.numel() == 0:
+            raise ValueError("semantic normalizer calibration received no latents")
+        quantiles = torch.quantile(
+            flat,
+            torch.tensor([self.quantile_min, 0.5, self.quantile_max], device=flat.device),
+            dim=0,
         )
-        batch_center = batch_center.to(self.center.device)
-        batch_scale = batch_scale.to(self.scale.device)
-        self.center.copy_(self.center * (1.0 - momentum) + batch_center * momentum)
-        self.scale.copy_(self.scale * (1.0 - momentum) + batch_scale * momentum)
+        low, median, high = quantiles.unbind(dim=0)
+        gaussian_iqr = 1.3489795003921634
+        scale = ((high - low) / gaussian_iqr).clamp_min(self.eps)
+        self.center.copy_(median.to(self.center.device, dtype=self.center.dtype))
+        self.scale.copy_(scale.to(self.scale.device, dtype=self.scale.dtype))
         self.initialized.fill_(True)
+        self.fitted.fill_(True)
         self.scale.clamp_(min=self.eps)
         self.log_scale.copy_(self.scale.log())
 
+    def require_fitted(self):
+        if not bool(self.fitted.detach().cpu()):
+            raise RuntimeError("DIL semantic normalizer is not fitted; run DIL calibration before NAZ")
+
     def normalize_mean(self, mean: torch.Tensor) -> torch.Tensor:
+        self.require_fitted()
         center = self.center.to(device=mean.device, dtype=mean.dtype)
         scale = self.scale.to(device=mean.device, dtype=mean.dtype)
         return (mean - center) / scale
 
     def denormalize_mean(self, mean: torch.Tensor) -> torch.Tensor:
+        self.require_fitted()
         center = self.center.to(device=mean.device, dtype=mean.dtype)
         scale = self.scale.to(device=mean.device, dtype=mean.dtype)
         return mean * scale + center
@@ -271,144 +278,21 @@ class DilEncoderCore(nn.Module):
         return latent_states
 
 
-class DilAutoregressiveDecoderLayer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        heads = dil_context_attention_heads(config.hidden_size)
-        self.self_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.cross_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.memory_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = nn.MultiheadAttention(
-            config.hidden_size,
-            heads,
-            dropout=0.0,
-            bias=False,
-            batch_first=True,
-        )
-        self.cross_attn = nn.MultiheadAttention(
-            config.hidden_size,
-            heads,
-            dropout=0.0,
-            bias=False,
-            batch_first=True,
-        )
-        self.mlp = DilGatedMLP(config)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        memory_states: torch.Tensor,
-        causal_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.self_norm(hidden_states)
-        self_attn, _ = self.self_attn(
-            hidden_states,
-            hidden_states,
-            hidden_states,
-            attn_mask=causal_mask,
-            need_weights=False,
-        )
-        hidden_states = residual + self_attn
-
-        residual = hidden_states
-        cross_attn, _ = self.cross_attn(
-            self.cross_norm(hidden_states),
-            self.memory_norm(memory_states),
-            memory_states,
-            need_weights=False,
-        )
-        hidden_states = residual + cross_attn
-        return hidden_states + self.mlp(self.mlp_norm(hidden_states))
-
-
-class DilAutoregressiveWriter(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.max_word_bytes = config.max_word_bytes
-        self.pad_token_id = config.pad_token_id
-        self.decoder_start_token_id = config.decoder_start_token_id
-        self.latent_to_hidden = nn.Linear(config.latent_size, config.hidden_size)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.position_embeddings = nn.Embedding(config.max_word_bytes, config.hidden_size)
-        self.decoder_layers = nn.ModuleList(
-            [DilAutoregressiveDecoderLayer(config) for _ in range(config.num_decoder_layers)]
-        )
-        self.norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        causal_mask = torch.triu(
-            torch.ones(config.max_word_bytes, config.max_word_bytes, dtype=torch.bool),
-            diagonal=1,
-        )
-        self.register_buffer(
-            "causal_mask",
-            causal_mask,
-            persistent=False,
-        )
-
-    def teacher_forced_logits(
-        self,
-        latent_states: torch.Tensor,
-        decoder_input_ids: torch.LongTensor,
-    ) -> torch.Tensor:
-        batch_size = latent_states.shape[0]
-        if decoder_input_ids.shape != (batch_size, self.max_word_bytes):
-            raise ValueError(
-                f"decoder_input_ids must be shaped {(batch_size, self.max_word_bytes)}"
-            )
-        positions = torch.arange(self.max_word_bytes, device=decoder_input_ids.device)
-        hidden_states = self.embed_tokens(decoder_input_ids)
-        hidden_states = hidden_states + self.position_embeddings(positions).unsqueeze(0)
-        memory_states = self.latent_to_hidden(latent_states).unsqueeze(1)
-        causal_mask = self.causal_mask.to(device=hidden_states.device)
-        for layer in self.decoder_layers:
-            hidden_states = layer(hidden_states, memory_states, causal_mask)
-        hidden_states = self.norm(hidden_states)
-        return F.linear(hidden_states, self.embed_tokens.weight)
-
-    def greedy_logits(self, latent_states: torch.Tensor) -> torch.Tensor:
-        batch_size = latent_states.shape[0]
-        decoder_input_ids = torch.full(
-            (batch_size, self.max_word_bytes),
-            self.pad_token_id,
-            dtype=torch.long,
-            device=latent_states.device,
-        )
-        decoder_input_ids[:, 0] = self.decoder_start_token_id
-        logits_by_position = []
-        for position in range(self.max_word_bytes):
-            logits = self.teacher_forced_logits(latent_states, decoder_input_ids)
-            next_logits = logits[:, position]
-            logits_by_position.append(next_logits)
-            if position + 1 < self.max_word_bytes:
-                decoder_input_ids[:, position + 1] = next_logits.argmax(dim=-1)
-        return torch.stack(logits_by_position, dim=1)
-
-    def forward(
-        self,
-        latent_states: torch.Tensor,
-        decoder_input_ids: Optional[torch.LongTensor] = None,
-    ) -> torch.Tensor:
-        if decoder_input_ids is None:
-            return self.greedy_logits(latent_states)
-        return self.teacher_forced_logits(latent_states, decoder_input_ids)
-
-
 class Dil(PreTrainedModel):
     config_class = DilConfig
 
     def __init__(self, config):
         super().__init__(config)
+        if config.checkpoint_format_version != 15:
+            raise ValueError("Dil encoder-only checkpoints require checkpoint_format_version=15")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
 
         self.encoder = DilEncoderCore(config)
-        self.decoder = DilAutoregressiveWriter(config)
         self.semantic_normalizer = SemanticDistributionNormalizer(config)
         self.dil_dropout = config.dil_dropout
         self.kl_clamp = config.kl_clamp
         self.kl_weight = config.kl_weight
-        self.ce_weight = config.ce_weight
         self.distillation_weight = config.distillation_weight
         self.layer_geometry_weight = config.layer_geometry_weight
         self.mean_geometry_weight = config.mean_geometry_weight
@@ -433,15 +317,8 @@ class Dil(PreTrainedModel):
     def set_input_embeddings(self, value):
         self.encoder.embed_tokens = value
 
-    def decoder_inputs_from_labels(self, labels: torch.LongTensor) -> torch.LongTensor:
-        clean_labels = labels.masked_fill(labels < 0, self.config.pad_token_id)
-        decoder_input_ids = torch.full_like(clean_labels, self.config.pad_token_id)
-        decoder_input_ids[:, 0] = self.config.decoder_start_token_id
-        decoder_input_ids[:, 1:] = clean_labels[:, :-1]
-        return decoder_input_ids
-
-    def update_semantic_normalizer(self, mean: torch.Tensor):
-        self.semantic_normalizer.update(mean)
+    def fit_semantic_normalizer(self, mean: torch.Tensor):
+        self.semantic_normalizer.fit(mean)
 
     def normalize_distribution(
         self,
@@ -467,23 +344,6 @@ class Dil(PreTrainedModel):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.semantic_normalizer.guard_distribution(mean, log_std)
 
-    def decode_from_latents(
-        self,
-        latent_states: torch.Tensor,
-        decoder_input_ids: Optional[torch.LongTensor] = None,
-    ) -> torch.Tensor:
-        compiled_forward = getattr(self, "_compiled_decode_forward", None)
-        if compiled_forward is not None:
-            return compiled_forward(latent_states, decoder_input_ids)
-        return self._decode_from_latents_impl(latent_states, decoder_input_ids)
-
-    def _decode_from_latents_impl(
-        self,
-        latent_states: torch.Tensor,
-        decoder_input_ids: Optional[torch.LongTensor] = None,
-    ) -> torch.Tensor:
-        return self.decoder(latent_states, decoder_input_ids)
-
     def encode(
         self,
         input_ids: torch.LongTensor,
@@ -499,9 +359,8 @@ class Dil(PreTrainedModel):
             output_hidden_states=output_hidden_states,
         )
 
-    def set_compiled_forwards(self, encoder_forward=None, decode_forward=None):
+    def set_compiled_forwards(self, encoder_forward=None):
         object.__setattr__(self, "_compiled_encoder_forward", encoder_forward)
-        object.__setattr__(self, "_compiled_decode_forward", decode_forward)
 
     def geometry_loss(
         self,
@@ -540,7 +399,6 @@ class Dil(PreTrainedModel):
         self,
         input_ids: torch.LongTensor,
         word_masks: torch.Tensor,
-        labels: Optional[torch.LongTensor] = None,
         teacher_layers: Optional[torch.Tensor] = None,
         teacher_mask: Optional[torch.Tensor] = None,
     ) -> DilOutput:
@@ -555,40 +413,17 @@ class Dil(PreTrainedModel):
             output_hidden_states=True,
         )
         mean, log_std = torch.chunk(latent_states, 2, dim=-1)
-        if self.training:
-            self.update_semantic_normalizer(mean)
         std = torch.exp(log_std)
-        latent_states = mean + torch.randn_like(mean) * std
-        latent_states = F.dropout(latent_states, p=self.dil_dropout, training=self.training)
 
         kl_loss = 0.5 * (mean.pow(2) + std.pow(2) - 1 - log_std * 2)
         kl_loss = torch.clamp(kl_loss, min=self.kl_clamp)
         kl_loss = torch.mean(torch.sum(kl_loss, dim=-1))
 
-        decoder_input_ids = (
-            self.decoder_inputs_from_labels(labels.to(latent_states.device))
-            if labels is not None
-            else None
-        )
-        logits = self.decode_from_latents(latent_states, decoder_input_ids)
-        logits = logits.float()
-        ce_loss = None
         distill_loss = None
         layer_geometry_losses = None
         mean_geometry_loss = None
         variance_loss = None
-        byte_acc = None
-        loss = None
-
-        if labels is not None:
-            ce_loss = F.cross_entropy(
-                logits.reshape(-1, self.config.vocab_size),
-                labels.reshape(-1).to(logits.device),
-                ignore_index=-100,
-            )
-            valid = labels.ne(-100)
-            correct = logits.argmax(dim=-1).eq(labels.to(logits.device)) & valid.to(logits.device)
-            byte_acc = correct.sum().float() / valid.to(logits.device).sum().clamp_min(1).float()
+        loss = kl_loss * self.kl_weight
 
         if teacher_layers is not None:
             teacher_layers = teacher_layers.to(mean.device, dtype=torch.float32)
@@ -619,25 +454,16 @@ class Dil(PreTrainedModel):
                 + mean_geometry_loss * self.mean_geometry_weight
                 + variance_loss * self.variance_weight
             )
-
-        if ce_loss is not None and distill_loss is not None:
-            loss = (
-                ce_loss * self.ce_weight
-                + kl_loss * self.kl_weight
-                + distill_loss * self.distillation_weight
-            )
+            loss = loss + distill_loss * self.distillation_weight
 
         return DilOutput(
             loss=loss,
-            logits=logits,
             mean=mean,
             log_std=log_std,
-            ce_loss=ce_loss,
             kl_loss=kl_loss,
             distill_loss=distill_loss,
             layer_geometry_losses=layer_geometry_losses,
             mean_geometry_loss=mean_geometry_loss,
             variance_loss=variance_loss,
-            byte_acc=byte_acc,
         )
 

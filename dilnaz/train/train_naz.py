@@ -41,7 +41,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer
 
 
-CHECKPOINT_FORMAT_VERSION = 13
+CHECKPOINT_FORMAT_VERSION = 16
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -72,7 +72,8 @@ def json_training_state(config, step: int, metrics: dict, dil_checksum: str, com
         "compile_mode": compile_mode,
         "max_word_bytes": config.max_word_bytes,
         "latent_size": config.latent_size,
-        "semantic_space": "dil_normalized_distribution",
+        "semantic_space": "dil_normalized_latent",
+        "feedback": "dil_reencoded_contextual_mean",
         "byte_vocab_size": config.byte_vocab_size,
         "vocab_size": config.vocab_size,
         "pad_token_id": config.pad_token_id,
@@ -134,8 +135,14 @@ def evaluate(model, eval_loader, device, autocast_enabled: bool, max_batches: in
     total = {
         "loss": 0.0,
         "energy": 0.0,
+        "energy_loss": 0.0,
+        "mean_loss": 0.0,
+        "cosine_loss": 0.0,
+        "writer_loss": 0.0,
+        "stop_loss": 0.0,
         "latent_cos": 0.0,
-        "log_std_loss": 0.0,
+        "candidate_cos": 0.0,
+        "byte_acc": 0.0,
         "batches": 0,
     }
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
@@ -143,8 +150,14 @@ def evaluate(model, eval_loader, device, autocast_enabled: bool, max_batches: in
             outputs = run_naz_batch(model, batch)
         total["loss"] += float(outputs.loss.detach().cpu())
         total["energy"] += float(outputs.energy.detach().cpu())
+        total["energy_loss"] += float(outputs.energy_loss.detach().cpu())
+        total["mean_loss"] += float(outputs.mean_loss.detach().cpu())
+        total["cosine_loss"] += float(outputs.cosine_loss.detach().cpu())
+        total["writer_loss"] += float(outputs.writer_loss.detach().cpu())
+        total["stop_loss"] += float(outputs.stop_loss.detach().cpu())
         total["latent_cos"] += float(outputs.latent_cos.detach().cpu())
-        total["log_std_loss"] += float(outputs.log_std_loss.detach().cpu())
+        total["candidate_cos"] += float(outputs.candidate_cos.detach().cpu())
+        total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
         total["batches"] += 1
         if batch_idx >= max_batches:
             break
@@ -159,8 +172,14 @@ def format_log(step: int, metrics: dict) -> str:
         f"step={step}",
         f"loss={metrics['loss']:.4f}",
         f"energy={metrics['energy']:.4f}",
+        f"energy_loss={metrics['energy_loss']:.4f}",
+        f"mean_loss={metrics['mean_loss']:.4f}",
+        f"cosine_loss={metrics['cosine_loss']:.4f}",
+        f"writer_loss={metrics['writer_loss']:.4f}",
+        f"stop_loss={metrics['stop_loss']:.4f}",
         f"latent_cos={metrics['latent_cos']:.4f}",
-        f"logstd={metrics['log_std_loss']:.4f}",
+        f"candidate_cos={metrics['candidate_cos']:.4f}",
+        f"byte_acc={metrics['byte_acc']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"transfer_s={metrics['transfer_seconds']:.4f}",
@@ -206,20 +225,25 @@ def build_resident_semantic_cache(
         log_stds.append(log_std.squeeze(0).float())
     mean_cache = torch.cat(means, dim=0)
     log_std_cache = torch.cat(log_stds, dim=0)
-    semantic_states = torch.cat((mean_cache, log_std_cache), dim=-1)
+    semantic_states = mean_cache
+    stop_cache = surface_batcher.terminal_flags.bool()
     model.train()
-    return semantic_states, mean_cache, log_std_cache
+    return semantic_states, mean_cache, log_std_cache, stop_cache, surface_batcher.byte_ids, surface_batcher.lengths
 
 
-def run_naz_batch(model, batch):
+def run_naz_batch(model, batch, training_step: int | None = None):
     if "semantic_states" in batch:
         return model.forward_semantic(
             semantic_states=batch["semantic_states"],
             target_mean=batch["target_mean"],
             target_log_std=batch["target_log_std"],
             unit_mask=batch["unit_mask"],
+            target_input_ids=batch["target_input_ids"],
+            target_word_masks=batch["target_word_masks"],
+            stop_targets=batch["stop_targets"],
+            training_step=training_step,
         )
-    return model(**batch)
+    return model(**batch, training_step=training_step)
 
 
 def parse_args():
@@ -273,11 +297,18 @@ def parse_args():
     parser.add_argument("--num-mlp-layers", type=int, default=NAZ_MODEL_DEFAULTS["num_mlp_layers"])
     parser.add_argument("--num-samples", type=int, default=NAZ_MODEL_DEFAULTS["num_samples"])
     parser.add_argument("--energy-target-samples", type=int, default=NAZ_MODEL_DEFAULTS["energy_target_samples"])
-    parser.add_argument("--pred-log-std-min", type=float, default=NAZ_MODEL_DEFAULTS["pred_log_std_min"])
-    parser.add_argument("--pred-log-std-max", type=float, default=NAZ_MODEL_DEFAULTS["pred_log_std_max"])
-    parser.add_argument("--log-std-loss-weight", type=float, default=NAZ_MODEL_DEFAULTS["log_std_loss_weight"])
+    parser.add_argument("--noise-size", type=int, default=NAZ_MODEL_DEFAULTS["noise_size"])
     parser.add_argument("--decode-chunk-size", type=int, default=NAZ_MODEL_DEFAULTS["decode_chunk_size"])
+    parser.add_argument("--num-writer-layers", type=int, default=NAZ_MODEL_DEFAULTS["num_writer_layers"])
     parser.add_argument("--beta", type=float, default=NAZ_MODEL_DEFAULTS["beta"])
+    parser.add_argument("--mean-loss-weight", type=float, default=NAZ_MODEL_DEFAULTS["mean_loss_weight"])
+    parser.add_argument("--cosine-loss-weight", type=float, default=NAZ_MODEL_DEFAULTS["cosine_loss_weight"])
+    parser.add_argument("--energy-loss-weight", type=float, default=NAZ_MODEL_DEFAULTS["energy_loss_weight"])
+    parser.add_argument("--writer-loss-weight", type=float, default=NAZ_MODEL_DEFAULTS["writer_loss_weight"])
+    parser.add_argument("--writer-target-warmup-steps", type=int, default=NAZ_MODEL_DEFAULTS["writer_target_warmup_steps"])
+    parser.add_argument("--writer-candidate-start-step", type=int, default=NAZ_MODEL_DEFAULTS["writer_candidate_start_step"])
+    parser.add_argument("--writer-candidate-probability", type=float, default=NAZ_MODEL_DEFAULTS["writer_candidate_probability"])
+    parser.add_argument("--stop-loss-weight", type=float, default=NAZ_MODEL_DEFAULTS["stop_loss_weight"])
     return parser.parse_args()
 
 
@@ -302,12 +333,30 @@ def validate_args(args):
         raise ValueError("--eval-file is required when --eval-every > 0")
     if args.resume is None and args.dil_checkpoint_dir is None:
         raise ValueError("--dil-checkpoint-dir is required when --resume is not set")
-    if args.pred_log_std_min >= args.pred_log_std_max:
-        raise ValueError("--pred-log-std-min must be smaller than --pred-log-std-max")
-    if args.log_std_loss_weight < 0:
-        raise ValueError("--log-std-loss-weight must be >= 0")
+    if args.noise_size <= 0:
+        raise ValueError("--noise-size must be > 0")
+    if args.num_samples < 3:
+        raise ValueError("--num-samples must be >= 3")
+    if args.energy_target_samples <= 0:
+        raise ValueError("--energy-target-samples must be > 0")
+    if args.beta <= 0.0:
+        raise ValueError("--beta must be > 0")
     if args.decode_chunk_size <= 0:
         raise ValueError("--decode-chunk-size must be > 0")
+    if args.num_writer_layers <= 0:
+        raise ValueError("--num-writer-layers must be > 0")
+    if (
+        args.mean_loss_weight < 0.0
+        or args.cosine_loss_weight < 0.0
+        or args.energy_loss_weight < 0.0
+        or args.writer_loss_weight < 0.0
+        or args.stop_loss_weight < 0.0
+    ):
+        raise ValueError("--mean-loss-weight, --cosine-loss-weight, --energy-loss-weight, --writer-loss-weight and --stop-loss-weight must be >= 0")
+    if args.writer_target_warmup_steps < 0 or args.writer_candidate_start_step < 0:
+        raise ValueError("--writer-target-warmup-steps and --writer-candidate-start-step must be >= 0")
+    if not 0.0 <= args.writer_candidate_probability <= 1.0:
+        raise ValueError("--writer-candidate-probability must be inside [0, 1]")
     if args.full_attention_interval <= 0:
         raise ValueError("--full-attention-interval must be > 0")
     if args.num_attention_heads <= 0 or args.num_key_value_heads <= 0:
@@ -343,11 +392,17 @@ def build_config(args, dil_config: DilConfig):
         num_samples=args.num_samples,
         energy_target_samples=args.energy_target_samples,
         beta=args.beta,
-        pred_log_std_min=args.pred_log_std_min,
-        pred_log_std_max=args.pred_log_std_max,
-        log_std_loss_weight=args.log_std_loss_weight,
+        noise_size=args.noise_size,
         decode_chunk_size=args.decode_chunk_size,
-        semantic_feedback=NAZ_MODEL_DEFAULTS["semantic_feedback"],
+        num_writer_layers=args.num_writer_layers,
+        mean_loss_weight=args.mean_loss_weight,
+        cosine_loss_weight=args.cosine_loss_weight,
+        energy_loss_weight=args.energy_loss_weight,
+        writer_loss_weight=args.writer_loss_weight,
+        writer_target_warmup_steps=args.writer_target_warmup_steps,
+        writer_candidate_start_step=args.writer_candidate_start_step,
+        writer_candidate_probability=args.writer_candidate_probability,
+        stop_loss_weight=args.stop_loss_weight,
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         num_hidden_layers=args.num_hidden_layers,
@@ -389,7 +444,7 @@ def main():
     tokenizer = HybridTokenizer.from_file(dil_checkpoint_dir / dil_config.tokenizer_vocab_file)
 
     token_cache_dir = args.token_cache_dir or args.output_dir / "naz_token_cache"
-    train_ids_path, train_lengths_path, train_token_count = build_token_cache(
+    train_ids_path, train_lengths_path, train_terminal_path, train_token_count = build_token_cache(
         args.train_file,
         tokenizer,
         dil_config.max_word_bytes,
@@ -417,6 +472,10 @@ def main():
     base_model.set_compiled_student_forward(
         compile_forward(base_model.student_core.forward, compile_mode, "NazStudentCore")
     )
+    if config.writer_loss_weight > 0.0:
+        base_model.set_compiled_writer_forward(
+            compile_forward(base_model.writer.forward, compile_mode, "NazContextualWriter")
+        )
     model = base_model
     optimizer = AdamW(
         (param for param in model.parameters() if param.requires_grad),
@@ -446,6 +505,7 @@ def main():
         train_surface = ResidentNazBatcher(
             train_ids_path,
             train_lengths_path,
+            train_terminal_path,
             train_token_count,
             dil_config,
             args.sequence_length,
@@ -467,10 +527,11 @@ def main():
         )
         eval_loader = None
         if eval_cache is not None:
-            eval_ids_path, eval_lengths_path, eval_token_count = eval_cache
+            eval_ids_path, eval_lengths_path, eval_terminal_path, eval_token_count = eval_cache
             eval_surface = ResidentNazBatcher(
                 eval_ids_path,
                 eval_lengths_path,
+                eval_terminal_path,
                 eval_token_count,
                 dil_config,
                 args.sequence_length,
@@ -497,6 +558,7 @@ def main():
             RandomWindowNazDataset(
                 train_ids_path,
                 train_lengths_path,
+                train_terminal_path,
                 train_token_count,
                 dil_config,
                 args.sequence_length,
@@ -509,11 +571,12 @@ def main():
         )
         eval_loader = None
         if eval_cache is not None:
-            eval_ids_path, eval_lengths_path, eval_token_count = eval_cache
+            eval_ids_path, eval_lengths_path, eval_terminal_path, eval_token_count = eval_cache
             eval_loader = make_naz_loader(
                 RandomWindowNazDataset(
                     eval_ids_path,
                     eval_lengths_path,
+                    eval_terminal_path,
                     eval_token_count,
                     dil_config,
                     args.sequence_length,
@@ -531,7 +594,18 @@ def main():
     data_seconds = 0.0
     transfer_seconds = 0.0
     compute_seconds = 0.0
-    metric_sums = {"loss": 0.0, "energy": 0.0, "latent_cos": 0.0, "log_std_loss": 0.0}
+    metric_sums = {
+        "loss": 0.0,
+        "energy": 0.0,
+        "energy_loss": 0.0,
+        "mean_loss": 0.0,
+        "cosine_loss": 0.0,
+        "writer_loss": 0.0,
+        "stop_loss": 0.0,
+        "latent_cos": 0.0,
+        "candidate_cos": 0.0,
+        "byte_acc": 0.0,
+    }
     completed_step = start_step
 
     def save_interrupted():
@@ -566,7 +640,7 @@ def main():
             compute_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(autocast_enabled):
-                outputs = run_naz_batch(model, batch)
+                outputs = run_naz_batch(model, batch, training_step=step)
 
             outputs.loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -584,8 +658,14 @@ def main():
             log_steps += 1
             metric_sums["loss"] += float(outputs.loss.detach().cpu())
             metric_sums["energy"] += float(outputs.energy.detach().cpu())
+            metric_sums["energy_loss"] += float(outputs.energy_loss.detach().cpu())
+            metric_sums["mean_loss"] += float(outputs.mean_loss.detach().cpu())
+            metric_sums["cosine_loss"] += float(outputs.cosine_loss.detach().cpu())
+            metric_sums["writer_loss"] += float(outputs.writer_loss.detach().cpu())
+            metric_sums["stop_loss"] += float(outputs.stop_loss.detach().cpu())
             metric_sums["latent_cos"] += float(outputs.latent_cos.detach().cpu())
-            metric_sums["log_std_loss"] += float(outputs.log_std_loss.detach().cpu())
+            metric_sums["candidate_cos"] += float(outputs.candidate_cos.detach().cpu())
+            metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
 
             should_log = step % args.log_every == 0 or step == start_step + 1 or step == args.max_steps
             should_eval = eval_loader is not None and step % args.eval_every == 0

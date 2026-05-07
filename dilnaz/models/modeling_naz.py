@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -18,11 +19,17 @@ from .naz_backbone import NazSemanticBackbone
 class NazOutput(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
     energy: Optional[torch.FloatTensor] = None
+    energy_loss: Optional[torch.FloatTensor] = None
+    mean_loss: Optional[torch.FloatTensor] = None
+    cosine_loss: Optional[torch.FloatTensor] = None
+    writer_loss: Optional[torch.FloatTensor] = None
+    stop_loss: Optional[torch.FloatTensor] = None
     latent_cos: Optional[torch.FloatTensor] = None
-    log_std_loss: Optional[torch.FloatTensor] = None
+    candidate_cos: Optional[torch.FloatTensor] = None
+    byte_acc: Optional[torch.FloatTensor] = None
     latent_predictions: Optional[torch.FloatTensor] = None
     predicted_mean: Optional[torch.FloatTensor] = None
-    predicted_log_std: Optional[torch.FloatTensor] = None
+    stop_prob: Optional[torch.FloatTensor] = None
     target_mean: Optional[torch.FloatTensor] = None
     target_log_std: Optional[torch.FloatTensor] = None
 
@@ -33,10 +40,22 @@ class NazGenerationOutput(ModelOutput):
     word_masks: Optional[torch.Tensor] = None
     unit_mask: Optional[torch.Tensor] = None
     generated_lengths: Optional[torch.LongTensor] = None
-    generated_mean: Optional[torch.FloatTensor] = None
-    generated_log_std: Optional[torch.FloatTensor] = None
-    generated_raw_mean: Optional[torch.FloatTensor] = None
+    generated_latents: Optional[torch.FloatTensor] = None
+    generated_raw_latents: Optional[torch.FloatTensor] = None
     roundtrip_cosine: Optional[torch.FloatTensor] = None
+
+
+@dataclass
+class NazGenerationStep(ModelOutput):
+    token_ids: Optional[torch.LongTensor] = None
+    word_masks: Optional[torch.Tensor] = None
+    lengths: Optional[torch.LongTensor] = None
+    latent: Optional[torch.FloatTensor] = None
+    feedback_latent: Optional[torch.FloatTensor] = None
+    roundtrip_score: Optional[torch.FloatTensor] = None
+    likelihood_score: Optional[torch.FloatTensor] = None
+    stop_probability: Optional[torch.FloatTensor] = None
+    should_stop: Optional[torch.Tensor] = None
 
 
 class NazMLPBlock(nn.Module):
@@ -77,57 +96,115 @@ class NazLatentGenerator(nn.Module):
     def __init__(self, config: NazConfig):
         super().__init__()
         self.latent_size = config.latent_size
-        self.log_std_min = config.pred_log_std_min
-        self.log_std_max = config.pred_log_std_max
-        self.state_embd = nn.Linear(config.hidden_size, config.hidden_size)
+        self.noise_size = config.noise_size
+        self.noise_embd = nn.Linear(config.noise_size, config.hidden_size)
         self.hidden_embd = nn.Linear(config.hidden_size, config.hidden_size)
         self.norm_hidden = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.norm_state = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self.norm_noise = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.mlp_blocks = nn.ModuleList(
             [NazMLPBlock(config.hidden_size) for _ in range(config.num_mlp_layers)]
         )
-        self.final_layer = NazFinalLayer(config.hidden_size, config.latent_size * 2)
+        self.final_layer = NazFinalLayer(config.hidden_size, config.latent_size)
 
     def initialize_weights(self):
         nn.init.constant_(self.final_layer.linears[-1].weight, 0)
         nn.init.constant_(self.final_layer.linears[-1].bias, 0)
 
-    def sample_distribution(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        noise = torch.rand(
+            (*hidden_states.shape[:-1], self.noise_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        ) - 0.5
         condition = self.norm_hidden(self.hidden_embd(hidden_states))
-        states = self.norm_state(self.state_embd(hidden_states))
+        states = self.norm_noise(self.noise_embd(noise))
 
         for block in self.mlp_blocks:
             states = block(states, condition)
 
-        mean, log_std = torch.chunk(self.final_layer(states), 2, dim=-1)
-        return mean, log_std.clamp(self.log_std_min, self.log_std_max)
+        return self.final_layer(states)
 
-    def sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        mean, log_std = self.sample_distribution(hidden_states)
-        eps = torch.randn_like(mean)
-        return mean + eps * torch.exp(log_std)
+
+class NazContextualWriterLayer(nn.Module):
+    def __init__(self, config: NazConfig):
+        super().__init__()
+        self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(config.hidden_size, config.intermediate_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(config.intermediate_size, config.hidden_size, bias=True),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states + self.mlp(self.mlp_norm(hidden_states))
+
+
+class NazContextualWriter(nn.Module):
+    def __init__(self, config: NazConfig):
+        super().__init__()
+        self.max_word_bytes = config.max_word_bytes
+        self.latent_proj = nn.Linear(config.latent_size, config.hidden_size)
+        self.hidden_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.fuse_norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self.expand_layer = nn.Linear(config.hidden_size, config.max_word_bytes * config.hidden_size)
+        self.position_embeddings = nn.Embedding(config.max_word_bytes, config.hidden_size)
+        self.layers = nn.ModuleList([NazContextualWriterLayer(config) for _ in range(config.num_writer_layers)])
+        self.norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
+    def initialize_weights(self, std: float, pad_token_id: int):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                module.weight.data.normal_(mean=0.0, std=std)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+            elif isinstance(module, nn.Embedding):
+                module.weight.data.normal_(mean=0.0, std=std)
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
+        if 0 <= pad_token_id < self.embed_tokens.num_embeddings:
+            self.embed_tokens.weight.data[pad_token_id].zero_()
+
+    def forward(self, latents: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        if latents.dim() == hidden_states.dim() + 1:
+            hidden_states = hidden_states.unsqueeze(0).expand(*latents.shape[:-1], hidden_states.shape[-1])
+        latent_shape = latents.shape[:-1]
+        flat_latents = latents.reshape(-1, latents.shape[-1])
+        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+        fused = self.fuse_norm(self.latent_proj(flat_latents) + self.hidden_proj(flat_hidden))
+        byte_states = self.expand_layer(fused).reshape(flat_latents.shape[0], self.max_word_bytes, -1)
+        positions = torch.arange(self.max_word_bytes, device=latents.device)
+        byte_states = byte_states + self.position_embeddings(positions).unsqueeze(0)
+        for layer in self.layers:
+            byte_states = layer(byte_states)
+        logits = F.linear(self.norm(byte_states), self.embed_tokens.weight)
+        return logits.reshape(*latent_shape, self.max_word_bytes, -1)
 
 
 class NazStudentCore(nn.Module):
     def __init__(self, config: NazConfig):
         super().__init__()
         self.semantic_embed_proj = nn.Sequential(
-            nn.Linear(config.latent_size * 2, 2 * config.hidden_size),
+            nn.Linear(config.latent_size, 2 * config.hidden_size),
             nn.SiLU(),
             nn.Linear(2 * config.hidden_size, config.hidden_size),
             nn.LayerNorm(config.hidden_size, eps=1e-6),
         )
         self.backbone = NazSemanticBackbone(config)
+        self.mean_head = NazFinalLayer(config.hidden_size, config.latent_size)
         self.generative_head = NazLatentGenerator(config)
+        self.writer = NazContextualWriter(config)
+        self.stop_head = nn.Sequential(
+            nn.LayerNorm(config.hidden_size, eps=1e-6),
+            nn.Linear(config.hidden_size, 1, bias=True),
+        )
 
-    def initialize_weights(self):
+    def initialize_weights(self, config: NazConfig):
         self.generative_head.initialize_weights()
+        self.writer.initialize_weights(config.initializer_range, config.pad_token_id)
 
     def embed_semantic_states(self, semantic_states: torch.Tensor) -> torch.Tensor:
         return self.semantic_embed_proj(semantic_states)
-
-    def embed_distribution(self, mean: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
-        return self.embed_semantic_states(torch.cat((mean, log_std), dim=-1))
 
     def forward(
         self,
@@ -140,7 +217,7 @@ class NazStudentCore(nn.Module):
             attention_mask=unit_mask,
             use_cache=False,
         )
-        return self.generative_head.sample_distribution(outputs.last_hidden_state)
+        return outputs.last_hidden_state
 
 
 class Naz(PreTrainedModel):
@@ -150,10 +227,8 @@ class Naz(PreTrainedModel):
         super().__init__(config)
         if config.dil_path is None:
             raise ValueError("NazConfig.dil_path is required")
-        if config.num_samples < 2:
-            raise ValueError("num_samples must be >= 2 for energy score")
-        if config.semantic_feedback != "mean":
-            raise ValueError("Naz semantic_feedback must be 'mean'")
+        if config.num_samples < 3:
+            raise ValueError("num_samples must be >= 3: one mean anchor plus at least two energy samples")
 
         self.student_core = NazStudentCore(config)
         self.beta = config.beta
@@ -161,10 +236,20 @@ class Naz(PreTrainedModel):
         self.energy_target_samples = config.energy_target_samples
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
-        self.log_std_loss_weight = config.log_std_loss_weight
         self.decode_chunk_size = config.decode_chunk_size
+        self.mean_loss_weight = config.mean_loss_weight
+        self.cosine_loss_weight = config.cosine_loss_weight
+        self.energy_loss_weight = config.energy_loss_weight
+        self.writer_loss_weight = config.writer_loss_weight
+        self.writer_target_warmup_steps = config.writer_target_warmup_steps
+        self.writer_candidate_start_step = config.writer_candidate_start_step
+        self.writer_candidate_probability = config.writer_candidate_probability
+        self.stop_loss_weight = config.stop_loss_weight
+        self.stop_threshold = config.stop_threshold
+        self.repetition_cos_threshold = config.repetition_cos_threshold
+        self.min_new_tokens = config.min_new_tokens
 
-        self.student_core.initialize_weights()
+        self.student_core.initialize_weights(config)
         self.dil_config = DilConfig.from_pretrained(config.dil_path)
         self._validate_dil_config(config, self.dil_config)
         self.dil_model = self._load_dil(Path(config.dil_path), self.dil_config)
@@ -181,6 +266,18 @@ class Naz(PreTrainedModel):
     @property
     def generative_head(self):
         return self.student_core.generative_head
+
+    @property
+    def mean_head(self):
+        return self.student_core.mean_head
+
+    @property
+    def writer(self):
+        return self.student_core.writer
+
+    @property
+    def stop_head(self):
+        return self.student_core.stop_head
 
     def _validate_dil_config(
         self,
@@ -218,6 +315,8 @@ class Naz(PreTrainedModel):
         if checkpoint["format_version"] != dil_config.checkpoint_format_version:
             raise ValueError(f"unsupported Dil checkpoint format_version={checkpoint.get('format_version')}")
         model.load_state_dict(checkpoint["model_state_dict"])
+        if not bool(model.semantic_normalizer.fitted.detach().cpu()):
+            raise RuntimeError("Naz requires a DIL checkpoint with fitted robust semantic normalizer")
         for param in model.parameters():
             param.requires_grad = False
         model.eval()
@@ -240,6 +339,9 @@ class Naz(PreTrainedModel):
 
     def set_compiled_student_forward(self, compiled_forward=None):
         object.__setattr__(self, "_student_core_forward", compiled_forward)
+
+    def set_compiled_writer_forward(self, compiled_forward=None):
+        object.__setattr__(self, "_compiled_writer_forward", compiled_forward)
 
     def get_input_embeddings(self):
         return None
@@ -365,11 +467,11 @@ class Naz(PreTrainedModel):
         mean, log_std = self.latent_distribution(input_ids, word_masks, unit_mask)
         active = unit_mask.reshape(-1)
         semantic_states = torch.zeros(
-            (batch_size * sequence_length, self.config.latent_size * 2),
+            (batch_size * sequence_length, self.config.latent_size),
             dtype=mean.dtype,
             device=mean.device,
         )
-        semantic_states[active] = torch.cat((mean, log_std), dim=-1)
+        semantic_states[active] = mean
         return semantic_states.reshape(batch_size, sequence_length, -1)
 
     def semantic_embeddings(
@@ -384,49 +486,120 @@ class Naz(PreTrainedModel):
 
     target_distribution = latent_distribution
 
-    def _student_forward(
+    def _student_hidden(
         self,
         semantic_states: torch.Tensor,
         unit_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         compiled_forward = getattr(self, "_student_core_forward", None)
         if compiled_forward is not None:
-            mean, log_std = compiled_forward(semantic_states, unit_mask)
-        else:
-            mean, log_std = self.student_core(semantic_states, unit_mask)
-        return self.dil_model.guard_normalized_distribution(mean, log_std)
+            return compiled_forward(semantic_states, unit_mask)
+        return self.student_core(semantic_states, unit_mask)
 
-    def predict_distribution(
+    def guard_normalized_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        zeros = torch.zeros_like(latents)
+        latents, _ = self.dil_model.guard_normalized_distribution(latents, zeros)
+        return latents
+
+    def writer_labels(
+        self,
+        target_input_ids: torch.LongTensor,
+        target_word_masks: torch.Tensor,
+        unit_mask: torch.Tensor,
+    ) -> torch.LongTensor:
+        labels = torch.full_like(target_input_ids, -100)
+        labels = torch.where(target_word_masks, target_input_ids, labels)
+        lengths = target_word_masks.long().sum(dim=-1)
+        eos_positions = lengths.clamp_max(self.max_word_bytes - 1)
+        eos_valid = unit_mask & lengths.lt(self.max_word_bytes)
+        batch_idx, unit_idx = torch.where(eos_valid)
+        labels[batch_idx, unit_idx, eos_positions[eos_valid]] = self.config.eos_token_id
+        return labels.masked_fill(~unit_mask.unsqueeze(-1), -100)
+
+    def writer_logits(self, latents: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        compiled_forward = getattr(self, "_compiled_writer_forward", None)
+        if compiled_forward is not None:
+            return compiled_forward(latents, hidden_states)
+        return self.writer(latents, hidden_states)
+
+    def writer_training_latents(
+        self,
+        target_mean: torch.Tensor,
+        predicted_mean: torch.Tensor,
+        sample_predictions: torch.Tensor,
+        training_step: Optional[int],
+    ) -> torch.Tensor:
+        if training_step is None or training_step < self.writer_target_warmup_steps:
+            return target_mean.detach()
+
+        writer_latents = predicted_mean.detach()
+        if (
+            self.writer_candidate_probability <= 0.0
+            or training_step < self.writer_candidate_start_step
+            or sample_predictions.shape[0] == 0
+        ):
+            return writer_latents
+
+        sample_idx = torch.randint(
+            sample_predictions.shape[0],
+            (writer_latents.shape[0],),
+            device=writer_latents.device,
+        )
+        row_idx = torch.arange(writer_latents.shape[0], device=writer_latents.device)
+        candidate_latents = sample_predictions.detach()[sample_idx, row_idx]
+        use_candidate = torch.rand(
+            (writer_latents.shape[0], 1),
+            device=writer_latents.device,
+            dtype=writer_latents.dtype,
+        ).lt(self.writer_candidate_probability)
+        return torch.where(use_candidate, candidate_latents, writer_latents)
+
+    def predict_semantic_mean(
+        self,
+        semantic_states: torch.Tensor,
+        unit_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = self._student_hidden(semantic_states, unit_mask)
+        return self.guard_normalized_latents(self.mean_head(hidden_states).float())
+
+    def predict_mean(
         self,
         input_ids: torch.LongTensor,
         word_masks: torch.Tensor,
         unit_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._student_forward(
+    ) -> torch.Tensor:
+        return self.predict_semantic_mean(
             self.semantic_states(input_ids, word_masks, unit_mask),
             unit_mask,
         )
 
-    def predict_semantic_distribution(
+    def candidate_latents_from_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        num_samples: int,
+    ) -> torch.Tensor:
+        if num_samples <= 0:
+            raise ValueError("num_samples must be > 0")
+        predicted_mean = self.guard_normalized_latents(self.mean_head(hidden_states).float())
+        anchor = predicted_mean.unsqueeze(0)
+        if num_samples == 1:
+            return anchor
+        sample_count = num_samples - 1
+        repeated_hidden = hidden_states.unsqueeze(0).repeat(sample_count, *([1] * hidden_states.dim()))
+        sampled_offsets = self.generative_head.sample(repeated_hidden).float()
+        samples = self.guard_normalized_latents(predicted_mean.unsqueeze(0) + sampled_offsets)
+        return torch.cat((anchor, samples), dim=0)
+
+    def sample_semantic_latents(
         self,
         semantic_states: torch.Tensor,
         unit_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        mean, log_std = self._student_forward(semantic_states, unit_mask)
-        return mean[unit_mask], log_std[unit_mask]
-
-    def sample_from_distribution(
-        self,
-        mean: torch.Tensor,
-        log_std: torch.Tensor,
-        sample_count: int,
+        num_samples: Optional[int] = None,
     ) -> torch.Tensor:
-        eps = torch.randn(
-            (sample_count, *mean.shape),
-            dtype=mean.dtype,
-            device=mean.device,
-        )
-        return mean.unsqueeze(0) + eps * torch.exp(log_std).unsqueeze(0)
+        sample_count = num_samples or self.num_samples
+        hidden_states = self._student_hidden(semantic_states, unit_mask)
+        active_hidden = hidden_states[unit_mask]
+        return self.candidate_latents_from_hidden(active_hidden, sample_count)
 
     def sample_latents(
         self,
@@ -435,9 +608,11 @@ class Naz(PreTrainedModel):
         unit_mask: torch.Tensor,
         num_samples: Optional[int] = None,
     ) -> torch.Tensor:
-        sample_count = num_samples or self.num_samples
-        mean, log_std = self.predict_distribution(input_ids, word_masks, unit_mask)
-        return self.sample_from_distribution(mean, log_std, sample_count).float()
+        return self.sample_semantic_latents(
+            self.semantic_states(input_ids, word_masks, unit_mask),
+            unit_mask,
+            num_samples,
+        )
 
     def forward_semantic(
         self,
@@ -445,40 +620,89 @@ class Naz(PreTrainedModel):
         target_mean: torch.Tensor,
         target_log_std: torch.Tensor,
         unit_mask: torch.Tensor,
+        target_input_ids: torch.LongTensor,
+        target_word_masks: torch.Tensor,
+        stop_targets: Optional[torch.Tensor] = None,
+        training_step: Optional[int] = None,
     ) -> NazOutput:
-        predicted_mean, predicted_log_std = self._student_forward(
-            semantic_states,
-            unit_mask,
-        )
-        predicted_mean = predicted_mean[unit_mask]
-        predicted_log_std = predicted_log_std[unit_mask]
+        hidden_states = self._student_hidden(semantic_states, unit_mask)
+        active_hidden = hidden_states[unit_mask]
         active_target_mean = target_mean if target_mean.dim() == 2 else target_mean[unit_mask]
         active_target_log_std = target_log_std if target_log_std.dim() == 2 else target_log_std[unit_mask]
-        latent_predictions = self.sample_from_distribution(
-            predicted_mean,
-            predicted_log_std,
-            self.num_samples,
-        ).float()
+        predicted_mean = self.guard_normalized_latents(self.mean_head(hidden_states).float())[unit_mask]
+        anchor_prediction = predicted_mean.unsqueeze(0)
+        sample_count = self.num_samples - 1
+        repeated_hidden = active_hidden.unsqueeze(0).repeat(sample_count, 1, 1)
+        sampled_offsets = self.generative_head.sample(repeated_hidden).float()
+        sample_predictions = self.guard_normalized_latents(
+            predicted_mean.unsqueeze(0) + sampled_offsets
+        )
         energy = self.energy_score(
-            latent_predictions,
+            sample_predictions,
             active_target_mean,
             active_target_log_std,
         ).mean()
-        log_std_loss = F.smooth_l1_loss(predicted_log_std, active_target_log_std)
-        loss = -energy + self.log_std_loss_weight * log_std_loss
-        latent_cos = F.cosine_similarity(
+        energy_loss = -energy
+        mean_loss = F.mse_loss(predicted_mean, active_target_mean)
+        cosine = F.cosine_similarity(
             predicted_mean,
             active_target_mean,
             dim=-1,
+        )
+        latent_cos = cosine.mean()
+        expanded_sample_target_mean = active_target_mean.unsqueeze(0).expand_as(sample_predictions)
+        candidate_cos = F.cosine_similarity(
+            sample_predictions.detach(),
+            expanded_sample_target_mean,
+            dim=-1,
         ).mean()
+        cosine_loss = (1.0 - cosine).mean()
+        writer_loss = active_hidden.new_zeros(())
+        byte_acc = active_hidden.new_zeros(())
+        if self.writer_loss_weight > 0.0:
+            labels = self.writer_labels(target_input_ids, target_word_masks, unit_mask)
+            active_labels = labels[unit_mask].to(active_hidden.device)
+            writer_latents = self.writer_training_latents(
+                active_target_mean,
+                predicted_mean,
+                sample_predictions,
+                training_step,
+            )
+            writer_logits = self.writer_logits(writer_latents, active_hidden.detach()).float()
+            writer_loss = F.cross_entropy(
+                writer_logits.reshape(-1, self.config.vocab_size),
+                active_labels.reshape(-1),
+                ignore_index=-100,
+            )
+            valid_labels = active_labels.ne(-100)
+            byte_correct = writer_logits.argmax(dim=-1).eq(active_labels) & valid_labels
+            byte_acc = byte_correct.sum().float() / valid_labels.sum().clamp_min(1).float()
+        stop_logits = self.stop_head(hidden_states).squeeze(-1)
+        if stop_targets is None:
+            stop_targets = torch.zeros_like(unit_mask, dtype=stop_logits.dtype)
+        active_stop_targets = stop_targets.to(stop_logits.device, dtype=stop_logits.dtype)[unit_mask]
+        stop_loss = F.binary_cross_entropy_with_logits(stop_logits[unit_mask].float(), active_stop_targets.float())
+        loss = (
+            self.energy_loss_weight * energy_loss
+            + self.mean_loss_weight * mean_loss
+            + self.cosine_loss_weight * cosine_loss
+            + self.writer_loss_weight * writer_loss
+            + self.stop_loss_weight * stop_loss
+        )
         return NazOutput(
             loss=loss,
             energy=energy,
+            energy_loss=energy_loss,
+            mean_loss=mean_loss,
+            cosine_loss=cosine_loss,
+            writer_loss=writer_loss,
+            stop_loss=stop_loss,
             latent_cos=latent_cos,
-            log_std_loss=log_std_loss,
-            latent_predictions=latent_predictions,
+            candidate_cos=candidate_cos,
+            byte_acc=byte_acc,
+            latent_predictions=torch.cat((anchor_prediction, sample_predictions), dim=0),
             predicted_mean=predicted_mean,
-            predicted_log_std=predicted_log_std,
+            stop_prob=torch.sigmoid(stop_logits[unit_mask].float()),
             target_mean=active_target_mean,
             target_log_std=active_target_log_std,
         )
@@ -486,22 +710,26 @@ class Naz(PreTrainedModel):
     def decode_latent_tokens(
         self,
         latents: torch.Tensor,
+        hidden_states: torch.Tensor,
         chunk_size: Optional[int] = None,
     ) -> tuple[torch.LongTensor, torch.Tensor, torch.LongTensor]:
         latent_shape = latents.shape[:-1]
         flat_latents = latents.reshape(-1, latents.shape[-1])
-        flat_latents = self.dil_model.denormalize_mean(flat_latents)
+        if latents.dim() == hidden_states.dim() + 1:
+            hidden_states = hidden_states.unsqueeze(0).expand(*latents.shape[:-1], hidden_states.shape[-1])
+        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
         decode_chunk_size = chunk_size or self.decode_chunk_size
         if decode_chunk_size > 0 and flat_latents.shape[0] > decode_chunk_size:
             logits_list = []
             for start in range(0, flat_latents.shape[0], decode_chunk_size):
-                logits_chunk = self.dil_model.decode_from_latents(
-                    flat_latents[start : start + decode_chunk_size]
+                logits_chunk = self.writer_logits(
+                    flat_latents[start : start + decode_chunk_size],
+                    flat_hidden[start : start + decode_chunk_size],
                 )
                 logits_list.append(logits_chunk)
             logits = torch.cat(logits_list, dim=0)
         else:
-            logits = self.dil_model.decode_from_latents(flat_latents)
+            logits = self.writer_logits(flat_latents, flat_hidden)
         logits = logits.float()
         token_ids = logits.argmax(dim=-1)
         eos_mask = token_ids.eq(self.config.eos_token_id)
@@ -518,6 +746,102 @@ class Naz(PreTrainedModel):
             token_ids.reshape(*latent_shape, self.max_word_bytes),
             masks.reshape(*latent_shape, self.max_word_bytes),
             lengths.reshape(*latent_shape),
+        )
+
+    def sample_next_latents(self, hidden_states: torch.Tensor, num_samples: int) -> torch.Tensor:
+        return self.candidate_latents_from_hidden(hidden_states, num_samples)
+
+    def feedback_distribution_for_candidates(
+        self,
+        sequences: torch.LongTensor,
+        sequence_word_masks: torch.Tensor,
+        sequence_unit_mask: torch.Tensor,
+        candidate_ids: torch.LongTensor,
+        candidate_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        sample_count, batch_size, byte_width = candidate_ids.shape
+        sequence_length = sequences.shape[1]
+        repeated_sequences = sequences.unsqueeze(0).expand(sample_count, -1, -1, -1)
+        repeated_word_masks = sequence_word_masks.unsqueeze(0).expand(sample_count, -1, -1, -1)
+        repeated_unit_mask = sequence_unit_mask.unsqueeze(0).expand(sample_count, -1, -1)
+        flat_sequences = repeated_sequences.reshape(sample_count * batch_size, sequence_length, byte_width)
+        flat_word_masks = repeated_word_masks.reshape(sample_count * batch_size, sequence_length, byte_width)
+        flat_unit_mask = repeated_unit_mask.reshape(sample_count * batch_size, sequence_length)
+        flat_candidate_ids = candidate_ids.reshape(sample_count * batch_size, byte_width)
+        flat_candidate_masks = candidate_masks.reshape(sample_count * batch_size, byte_width)
+        candidate_sequences = torch.cat((flat_sequences, flat_candidate_ids.unsqueeze(1)), dim=1)
+        candidate_word_masks = torch.cat((flat_word_masks, flat_candidate_masks.unsqueeze(1)), dim=1)
+        candidate_unit_mask = torch.cat(
+            (
+                flat_unit_mask,
+                torch.ones(
+                    (sample_count * batch_size, 1),
+                    dtype=torch.bool,
+                    device=flat_unit_mask.device,
+                ),
+            ),
+            dim=1,
+        )
+        feedback_unit_mask = torch.zeros_like(candidate_unit_mask)
+        feedback_unit_mask[:, -1] = True
+        feedback_mean, feedback_log_std = self.latent_distribution(
+            candidate_sequences,
+            candidate_word_masks,
+            feedback_unit_mask,
+        )
+        return (
+            feedback_mean.reshape(sample_count, batch_size, -1),
+            feedback_log_std.reshape(sample_count, batch_size, -1),
+        )
+
+    def select_written_candidates(
+        self,
+        candidate_latents: torch.Tensor,
+        candidate_ids: torch.LongTensor,
+        candidate_masks: torch.Tensor,
+        candidate_lengths: torch.LongTensor,
+        feedback_means: torch.Tensor,
+        feedback_log_stds: torch.Tensor,
+        stop_probability: Optional[torch.Tensor] = None,
+        should_stop: Optional[torch.Tensor] = None,
+    ) -> NazGenerationStep:
+        scores = F.cosine_similarity(candidate_latents, feedback_means, dim=-1)
+        log_var = feedback_log_stds * 2.0
+        likelihood_scores = -0.5 * (
+            ((candidate_latents - feedback_means).pow(2) / log_var.exp().clamp_min(1e-6))
+            + log_var
+        ).mean(dim=-1)
+        sample_count, batch_size, latent_size = candidate_latents.shape
+        selected = []
+        for batch_idx in range(batch_size):
+            keys = [
+                tuple(candidate_ids[sample_idx, batch_idx][candidate_masks[sample_idx, batch_idx]].tolist())
+                for sample_idx in range(sample_count)
+            ]
+            counts = Counter(keys)
+            best_idx = max(
+                range(sample_count),
+                key=lambda sample_idx: (
+                    counts[keys[sample_idx]],
+                    float(scores[sample_idx, batch_idx].detach().cpu()),
+                    float(likelihood_scores[sample_idx, batch_idx].detach().cpu()),
+                ),
+            )
+            selected.append(best_idx)
+        selected_idx = torch.tensor(selected, dtype=torch.long, device=candidate_latents.device)
+        latent_index = selected_idx.reshape(1, batch_size, 1).expand(1, batch_size, latent_size)
+        byte_index = selected_idx.reshape(1, batch_size, 1).expand(1, batch_size, self.max_word_bytes)
+        scalar_index = selected_idx.reshape(1, batch_size)
+        return NazGenerationStep(
+            token_ids=candidate_ids.gather(0, byte_index).squeeze(0),
+            word_masks=candidate_masks.gather(0, byte_index).squeeze(0),
+            lengths=candidate_lengths.gather(0, scalar_index).squeeze(0),
+            latent=candidate_latents.gather(0, latent_index).squeeze(0),
+            feedback_latent=feedback_means.gather(0, latent_index).squeeze(0),
+            roundtrip_score=scores.gather(0, scalar_index).squeeze(0),
+            likelihood_score=likelihood_scores.gather(0, scalar_index).squeeze(0),
+            stop_probability=stop_probability,
+            should_stop=should_stop,
         )
 
     @torch.no_grad()
@@ -544,15 +868,17 @@ class Naz(PreTrainedModel):
         scores[active] = F.cosine_similarity(mean, flat_latents[active].float(), dim=-1)
         return scores.reshape(normalized_latents.shape[:-1])
 
-    @torch.no_grad()
     def generate(
         self,
         input_ids: torch.LongTensor,
         word_masks: torch.Tensor,
         unit_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 16,
-        num_samples: int = 64,
+        num_samples: int = 4,
         roundtrip_check: bool = False,
+        min_new_tokens: Optional[int] = None,
+        stop_threshold: Optional[float] = None,
+        repetition_cos_threshold: Optional[float] = None,
     ) -> NazGenerationOutput:
         self.eval()
         if max_new_tokens <= 0:
@@ -566,65 +892,168 @@ class Naz(PreTrainedModel):
         if not bool(unit_mask.all().detach().cpu()):
             raise ValueError("Naz.generate expects packed prompts without unit padding")
 
-        del num_samples
-        current_input_embeds = self.semantic_embeddings(input_ids, word_masks, unit_mask)
-        past_key_values = None
-        generated_means = []
-        generated_log_stds = []
+        sequences = input_ids
+        sequence_word_masks = word_masks
+        sequence_unit_mask = unit_mask
+        generated_latents = []
+        generated_ids = []
+        generated_masks = []
+        generated_lengths = []
 
-        for _ in range(max_new_tokens):
-            outputs = self.transformer(
-                inputs_embeds=current_input_embeds,
-                past_key_values=past_key_values,
-                use_cache=True,
+        for step in self.generate_stream(
+            input_ids=input_ids,
+            word_masks=word_masks,
+            unit_mask=unit_mask,
+            max_new_tokens=max_new_tokens,
+            num_samples=num_samples,
+            min_new_tokens=min_new_tokens,
+            stop_threshold=stop_threshold,
+            repetition_cos_threshold=repetition_cos_threshold,
+        ):
+            generated_latents.append(step.latent)
+            generated_ids.append(step.token_ids)
+            generated_masks.append(step.word_masks)
+            generated_lengths.append(step.lengths)
+            sequences = torch.cat((sequences, step.token_ids.unsqueeze(1)), dim=1)
+            sequence_word_masks = torch.cat((sequence_word_masks, step.word_masks.unsqueeze(1)), dim=1)
+            sequence_unit_mask = torch.cat(
+                (
+                    sequence_unit_mask,
+                    torch.ones(
+                        (sequence_unit_mask.shape[0], 1),
+                        dtype=torch.bool,
+                        device=sequence_unit_mask.device,
+                    ),
+                ),
+                dim=1,
             )
-            past_key_values = outputs.past_key_values
-            last_hidden = outputs.last_hidden_state[:, -1, :]
-            next_mean, next_log_std = self.generative_head.sample_distribution(last_hidden)
-            next_mean, next_log_std = self.dil_model.guard_normalized_distribution(
-                next_mean,
-                next_log_std,
-            )
-            generated_means.append(next_mean)
-            generated_log_stds.append(next_log_std)
-            current_input_embeds = self.student_core.embed_distribution(
-                next_mean,
-                next_log_std,
-            ).unsqueeze(1)
 
-        generated_mean = torch.stack(generated_means, dim=1)
-        generated_log_std = torch.stack(generated_log_stds, dim=1)
-        generated_raw_mean = self.dil_model.denormalize_mean(generated_mean)
-        generated_ids, generated_masks, generated_lengths = self.decode_latent_tokens(generated_mean)
+        generated_latents = torch.stack(generated_latents, dim=1)
+        generated_raw_latents = self.dil_model.denormalize_mean(generated_latents)
+        generated_ids = torch.stack(generated_ids, dim=1)
+        generated_masks = torch.stack(generated_masks, dim=1)
+        generated_lengths = torch.stack(generated_lengths, dim=1)
         roundtrip_cosine = (
-            self.roundtrip_semantic_cosine(generated_mean, generated_ids, generated_masks)
+            self.roundtrip_semantic_cosine(generated_latents, generated_ids, generated_masks)
             if roundtrip_check
             else None
         )
-        sequences = torch.cat((input_ids, generated_ids), dim=1)
-        sequence_word_masks = torch.cat((word_masks, generated_masks), dim=1)
-        sequence_unit_mask = torch.cat(
-            (
-                unit_mask,
-                torch.ones(
-                    generated_lengths.shape,
-                    dtype=torch.bool,
-                    device=generated_lengths.device,
-                ),
-            ),
-            dim=1,
-        )
-
         return NazGenerationOutput(
             sequences=sequences,
             word_masks=sequence_word_masks,
             unit_mask=sequence_unit_mask,
             generated_lengths=generated_lengths,
-            generated_mean=generated_mean,
-            generated_log_std=generated_log_std,
-            generated_raw_mean=generated_raw_mean,
+            generated_latents=generated_latents,
+            generated_raw_latents=generated_raw_latents,
             roundtrip_cosine=roundtrip_cosine,
         )
+
+    def generate_stream(
+        self,
+        input_ids: torch.LongTensor,
+        word_masks: torch.Tensor,
+        unit_mask: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 16,
+        num_samples: int = 4,
+        min_new_tokens: Optional[int] = None,
+        stop_threshold: Optional[float] = None,
+        repetition_cos_threshold: Optional[float] = None,
+    ):
+        with torch.no_grad():
+            self.eval()
+            if max_new_tokens <= 0:
+                raise ValueError("max_new_tokens must be > 0")
+            if num_samples <= 0:
+                raise ValueError("num_samples must be > 0")
+            min_new_tokens = self.min_new_tokens if min_new_tokens is None else min_new_tokens
+            stop_threshold = self.stop_threshold if stop_threshold is None else stop_threshold
+            repetition_cos_threshold = (
+                self.repetition_cos_threshold if repetition_cos_threshold is None else repetition_cos_threshold
+            )
+            if min_new_tokens < 0:
+                raise ValueError("min_new_tokens must be >= 0")
+            if input_ids.dim() != 3 or word_masks.shape != input_ids.shape:
+                raise ValueError("input_ids and word_masks must be shaped [batch, units, bytes]")
+
+            unit_mask = unit_mask if unit_mask is not None else word_masks.any(dim=-1)
+            if unit_mask.shape != input_ids.shape[:2]:
+                raise ValueError("unit_mask must be shaped [batch, units]")
+            if not bool(unit_mask.all().detach().cpu()):
+                raise ValueError("Naz.generate_stream expects packed prompts without unit padding")
+
+            current_semantic_states = self.semantic_states(input_ids, word_masks, unit_mask)
+            previous_feedback_latent = current_semantic_states[:, -1]
+            previous_token_ids = input_ids[:, -1]
+            previous_token_masks = word_masks[:, -1]
+            current_input_embeds = self.student_core.embed_semantic_states(current_semantic_states)
+            sequences = input_ids
+            sequence_word_masks = word_masks
+            sequence_unit_mask = unit_mask
+            past_key_values = None
+
+            for generated_idx in range(max_new_tokens):
+                outputs = self.transformer(
+                    inputs_embeds=current_input_embeds,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                past_key_values = outputs.past_key_values
+                last_hidden = outputs.last_hidden_state[:, -1, :]
+                stop_probability = torch.sigmoid(self.stop_head(last_hidden).squeeze(-1).float())
+                candidate_latents = self.sample_next_latents(last_hidden, num_samples)
+                candidate_ids, candidate_masks, candidate_lengths = self.decode_latent_tokens(candidate_latents, last_hidden)
+                feedback_means, feedback_log_stds = self.feedback_distribution_for_candidates(
+                    sequences,
+                    sequence_word_masks,
+                    sequence_unit_mask,
+                    candidate_ids,
+                    candidate_masks,
+                )
+                selected = self.select_written_candidates(
+                    candidate_latents,
+                    candidate_ids,
+                    candidate_masks,
+                    candidate_lengths,
+                    feedback_means,
+                    feedback_log_stds,
+                )
+                repeated_latent = F.cosine_similarity(
+                    previous_feedback_latent,
+                    selected.feedback_latent,
+                    dim=-1,
+                ).ge(repetition_cos_threshold)
+                repeated_surface = (
+                    selected.word_masks.eq(previous_token_masks)
+                    & selected.token_ids.eq(previous_token_ids)
+                ).all(dim=-1)
+                should_stop = (
+                    (stop_probability.ge(stop_threshold) | repeated_latent | repeated_surface)
+                    & torch.full_like(repeated_latent, generated_idx + 1 >= min_new_tokens)
+                )
+                selected.stop_probability = stop_probability
+                selected.should_stop = should_stop
+
+                yield selected
+
+                sequences = torch.cat((sequences, selected.token_ids.unsqueeze(1)), dim=1)
+                sequence_word_masks = torch.cat((sequence_word_masks, selected.word_masks.unsqueeze(1)), dim=1)
+                sequence_unit_mask = torch.cat(
+                    (
+                        sequence_unit_mask,
+                        torch.ones(
+                            (sequence_unit_mask.shape[0], 1),
+                            dtype=torch.bool,
+                            device=sequence_unit_mask.device,
+                        ),
+                    ),
+                    dim=1,
+                )
+                current_input_embeds = self.student_core.embed_semantic_states(selected.feedback_latent).unsqueeze(1)
+                previous_feedback_latent = selected.feedback_latent
+                previous_token_ids = selected.token_ids
+                previous_token_masks = selected.word_masks
+                if bool(should_stop.all().detach().cpu()):
+                    break
 
     def forward(
         self,
@@ -633,6 +1062,8 @@ class Naz(PreTrainedModel):
         target_input_ids: torch.LongTensor,
         target_word_masks: torch.Tensor,
         unit_mask: torch.Tensor,
+        stop_targets: Optional[torch.Tensor] = None,
+        training_step: Optional[int] = None,
     ) -> NazOutput:
         target_mean, target_log_std = self.target_distribution(
             target_input_ids,
@@ -644,5 +1075,9 @@ class Naz(PreTrainedModel):
             target_mean,
             target_log_std,
             unit_mask,
+            target_input_ids=target_input_ids,
+            target_word_masks=target_word_masks,
+            stop_targets=stop_targets,
+            training_step=training_step,
         )
 

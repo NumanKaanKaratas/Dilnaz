@@ -1,5 +1,4 @@
 import sys
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,7 +20,6 @@ from parallel_dil_data import (
     parallel_total_loss,
 )
 from train_dil import model_inputs
-from migrate_dil_context_checkpoint import migrate_checkpoint
 
 
 def tiny_parallel_config(tokenizer) -> DilConfig:
@@ -32,7 +30,6 @@ def tiny_parallel_config(tokenizer) -> DilConfig:
         hidden_size=8,
         intermediate_size=16,
         num_encoder_layers=2,
-        num_decoder_layers=2,
         latent_size=4,
         max_word_bytes=32,
         context_radius=1,
@@ -198,59 +195,17 @@ def test_parallel_dil_mock_teacher_forward_backward(tmp_path):
 
     assert torch.isfinite(loss)
     assert torch.isfinite(alignment)
-    assert outputs.ce_loss is not None
     assert outputs.kl_loss is not None
     assert outputs.distill_loss is not None
+    assert not hasattr(outputs, "ce_loss")
     assert model.encoder.embed_tokens.weight.grad is not None
 
 
-def test_migrate_dil_context_checkpoint_writes_v2_model_checkpoint(tmp_path):
+def test_dil_checkpoint_format_matches_encoder_only_family():
     tokenizer = load_hybrid_tokenizer()
-    source_dir = tmp_path / "source"
-    output_dir = tmp_path / "output"
-    source_dir.mkdir()
-    old_config = tiny_parallel_config(tokenizer)
-    source_model = Dil(old_config)
-    source_state = source_model.state_dict()
-    source_state = {
-        key: value
-        for key, value in source_state.items()
-        if not key.startswith("encoder.context_")
-    }
-    raw_config = old_config.to_dict()
-    raw_config.pop("context_radius", None)
-    raw_config.pop("target_index", None)
-    raw_config["context_left_radius"] = 1
-    raw_config["context_size"] = 2
-    raw_config["checkpoint_format_version"] = 8
-    (source_dir / "config.json").write_text(
-        json.dumps(raw_config, indent=2),
-        encoding="utf-8",
-    )
-    torch.save(
-        {
-            "format_version": 8,
-            "model_state_dict": source_state,
-            "training_state": {"step": 123},
-        },
-        source_dir / "checkpoint.pt",
-    )
+    config = tiny_parallel_config(tokenizer)
+    model = Dil(config)
 
-    copied = migrate_checkpoint(source_dir, output_dir, context_radius=1, map_location="cpu")
-
-    migrated_config = DilConfig.from_pretrained(output_dir)
-    checkpoint = torch.load(output_dir / "checkpoint.pt", map_location="cpu", weights_only=False)
-    migrated_model = Dil(migrated_config)
-    migrated_model.load_state_dict(checkpoint["model_state_dict"])
-
-    assert migrated_config.context_size == 2
-    assert migrated_config.target_index == 1
-    assert checkpoint["format_version"] == 12
-    assert checkpoint["optimizer_state_dict"] is None
-    assert checkpoint["training_state"]["step"] == 0
-    assert checkpoint["training_state"]["migrated_from_step"] == 123
-    assert "encoder.embed_tokens.weight" in copied
-    assert torch.equal(
-        checkpoint["model_state_dict"]["encoder.embed_tokens.weight"],
-        source_state["encoder.embed_tokens.weight"],
-    )
+    assert config.checkpoint_format_version == 15
+    assert not hasattr(model, "decoder")
+    assert not any(key.startswith("decoder.") for key in model.state_dict())
