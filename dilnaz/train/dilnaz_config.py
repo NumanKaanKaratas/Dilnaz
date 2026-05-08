@@ -15,12 +15,6 @@ DIL_MODEL_DEFAULTS = {
     "layer_geometry_weight": 2.0,
     "mean_geometry_weight": 4.0,
     "variance_weight": 0.05,
-    "semantic_normalizer_eps": 1e-4,
-    "semantic_normalizer_z_clip": 6.0,
-    "semantic_normalizer_quantile_min": 0.25,
-    "semantic_normalizer_quantile_max": 0.75,
-    "normalized_log_std_min": -8.0,
-    "normalized_log_std_max": 4.0,
 }
 
 
@@ -45,7 +39,6 @@ DIL_TRAIN_DEFAULTS = {
     "num_workers": 0,
     "seed": 1,
     "max_samples": 0,
-    "normalizer_calibration_samples": 0,
 }
 
 

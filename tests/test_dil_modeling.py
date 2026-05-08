@@ -66,21 +66,13 @@ def tiny_naz_config(tmp_path, dil_config: DilConfig) -> NazConfig:
     )
 
 
-def mark_dil_normalizer_fitted(model: Dil):
-    model.semantic_normalizer.center.zero_()
-    model.semantic_normalizer.scale.fill_(1.0)
-    model.semantic_normalizer.log_scale.zero_()
-    model.semantic_normalizer.initialized.fill_(True)
-    model.semantic_normalizer.fitted.fill_(True)
-
-
 def test_dil_config_uses_left_context_contract():
     config = tiny_config()
 
     assert config.context_radius == 2
     assert config.context_size == 3
     assert config.target_index == 2
-    assert config.checkpoint_format_version == 15
+    assert config.checkpoint_format_version == 16
     assert not hasattr(config, "context_left_radius")
 
 
@@ -91,23 +83,9 @@ def test_dil_rejects_pre_parallel_writer_checkpoint_family():
     try:
         Dil(config)
     except ValueError as error:
-        assert "checkpoint_format_version=15" in str(error)
+        assert "checkpoint_format_version=16" in str(error)
     else:
         raise AssertionError("Dil accepted stale checkpoint_format_version")
-
-
-def test_dil_robust_normalizer_fit_roundtrips_mean():
-    config = tiny_config()
-    model = Dil(config)
-    calibration = torch.randn(33, config.latent_size)
-    model.fit_semantic_normalizer(calibration)
-    sample = torch.randn(5, config.latent_size)
-
-    normalized = model.normalize_distribution(sample, torch.zeros_like(sample))[0]
-    restored = model.denormalize_mean(normalized)
-
-    assert model.semantic_normalizer.fitted
-    assert torch.allclose(restored, sample, atol=1e-5, rtol=1e-5)
 
 
 def test_dil_forward_keeps_target_latent_shape():
@@ -136,7 +114,6 @@ def test_dil_forward_keeps_target_latent_shape():
     assert isinstance(model.encoder.encoder_layers[0].mlp, DilGatedMLP)
     assert isinstance(model.encoder.encoder_layers[0].layernorm, DilRMSNorm)
     assert not hasattr(model, "decoder")
-    assert not model.semantic_normalizer.initialized
     assert torch.isfinite(outputs.loss)
 
 
@@ -236,7 +213,6 @@ def test_naz_uses_dil_encoder_target_log_std(tmp_path):
         dil_model.encoder.hidden_to_latent.weight.zero_()
         dil_model.encoder.hidden_to_latent.bias.zero_()
         dil_model.encoder.hidden_to_latent.bias[dil_config.latent_size :].fill_(-1.25)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -281,30 +257,9 @@ def test_naz_uses_dil_encoder_target_log_std(tmp_path):
     assert torch.allclose(target_log_std, torch.full_like(target_log_std, -1.25))
 
 
-def test_naz_rejects_unfitted_dil_normalizer(tmp_path):
-    dil_config = tiny_config()
-    dil_model = Dil(dil_config)
-    dil_config.save_pretrained(tmp_path)
-    torch.save(
-        {
-            "format_version": dil_config.checkpoint_format_version,
-            "model_state_dict": dil_model.state_dict(),
-        },
-        tmp_path / "checkpoint.pt",
-    )
-
-    try:
-        Naz(tiny_naz_config(tmp_path, dil_config))
-    except RuntimeError as error:
-        assert "fitted robust semantic normalizer" in str(error)
-    else:
-        raise AssertionError("Naz accepted an unfitted DIL semantic normalizer")
-
-
 def test_naz_input_uses_frozen_dil_semantic_embeddings(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -352,14 +307,12 @@ def test_naz_input_uses_frozen_dil_semantic_embeddings(tmp_path):
     assert embeddings.shape == (1, 3, naz_config.hidden_size)
     assert model.student_core.semantic_embed_proj[-2].weight.grad is not None
     assert grad_abs_sum(model.dil_model.encoder.embed_tokens.weight) == 0.0
-    assert grad_abs_sum(model.dil_model.semantic_normalizer.center) == 0.0
     assert not hasattr(model, "byte_embed_tokens")
 
 
 def test_naz_generator_outputs_noise_conditioned_latents(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -386,11 +339,11 @@ def test_naz_generator_outputs_noise_conditioned_latents(tmp_path):
     pred_d = model.generative_head.sample(hidden_states)
     assert not torch.allclose(pred_c, pred_d)
     next_hidden = torch.randn(2, naz_config.hidden_size)
-    mean_anchor = model.guard_normalized_latents(model.mean_head(next_hidden).float())
+    mean_anchor = model.mean_head(next_hidden).float()
     candidate_latents = model.sample_next_latents(next_hidden, num_samples=3)
     assert candidate_latents.shape == (3, 2, dil_config.latent_size)
     assert torch.allclose(candidate_latents[0], mean_anchor)
-    logits = model.writer_logits(mean_anchor, next_hidden)
+    logits = model.writer_logits(mean_anchor)
     assert logits.shape == (2, dil_config.max_word_bytes, dil_config.vocab_size)
     assert not hasattr(model.dil_model, "decoder")
 
@@ -398,7 +351,6 @@ def test_naz_generator_outputs_noise_conditioned_latents(tmp_path):
 def test_naz_hybrid_backbone_uses_native_layer_pattern(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -426,7 +378,6 @@ def test_naz_hybrid_backbone_uses_native_layer_pattern(tmp_path):
 def test_naz_hybrid_backbone_cache_matches_full_forward(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -482,7 +433,6 @@ def test_naz_interface_has_no_flush_schedule_cli():
 def test_naz_forward_samples_energy_from_noise_generator(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -532,7 +482,6 @@ def test_naz_forward_samples_energy_from_noise_generator(tmp_path):
 def test_naz_writer_schedule_warms_up_then_uses_predicted_and_candidate_latents(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -563,7 +512,6 @@ def test_naz_writer_schedule_warms_up_then_uses_predicted_and_candidate_latents(
 def test_naz_writer_labels_use_first_position_eos_as_sequence_stop(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -586,7 +534,6 @@ def test_naz_writer_labels_use_first_position_eos_as_sequence_stop(tmp_path):
 def test_naz_generation_reencodes_written_feedback_tokens(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -631,7 +578,6 @@ def test_naz_generation_reencodes_written_feedback_tokens(tmp_path):
 def test_naz_generate_decodes_sample_candidates_each_step(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -651,9 +597,9 @@ def test_naz_generate_decodes_sample_candidates_each_step(tmp_path):
     decode_shapes = []
     original_decode = model.decode_latent_tokens
 
-    def capture_decode(latents, hidden_states, chunk_size=None):
+    def capture_decode(latents, chunk_size=None):
         decode_shapes.append(tuple(latents.shape))
-        return original_decode(latents, hidden_states, chunk_size)
+        return original_decode(latents, chunk_size)
 
     model.decode_latent_tokens = capture_decode
 
@@ -675,7 +621,6 @@ def test_naz_generate_decodes_sample_candidates_each_step(tmp_path):
 def test_naz_generate_stream_yields_each_written_token(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -719,7 +664,6 @@ def test_naz_generate_stream_yields_each_written_token(tmp_path):
 def test_resident_semantic_cache_matches_full_left_context_pass(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -813,7 +757,6 @@ def test_resident_naz_semantic_batcher_surfaces_next_units():
 def test_naz_decode_latent_tokens_uses_chunked_batch_shape(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
-    mark_dil_normalizer_fitted(dil_model)
     dil_config.save_pretrained(tmp_path)
     torch.save(
         {
@@ -825,9 +768,11 @@ def test_naz_decode_latent_tokens_uses_chunked_batch_shape(tmp_path):
     naz_config = tiny_naz_config(tmp_path, dil_config)
     model = Naz(naz_config).eval()
     latents = torch.randn(1, 5, dil_config.latent_size)
-    hidden_states = torch.randn(1, 5, naz_config.hidden_size)
 
-    token_ids, masks, lengths = model.decode_latent_tokens(latents, hidden_states, chunk_size=2)
+    token_ids, masks, lengths = model.decode_latent_tokens(
+        latents,
+        chunk_size=2,
+    )
 
     assert token_ids.shape == (1, 5, dil_config.max_word_bytes)
     assert masks.shape == (1, 5, dil_config.max_word_bytes)

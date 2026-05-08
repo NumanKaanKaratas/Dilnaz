@@ -14,7 +14,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 18
+CHECKPOINT_FORMAT_VERSION = 21
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -83,7 +83,7 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
         encoder_forward=compile_forward(model.dil_model.encoder.forward, compile_mode, "DilEncoderCore"),
     )
     model.set_compiled_writer_forward(
-        compile_forward(model.writer.forward, compile_mode, "NazContextualWriter")
+        compile_forward(model.writer.forward, compile_mode, "NazLatentWriter")
     )
     model.eval()
     dil_config = DilConfig.from_pretrained(dil_path)

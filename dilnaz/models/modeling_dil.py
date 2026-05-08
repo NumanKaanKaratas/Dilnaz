@@ -61,84 +61,6 @@ class DilLayer(nn.Module):
         return residual + hidden_states
 
 
-class SemanticDistributionNormalizer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.eps = config.semantic_normalizer_eps
-        self.z_clip = config.semantic_normalizer_z_clip
-        self.quantile_min = config.semantic_normalizer_quantile_min
-        self.quantile_max = config.semantic_normalizer_quantile_max
-        self.log_std_min = config.normalized_log_std_min
-        self.log_std_max = config.normalized_log_std_max
-        self.register_buffer("center", torch.zeros(config.latent_size))
-        self.register_buffer("scale", torch.ones(config.latent_size))
-        self.register_buffer("log_scale", torch.zeros(config.latent_size))
-        self.register_buffer("initialized", torch.zeros((), dtype=torch.bool))
-        self.register_buffer("fitted", torch.zeros((), dtype=torch.bool))
-
-    @torch.no_grad()
-    def fit(self, mean: torch.Tensor):
-        flat = mean.detach().float().reshape(-1, mean.shape[-1])
-        if flat.numel() == 0:
-            raise ValueError("semantic normalizer calibration received no latents")
-        quantiles = torch.quantile(
-            flat,
-            torch.tensor([self.quantile_min, 0.5, self.quantile_max], device=flat.device),
-            dim=0,
-        )
-        low, median, high = quantiles.unbind(dim=0)
-        gaussian_iqr = 1.3489795003921634
-        scale = ((high - low) / gaussian_iqr).clamp_min(self.eps)
-        self.center.copy_(median.to(self.center.device, dtype=self.center.dtype))
-        self.scale.copy_(scale.to(self.scale.device, dtype=self.scale.dtype))
-        self.initialized.fill_(True)
-        self.fitted.fill_(True)
-        self.scale.clamp_(min=self.eps)
-        self.log_scale.copy_(self.scale.log())
-
-    def require_fitted(self):
-        if not bool(self.fitted.detach().cpu()):
-            raise RuntimeError("DIL semantic normalizer is not fitted; run DIL calibration before NAZ")
-
-    def normalize_mean(self, mean: torch.Tensor) -> torch.Tensor:
-        self.require_fitted()
-        center = self.center.to(device=mean.device, dtype=mean.dtype)
-        scale = self.scale.to(device=mean.device, dtype=mean.dtype)
-        return (mean - center) / scale
-
-    def denormalize_mean(self, mean: torch.Tensor) -> torch.Tensor:
-        self.require_fitted()
-        center = self.center.to(device=mean.device, dtype=mean.dtype)
-        scale = self.scale.to(device=mean.device, dtype=mean.dtype)
-        return mean * scale + center
-
-    def normalize_distribution(
-        self,
-        mean: torch.Tensor,
-        log_std: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        log_scale = self.log_scale.to(device=log_std.device, dtype=log_std.dtype)
-        return self.normalize_mean(mean), log_std - log_scale
-
-    def denormalize_distribution(
-        self,
-        mean: torch.Tensor,
-        log_std: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        log_scale = self.log_scale.to(device=log_std.device, dtype=log_std.dtype)
-        return self.denormalize_mean(mean), log_std + log_scale
-
-    def guard_distribution(
-        self,
-        mean: torch.Tensor,
-        log_std: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            mean.clamp(min=-self.z_clip, max=self.z_clip),
-            log_std.clamp(min=self.log_std_min, max=self.log_std_max),
-        )
-
-
 def dil_context_attention_heads(hidden_size: int) -> int:
     return next(heads for heads in (8, 4, 2, 1) if hidden_size % heads == 0)
 
@@ -283,13 +205,12 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 15:
-            raise ValueError("Dil encoder-only checkpoints require checkpoint_format_version=15")
+        if config.checkpoint_format_version != 16:
+            raise ValueError("Dil encoder-only checkpoints require checkpoint_format_version=16")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
 
         self.encoder = DilEncoderCore(config)
-        self.semantic_normalizer = SemanticDistributionNormalizer(config)
         self.dil_dropout = config.dil_dropout
         self.kl_clamp = config.kl_clamp
         self.kl_weight = config.kl_weight
@@ -316,33 +237,6 @@ class Dil(PreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.encoder.embed_tokens = value
-
-    def fit_semantic_normalizer(self, mean: torch.Tensor):
-        self.semantic_normalizer.fit(mean)
-
-    def normalize_distribution(
-        self,
-        mean: torch.Tensor,
-        log_std: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.semantic_normalizer.normalize_distribution(mean, log_std)
-
-    def denormalize_distribution(
-        self,
-        mean: torch.Tensor,
-        log_std: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.semantic_normalizer.denormalize_distribution(mean, log_std)
-
-    def denormalize_mean(self, mean: torch.Tensor) -> torch.Tensor:
-        return self.semantic_normalizer.denormalize_mean(mean)
-
-    def guard_normalized_distribution(
-        self,
-        mean: torch.Tensor,
-        log_std: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.semantic_normalizer.guard_distribution(mean, log_std)
 
     def encode(
         self,

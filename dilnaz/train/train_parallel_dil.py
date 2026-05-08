@@ -37,7 +37,6 @@ from parallel_dil_data import (  # noqa: E402
 from tokenization import default_vocab_path  # noqa: E402
 from train_dil import (  # noqa: E402
     is_dataloader_worker_exit,
-    calibrate_semantic_normalizer,
     make_scheduler,
     model_inputs,
     restore_checkpoint,
@@ -116,7 +115,6 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=DIL_TRAIN_DEFAULTS["num_workers"])
     parser.add_argument("--seed", type=int, default=DIL_TRAIN_DEFAULTS["seed"])
     parser.add_argument("--max-samples", type=int, default=DIL_TRAIN_DEFAULTS["max_samples"])
-    parser.add_argument("--normalizer-calibration-samples", type=int, default=DIL_TRAIN_DEFAULTS["normalizer_calibration_samples"])
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
@@ -131,12 +129,6 @@ def parse_args():
     parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
-    parser.add_argument("--semantic-normalizer-eps", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_eps"])
-    parser.add_argument("--semantic-normalizer-z-clip", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_z_clip"])
-    parser.add_argument("--semantic-normalizer-quantile-min", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_quantile_min"])
-    parser.add_argument("--semantic-normalizer-quantile-max", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_quantile_max"])
-    parser.add_argument("--normalized-log-std-min", type=float, default=DIL_MODEL_DEFAULTS["normalized_log_std_min"])
-    parser.add_argument("--normalized-log-std-max", type=float, default=DIL_MODEL_DEFAULTS["normalized_log_std_max"])
     parser.add_argument("--parallel-alignment-weight", type=float, default=1.0)
     parser.add_argument("--nllb-model-name", default=DEFAULT_PARALLEL_NLLB_MODEL)
     parser.add_argument("--source-lang", default=DEFAULT_SOURCE_LANG)
@@ -168,17 +160,6 @@ def validate_args(args):
         raise ValueError("--eval-file is required when --eval-every > 0")
     if args.max_eval_batches <= 0:
         raise ValueError("--max-eval-batches must be > 0")
-    if args.normalizer_calibration_samples < 0:
-        raise ValueError("--normalizer-calibration-samples must be >= 0")
-    if args.semantic_normalizer_eps <= 0.0:
-        raise ValueError("--semantic-normalizer-eps must be > 0")
-    if args.semantic_normalizer_z_clip <= 0.0:
-        raise ValueError("--semantic-normalizer-z-clip must be > 0")
-    if not 0.0 < args.semantic_normalizer_quantile_min < args.semantic_normalizer_quantile_max < 1.0:
-        raise ValueError("--semantic-normalizer-quantile-min/max must be ordered inside (0, 1)")
-    if args.normalized_log_std_min >= args.normalized_log_std_max:
-        raise ValueError("--normalized-log-std-min must be smaller than --normalized-log-std-max")
-
 
 def build_config(args, tokenizer):
     if args.resume is not None:
@@ -200,12 +181,6 @@ def build_config(args, tokenizer):
         layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
-        semantic_normalizer_eps=args.semantic_normalizer_eps,
-        semantic_normalizer_z_clip=args.semantic_normalizer_z_clip,
-        semantic_normalizer_quantile_min=args.semantic_normalizer_quantile_min,
-        semantic_normalizer_quantile_max=args.semantic_normalizer_quantile_max,
-        normalized_log_std_min=args.normalized_log_std_min,
-        normalized_log_std_max=args.normalized_log_std_max,
         tokenizer_vocab_file=args.tokenizer_vocab.name,
         nllb_model_name=args.nllb_model_name,
         nllb_src_lang=args.source_lang,
@@ -416,27 +391,7 @@ def main():
     current_batch, current_batch_seen, initial_wait = batch_source.first()
     data_seconds += initial_wait
 
-    def fit_semantic_normalizer_for_save():
-        print("semantic_normalizer_calibration_start=1", flush=True)
-        calibration_dataset = ParallelDilBatchDataset(
-            args.train_file,
-            config,
-            tokenizer,
-            batch_size=args.batch_size,
-            repeat=False,
-            max_samples=args.normalizer_calibration_samples,
-        )
-        calibrated_tokens = calibrate_semantic_normalizer(
-            model,
-            calibration_dataset,
-            device,
-            cuda_prefetch,
-            args.prefetch_factor,
-        )
-        print(f"semantic_normalizer_calibration_done=1 tokens={calibrated_tokens}", flush=True)
-
     def save_interrupted():
-        fit_semantic_normalizer_for_save()
         interrupted_dir = save_checkpoint(
             args.output_dir,
             model,
@@ -547,8 +502,6 @@ def main():
         return
 
     batch_source.close()
-    fit_semantic_normalizer_for_save()
-
     final_dir = save_checkpoint(
         args.output_dir,
         model,

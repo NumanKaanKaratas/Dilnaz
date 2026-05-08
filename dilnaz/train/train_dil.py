@@ -45,7 +45,7 @@ from models.modeling_dil import Dil
 from tokenization import default_vocab_path
 
 
-CHECKPOINT_FORMAT_VERSION = 15
+CHECKPOINT_FORMAT_VERSION = 16
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -119,7 +119,6 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "target_index": config.target_index,
         "latent_size": config.latent_size,
         "distillation_weight": config.distillation_weight,
-        "semantic_normalizer_z_clip": config.semantic_normalizer_z_clip,
     }
 
 
@@ -142,7 +141,6 @@ def save_checkpoint(
     if tokenizer_vocab_path.resolve() != dst_vocab.resolve():
         shutil.copyfile(tokenizer_vocab_path, dst_vocab)
     state = json_training_state(config, step, metrics, compile_mode)
-    state["semantic_normalizer_fitted"] = bool(model.semantic_normalizer.fitted.detach().cpu())
     torch.save(
         {
             "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -230,39 +228,6 @@ def evaluate(model, eval_loader, teacher, device, autocast_enabled: bool, cuda_p
     return {f"eval_{key}": value / batches for key, value in total.items()}
 
 
-@torch.no_grad()
-def calibrate_semantic_normalizer(
-    model: Dil,
-    calibration_dataset,
-    device: torch.device,
-    cuda_prefetch: bool,
-    prefetch_factor: int,
-):
-    loader = make_dil_batch_loader(
-        calibration_dataset,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
-        prefetch_factor=prefetch_factor,
-    )
-    model.eval()
-    means = []
-    token_count = 0
-    for batch in DeviceBatchPrefetcher(loader, device, cuda_prefetch):
-        latent_states = model.encode(
-            input_ids=batch["input_ids"],
-            word_masks=batch["word_masks"],
-            output_hidden_states=False,
-        )
-        mean, _ = torch.chunk(latent_states, 2, dim=-1)
-        means.append(mean.detach().float().cpu())
-        token_count += mean.shape[0]
-    if not means:
-        raise ValueError("semantic normalizer calibration produced no latents")
-    model.fit_semantic_normalizer(torch.cat(means, dim=0))
-    model.train()
-    return token_count
-
-
 def format_log(step, metrics):
     fields = [
         f"step={step}",
@@ -323,7 +288,6 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=DIL_TRAIN_DEFAULTS["num_workers"])
     parser.add_argument("--seed", type=int, default=DIL_TRAIN_DEFAULTS["seed"])
     parser.add_argument("--max-samples", type=int, default=DIL_TRAIN_DEFAULTS["max_samples"])
-    parser.add_argument("--normalizer-calibration-samples", type=int, default=DIL_TRAIN_DEFAULTS["normalizer_calibration_samples"])
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
@@ -338,12 +302,6 @@ def parse_args():
     parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
-    parser.add_argument("--semantic-normalizer-eps", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_eps"])
-    parser.add_argument("--semantic-normalizer-z-clip", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_z_clip"])
-    parser.add_argument("--semantic-normalizer-quantile-min", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_quantile_min"])
-    parser.add_argument("--semantic-normalizer-quantile-max", type=float, default=DIL_MODEL_DEFAULTS["semantic_normalizer_quantile_max"])
-    parser.add_argument("--normalized-log-std-min", type=float, default=DIL_MODEL_DEFAULTS["normalized_log_std_min"])
-    parser.add_argument("--normalized-log-std-max", type=float, default=DIL_MODEL_DEFAULTS["normalized_log_std_max"])
     parser.add_argument("--nllb-model-name", default="facebook/nllb-200-distilled-600M")
     parser.add_argument("--nllb-src-lang", default="tur_Latn")
     return parser.parse_args()
@@ -374,17 +332,6 @@ def validate_args(args):
         raise ValueError("--max-eval-batches must be > 0")
     if args.data_mode == "resident" and args.max_samples > 0:
         raise ValueError("--max-samples is not supported with --data-mode resident")
-    if args.normalizer_calibration_samples < 0:
-        raise ValueError("--normalizer-calibration-samples must be >= 0")
-    if args.semantic_normalizer_eps <= 0.0:
-        raise ValueError("--semantic-normalizer-eps must be > 0")
-    if args.semantic_normalizer_z_clip <= 0.0:
-        raise ValueError("--semantic-normalizer-z-clip must be > 0")
-    if not 0.0 < args.semantic_normalizer_quantile_min < args.semantic_normalizer_quantile_max < 1.0:
-        raise ValueError("--semantic-normalizer-quantile-min/max must be ordered inside (0, 1)")
-    if args.normalized_log_std_min >= args.normalized_log_std_max:
-        raise ValueError("--normalized-log-std-min must be smaller than --normalized-log-std-max")
-
 
 def is_parquet_path(path: Path | None) -> bool:
     return path is not None and path.suffix.casefold() == ".parquet"
@@ -410,12 +357,6 @@ def build_config(args, tokenizer):
         layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
-        semantic_normalizer_eps=args.semantic_normalizer_eps,
-        semantic_normalizer_z_clip=args.semantic_normalizer_z_clip,
-        semantic_normalizer_quantile_min=args.semantic_normalizer_quantile_min,
-        semantic_normalizer_quantile_max=args.semantic_normalizer_quantile_max,
-        normalized_log_std_min=args.normalized_log_std_min,
-        normalized_log_std_max=args.normalized_log_std_max,
         tokenizer_vocab_file=args.tokenizer_vocab.name,
         nllb_model_name=args.nllb_model_name,
         nllb_src_lang=args.nllb_src_lang,
@@ -622,40 +563,7 @@ def main():
         current_batch, current_batch_seen, initial_wait = batch_source.first()
         data_seconds += initial_wait
 
-    def fit_semantic_normalizer_for_save():
-        print("semantic_normalizer_calibration_start=1", flush=True)
-        if train_is_parquet:
-            calibration_dataset = ReadyParquetDilBatchDataset(
-                args.train_file,
-                config,
-                batch_size=args.batch_size,
-                repeat=False,
-                max_samples=args.normalizer_calibration_samples,
-            )
-        else:
-            assert teacher is not None
-            calibration_dataset = HybridDilBatchDataset(
-                args.train_file,
-                config,
-                tokenizer,
-                batch_size=args.batch_size,
-                read_chars=args.text_read_chars,
-                repeat=False,
-                max_samples=args.normalizer_calibration_samples,
-                teacher_tokenizer=teacher.tokenizer,
-                teacher_max_tokens=teacher.max_encoder_tokens,
-            )
-        calibrated_tokens = calibrate_semantic_normalizer(
-            model,
-            calibration_dataset,
-            device,
-            cuda_prefetch,
-            args.prefetch_factor,
-        )
-        print(f"semantic_normalizer_calibration_done=1 tokens={calibrated_tokens}", flush=True)
-
     def save_interrupted():
-        fit_semantic_normalizer_for_save()
         interrupted_dir = save_checkpoint(
             args.output_dir,
             model,
@@ -778,8 +686,6 @@ def main():
 
     if batch_source is not None:
         batch_source.close()
-
-    fit_semantic_normalizer_for_save()
 
     final_dir = save_checkpoint(
         args.output_dir,

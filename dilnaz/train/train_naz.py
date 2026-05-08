@@ -41,7 +41,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer
 
 
-CHECKPOINT_FORMAT_VERSION = 18
+CHECKPOINT_FORMAT_VERSION = 21
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -72,7 +72,7 @@ def json_training_state(config, step: int, metrics: dict, dil_checksum: str, com
         "compile_mode": compile_mode,
         "max_word_bytes": config.max_word_bytes,
         "latent_size": config.latent_size,
-        "semantic_space": "dil_normalized_latent",
+        "semantic_space": "dil_latent",
         "feedback": "dil_reencoded_contextual_mean",
         "byte_vocab_size": config.byte_vocab_size,
         "vocab_size": config.vocab_size,
@@ -466,7 +466,7 @@ def main():
     )
     if config.writer_loss_weight > 0.0:
         base_model.set_compiled_writer_forward(
-            compile_forward(base_model.writer.forward, compile_mode, "NazContextualWriter")
+            compile_forward(base_model.writer.forward, compile_mode, "NazLatentWriter")
         )
     model = base_model
     optimizer = AdamW(

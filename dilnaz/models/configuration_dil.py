@@ -23,19 +23,13 @@ class DilConfig(PretrainedConfig):
         layer_geometry_weight=4.0,
         mean_geometry_weight=8.0,
         variance_weight=0.05,
-        semantic_normalizer_eps=1e-4,
-        semantic_normalizer_z_clip=6.0,
-        semantic_normalizer_quantile_min=0.25,
-        semantic_normalizer_quantile_max=0.75,
-        normalized_log_std_min=-8.0,
-        normalized_log_std_max=4.0,
         tokenizer_vocab_file="hybrid_surface_vocab.json",
         nllb_model_name="facebook/nllb-200-distilled-600M",
         nllb_src_lang="tur_Latn",
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=15,
+        checkpoint_format_version=16,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:
@@ -63,12 +57,6 @@ class DilConfig(PretrainedConfig):
         self.layer_geometry_weight = layer_geometry_weight
         self.mean_geometry_weight = mean_geometry_weight
         self.variance_weight = variance_weight
-        self.semantic_normalizer_eps = semantic_normalizer_eps
-        self.semantic_normalizer_z_clip = semantic_normalizer_z_clip
-        self.semantic_normalizer_quantile_min = semantic_normalizer_quantile_min
-        self.semantic_normalizer_quantile_max = semantic_normalizer_quantile_max
-        self.normalized_log_std_min = normalized_log_std_min
-        self.normalized_log_std_max = normalized_log_std_max
         self.tokenizer_vocab_file = tokenizer_vocab_file
         self.nllb_model_name = nllb_model_name
         self.nllb_src_lang = nllb_src_lang
