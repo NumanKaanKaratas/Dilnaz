@@ -18,13 +18,12 @@ class DilOutput(ModelOutput):
     distill_loss: Optional[torch.FloatTensor] = None
     writer_loss: Optional[torch.FloatTensor] = None
     writer_token_loss: Optional[torch.FloatTensor] = None
-    writer_length_loss: Optional[torch.FloatTensor] = None
     layer_geometry_losses: Optional[torch.FloatTensor] = None
     mean_geometry_loss: Optional[torch.FloatTensor] = None
     variance_loss: Optional[torch.FloatTensor] = None
     byte_acc: Optional[torch.FloatTensor] = None
     token_exact: Optional[torch.FloatTensor] = None
-    length_acc: Optional[torch.FloatTensor] = None
+    stop_acc: Optional[torch.FloatTensor] = None
 
 
 def semantic_unit_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -284,11 +283,12 @@ class DilConditionalWriter(nn.Module):
     def __init__(self, config: DilConfig):
         super().__init__()
         self.max_word_bytes = config.max_word_bytes
+        self.writer_max_positions = config.writer_max_positions
         self.pad_token_id = config.pad_token_id
-        self.eos_token_id = config.eos_token_id
-        self.vocab_size = config.vocab_size
+        self.writer_stop_token_id = config.writer_stop_token_id
+        self.writer_vocab_size = config.writer_vocab_size
         self.semantic_proj = nn.Linear(config.latent_size, config.hidden_size)
-        self.position_embeddings = nn.Embedding(config.max_word_bytes, config.hidden_size)
+        self.position_embeddings = nn.Embedding(config.writer_max_positions, config.hidden_size)
         intermediate_size = config.hidden_size * config.writer_conv_expansion
         self.blocks = nn.ModuleList(
             [
@@ -304,30 +304,32 @@ class DilConditionalWriter(nn.Module):
             ]
         )
         self.final_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.token_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.length_head = nn.Linear(config.hidden_size, config.max_word_bytes + 1)
+        self.token_head = nn.Linear(config.hidden_size, config.writer_vocab_size, bias=False)
         self.dropout = nn.Dropout(config.writer_dropout)
 
-    def forward(self, semantic: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, semantic: torch.Tensor) -> torch.Tensor:
         if semantic.shape[-1] == 0:
             raise ValueError("semantic last dimension must be non-empty")
         prefix_shape = semantic.shape[:-1]
         flat_semantic = semantic.reshape(-1, semantic.shape[-1])
-        positions = torch.arange(self.max_word_bytes, device=semantic.device)
+        positions = torch.arange(self.writer_max_positions, device=semantic.device)
         hidden_states = self.semantic_proj(flat_semantic).unsqueeze(1) + self.position_embeddings(positions).unsqueeze(0)
         hidden_states = self.dropout(hidden_states)
         for block in self.blocks:
             hidden_states = block(hidden_states)
         hidden_states = self.final_norm(hidden_states)
-        token_logits = self.token_head(hidden_states).reshape(*prefix_shape, self.max_word_bytes, self.vocab_size)
-        length_logits = self.length_head(hidden_states[:, 0]).reshape(*prefix_shape, self.max_word_bytes + 1)
-        return token_logits, length_logits
+        return self.token_head(hidden_states).reshape(*prefix_shape, self.writer_max_positions, self.writer_vocab_size)
 
     @torch.no_grad()
     def generate(self, semantic: torch.Tensor) -> tuple[torch.LongTensor, torch.Tensor, torch.LongTensor]:
-        token_logits, length_logits = self.forward(semantic)
+        token_logits = self.forward(semantic)
         generated = token_logits.argmax(dim=-1)
-        lengths = length_logits.argmax(dim=-1).clamp_max(self.max_word_bytes)
+        stop_hits = generated.eq(self.writer_stop_token_id)
+        has_stop = stop_hits.any(dim=-1)
+        first_stop = stop_hits.float().argmax(dim=-1).long()
+        fallback = torch.full_like(first_stop, self.max_word_bytes)
+        lengths = torch.where(has_stop, first_stop, fallback).clamp_max(self.max_word_bytes)
+        generated = generated[..., : self.max_word_bytes]
         mask = torch.arange(self.max_word_bytes, device=semantic.device).view(
             *([1] * (generated.dim() - 1)),
             self.max_word_bytes,
@@ -340,14 +342,18 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 20:
-            raise ValueError("DIL native-normalized semantic checkpoints require checkpoint_format_version=20")
+        if config.checkpoint_format_version != 21:
+            raise ValueError("DIL parallel-stop Writer checkpoints require checkpoint_format_version=21")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
             raise ValueError("eos_token_id must be inside the tokenizer vocabulary")
         if config.decoder_start_token_id >= config.vocab_size:
             raise ValueError("decoder_start_token_id must be inside the tokenizer vocabulary")
+        if config.writer_stop_token_id != config.vocab_size or config.writer_vocab_size != config.vocab_size + 1:
+            raise ValueError("Writer stop token contract must be writer_stop_token_id=vocab_size")
+        if config.writer_max_positions != config.max_word_bytes + 1:
+            raise ValueError("Writer max positions must be max_word_bytes + 1")
 
         self.encoder = DilEncoderCore(config)
         self.writer = DilConditionalWriter(config)
@@ -392,7 +398,7 @@ class Dil(PreTrainedModel):
             return normalize_semantic_latents(semantic), layer_vectors
         return normalize_semantic_latents(encoded)
 
-    def writer_outputs(self, semantic: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def writer_outputs(self, semantic: torch.Tensor) -> torch.Tensor:
         compiled_forward = getattr(self, "_compiled_writer_forward", None)
         if compiled_forward is not None:
             return compiled_forward(semantic)
@@ -427,21 +433,17 @@ class Dil(PreTrainedModel):
         std = torch.sqrt(model_vectors.float().var(dim=0, unbiased=False) + 1e-4)
         return F.relu(1.0 - std).mean()
 
-    def writer_metrics(self, logits: torch.Tensor, labels: torch.LongTensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def writer_metrics(self, logits: torch.Tensor, labels: torch.LongTensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         valid = labels.ne(-100)
         predictions = logits.argmax(dim=-1)
-        byte_acc = (predictions.eq(labels) & valid).sum().float() / valid.sum().clamp_min(1).float()
+        byte_valid = valid & labels.ne(self.config.writer_stop_token_id)
+        stop_valid = labels.eq(self.config.writer_stop_token_id)
+        byte_acc = (predictions.eq(labels) & byte_valid).sum().float() / byte_valid.sum().clamp_min(1).float()
+        stop_acc = (predictions.eq(labels) & stop_valid).sum().float() / stop_valid.sum().clamp_min(1).float()
         row_valid = valid.any(dim=-1)
         exact = ((predictions.eq(labels) | ~valid).all(dim=-1) & row_valid).sum().float()
         token_exact = exact / row_valid.sum().clamp_min(1).float()
-        return byte_acc, token_exact
-
-    def writer_length_targets(self, labels: torch.LongTensor) -> torch.LongTensor:
-        eos_hits = labels.eq(self.config.eos_token_id)
-        has_eos = eos_hits.any(dim=-1)
-        first_eos = eos_hits.float().argmax(dim=-1).long()
-        fallback = labels.ne(-100).sum(dim=-1).clamp_max(self.config.max_word_bytes)
-        return torch.where(has_eos, first_eos, fallback)
+        return byte_acc, token_exact, stop_acc
 
     def writer_training_semantic(self, semantic: torch.Tensor, training_step: int | None) -> torch.Tensor:
         if not self.training:
@@ -482,19 +484,16 @@ class Dil(PreTrainedModel):
         semantic: torch.Tensor,
         labels: torch.LongTensor,
         training_step: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         semantic = self.writer_training_semantic(semantic, training_step)
-        token_logits, length_logits = self.writer_outputs(semantic)
+        token_logits = self.writer_outputs(semantic)
         token_loss = F.cross_entropy(
-            token_logits.reshape(-1, self.config.vocab_size),
+            token_logits.reshape(-1, self.config.writer_vocab_size),
             labels.reshape(-1),
             ignore_index=-100,
         )
-        length_targets = self.writer_length_targets(labels)
-        length_loss = F.cross_entropy(length_logits.reshape(-1, self.config.max_word_bytes + 1), length_targets.reshape(-1))
-        byte_acc, token_exact = self.writer_metrics(token_logits, labels)
-        length_acc = length_logits.argmax(dim=-1).eq(length_targets).float().mean()
-        return token_loss + length_loss, token_loss, length_loss, byte_acc, token_exact, length_acc
+        byte_acc, token_exact, stop_acc = self.writer_metrics(token_logits, labels)
+        return token_loss, token_loss, byte_acc, token_exact, stop_acc
 
     def forward(
         self,
@@ -545,12 +544,11 @@ class Dil(PreTrainedModel):
         byte_acc = semantic.new_zeros(())
         token_exact = semantic.new_zeros(())
         writer_token_loss = semantic.new_zeros(())
-        writer_length_loss = semantic.new_zeros(())
-        length_acc = semantic.new_zeros(())
+        stop_acc = semantic.new_zeros(())
         if labels is not None and self.writer_loss_weight > 0.0:
             writer_semantic = semantic.detach()
             labels = labels.to(semantic.device)
-            writer_loss, writer_token_loss, writer_length_loss, byte_acc, token_exact, length_acc = self.writer_loss_and_metrics(
+            writer_loss, writer_token_loss, byte_acc, token_exact, stop_acc = self.writer_loss_and_metrics(
                 writer_semantic,
                 labels,
                 training_step,
@@ -563,13 +561,12 @@ class Dil(PreTrainedModel):
             distill_loss=distill_loss,
             writer_loss=writer_loss,
             writer_token_loss=writer_token_loss,
-            writer_length_loss=writer_length_loss,
             layer_geometry_losses=layer_geometry_losses,
             mean_geometry_loss=mean_geometry_loss,
             variance_loss=variance_loss,
             byte_acc=byte_acc,
             token_exact=token_exact,
-            length_acc=length_acc,
+            stop_acc=stop_acc,
         )
 
     @torch.no_grad()

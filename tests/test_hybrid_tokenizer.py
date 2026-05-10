@@ -1,4 +1,5 @@
 import sys
+import json
 from pathlib import Path
 
 import torch
@@ -161,6 +162,46 @@ def test_whitespace_surface_tokens_do_not_receive_teacher_distillation():
     assert batch["teacher_text_indices"].tolist() == [0, 0, 0]
 
 
+def test_jsonl_text_records_decode_newline_escapes_for_dil_and_naz(tmp_path):
+    tokenizer = load_tokenizer()
+    train_file = tmp_path / "data.jsonl"
+    train_file.write_text(
+        json.dumps({"text": "A \nDişi"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    config = DilConfig(
+        vocab_size=tokenizer.vocab_size,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        max_word_bytes=32,
+    )
+    dataset = HybridDilBatchDataset(
+        train_file=train_file,
+        config=config,
+        tokenizer=tokenizer,
+        batch_size=8,
+        read_chars=2,
+        repeat=False,
+    )
+
+    batch = next(iter(dataset))
+    decoded = [
+        tokenizer.decode(
+            [
+                int(token_id)
+                for token_id in row.tolist()
+                if int(token_id) not in (-100, tokenizer.eos_token_id) and int(token_id) < tokenizer.vocab_size
+            ]
+        )
+        for row in batch["labels"]
+    ]
+    token_ids = list(stream_token_pieces(train_file, tokenizer, max_word_bytes=32, read_chars=2))
+
+    assert "".join(decoded) == "A \nDişi"
+    assert "".join(tokenizer.decode(ids) for ids in token_ids[:-1]) == "A \nDişi"
+    assert [tokenizer.eos_token_id] == token_ids[-1]
+
+
 def test_dil_batch_labels_decode_with_tokenizer_contract():
     tokenizer = load_tokenizer()
     text = "1234567890 sayıları"
@@ -191,7 +232,7 @@ def test_dil_batch_labels_decode_with_tokenizer_contract():
         ids = [
             int(token_id)
             for token_id in row.tolist()
-            if int(token_id) not in (-100, tokenizer.eos_token_id)
+            if int(token_id) not in (-100, tokenizer.eos_token_id) and int(token_id) < tokenizer.vocab_size
         ]
         decoded_labels.append(tokenizer.decode(ids))
     for row in batch["input_ids"][:, config.target_index]:

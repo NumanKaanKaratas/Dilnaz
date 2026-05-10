@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import hashlib
 from dataclasses import dataclass
@@ -40,7 +41,34 @@ def stream_text_lines(path: Path, read_chars: int):
         yield line
 
 
+def is_jsonl_path(path: Path) -> bool:
+    return path.suffix.casefold() == ".jsonl"
+
+
+def jsonl_text_records(path: Path):
+    emitted = False
+    with path.open("r", encoding="utf-8") as handle:
+        for line_idx, line in enumerate(handle):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_idx + 1} is not valid JSONL") from exc
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            emitted = True
+            yield line_idx, text
+    if not emitted:
+        raise ValueError(f"{path} produced no JSONL text records")
+
+
 def stream_text_line_items(path: Path, read_chars: int):
+    if is_jsonl_path(path):
+        yield from jsonl_text_records(path)
+        return
+
     emitted = False
     carry = ""
     line_idx = 0
@@ -222,7 +250,7 @@ def trainable_segments(tokenizer: HybridTokenizer, text: str, max_word_bytes: in
     return [
         segment
         for segment in tokenizer.encode_segments(text)
-        if 0 < segment.piece_len < max_word_bytes
+        if 0 < segment.piece_len <= max_word_bytes
     ]
 
 
@@ -277,8 +305,9 @@ class HybridDilBatchDataset(IterableDataset):
         self.context_radius = config.context_radius
         self.context_size = config.context_size
         self.max_word_bytes = config.max_word_bytes
+        self.writer_max_positions = config.writer_max_positions
         self.pad_token_id = config.pad_token_id
-        self.eos_token_id = config.eos_token_id
+        self.writer_stop_token_id = config.writer_stop_token_id
         self.batch_size = batch_size
         self.read_chars = read_chars
         self.repeat = repeat
@@ -321,7 +350,7 @@ class HybridDilBatchDataset(IterableDataset):
             dtype=np.int64,
         )
         word_masks = np.zeros((size, self.context_size, self.max_word_bytes), dtype=np.bool_)
-        labels = np.full((size, self.max_word_bytes), -100, dtype=np.int64)
+        labels = np.full((size, self.writer_max_positions), -100, dtype=np.int64)
         teacher_text_indices = np.zeros((size,), dtype=np.int64)
         teacher_starts = np.zeros((size,), dtype=np.int64)
         teacher_ends = np.zeros((size,), dtype=np.int64)
@@ -340,7 +369,7 @@ class HybridDilBatchDataset(IterableDataset):
 
             piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
             labels[row_idx, : piece_ids.shape[0]] = piece_ids
-            labels[row_idx, piece_ids.shape[0]] = self.eos_token_id
+            labels[row_idx, piece_ids.shape[0]] = self.writer_stop_token_id
             teacher_text_indices[row_idx] = ref.text_idx
             teacher_starts[row_idx] = segment.start
             teacher_ends[row_idx] = segment.end

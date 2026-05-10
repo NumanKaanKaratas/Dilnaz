@@ -47,7 +47,7 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=20,
+        checkpoint_format_version=21,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:
@@ -106,6 +106,9 @@ class DilConfig(PretrainedConfig):
         self.writer_conv_kernel_size = writer_conv_kernel_size
         self.writer_conv_expansion = writer_conv_expansion
         self.writer_dropout = writer_dropout
+        self.writer_vocab_size = vocab_size + 1
+        self.writer_stop_token_id = vocab_size
+        self.writer_max_positions = max_word_bytes + 1
         self.writer_noise_warmup_steps = writer_noise_warmup_steps
         self.writer_noise_clean_ratio = writer_noise_clean_ratio
         self.writer_noise_easy_ratio = writer_noise_easy_ratio

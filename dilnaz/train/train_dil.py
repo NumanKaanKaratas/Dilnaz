@@ -46,7 +46,7 @@ from models.modeling_dil import Dil
 from tokenization import default_vocab_path
 
 
-CHECKPOINT_FORMAT_VERSION = 20
+CHECKPOINT_FORMAT_VERSION = 21
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -200,7 +200,6 @@ def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_en
         "distill": 0.0,
         "writer": 0.0,
         "writer_token": 0.0,
-        "writer_length": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
         "geom_l3": 0.0,
@@ -209,7 +208,7 @@ def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_en
         "var": 0.0,
         "byte_acc": 0.0,
         "token_exact": 0.0,
-        "length_acc": 0.0,
+        "stop_acc": 0.0,
         "batches": 0,
     }
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
@@ -226,7 +225,6 @@ def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_en
         total["distill"] += float(outputs.distill_loss.detach().cpu())
         total["writer"] += float(outputs.writer_loss.detach().cpu())
         total["writer_token"] += float(outputs.writer_token_loss.detach().cpu())
-        total["writer_length"] += float(outputs.writer_length_loss.detach().cpu())
         layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
         for idx in range(4):
             total[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
@@ -234,7 +232,7 @@ def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_en
         total["var"] += float(outputs.variance_loss.detach().cpu())
         total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
         total["token_exact"] += float(outputs.token_exact.detach().cpu())
-        total["length_acc"] += float(outputs.length_acc.detach().cpu())
+        total["stop_acc"] += float(outputs.stop_acc.detach().cpu())
         total["batches"] += 1
         if batch_idx >= max_batches:
             break
@@ -251,7 +249,6 @@ def format_log(step, metrics):
         f"distill={metrics['distill']:.4f}",
         f"writer={metrics['writer']:.4f}",
         f"writer_tok={metrics['writer_token']:.4f}",
-        f"writer_len={metrics['writer_length']:.4f}",
         f"geom_l1={metrics['geom_l1']:.4f}",
         f"geom_l2={metrics['geom_l2']:.4f}",
         f"geom_l3={metrics['geom_l3']:.4f}",
@@ -260,7 +257,7 @@ def format_log(step, metrics):
         f"var={metrics['var']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
         f"token_exact={metrics['token_exact']:.4f}",
-        f"length_acc={metrics['length_acc']:.4f}",
+        f"stop_acc={metrics['stop_acc']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -600,7 +597,6 @@ def main():
         "distill": 0.0,
         "writer": 0.0,
         "writer_token": 0.0,
-        "writer_length": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
         "geom_l3": 0.0,
@@ -609,7 +605,7 @@ def main():
         "var": 0.0,
         "byte_acc": 0.0,
         "token_exact": 0.0,
-        "length_acc": 0.0,
+        "stop_acc": 0.0,
     }
     completed_step = start_step
     current_batch = None
@@ -675,7 +671,6 @@ def main():
             metric_sums["distill"] += float(outputs.distill_loss.detach().cpu())
             metric_sums["writer"] += float(outputs.writer_loss.detach().cpu())
             metric_sums["writer_token"] += float(outputs.writer_token_loss.detach().cpu())
-            metric_sums["writer_length"] += float(outputs.writer_length_loss.detach().cpu())
             layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
             for idx in range(4):
                 metric_sums[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
@@ -683,7 +678,7 @@ def main():
             metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
             metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
             metric_sums["token_exact"] += float(outputs.token_exact.detach().cpu())
-            metric_sums["length_acc"] += float(outputs.length_acc.detach().cpu())
+            metric_sums["stop_acc"] += float(outputs.stop_acc.detach().cpu())
 
             should_log = step % args.log_every == 0 or step == start_step + 1 or step == args.max_steps
             should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0

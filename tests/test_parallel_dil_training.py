@@ -43,7 +43,7 @@ def decoded_labels(tokenizer, labels: torch.Tensor) -> list[str]:
         ids = [
             int(token_id)
             for token_id in row.tolist()
-            if int(token_id) not in (-100, tokenizer.eos_token_id)
+            if int(token_id) not in (-100, tokenizer.eos_token_id) and int(token_id) < tokenizer.vocab_size
         ]
         rows.append(tokenizer.decode(ids))
     return rows
@@ -206,6 +206,6 @@ def test_dil_checkpoint_format_matches_encoder_only_family():
     config = tiny_parallel_config(tokenizer)
     model = Dil(config)
 
-    assert config.checkpoint_format_version == 20
+    assert config.checkpoint_format_version == 21
     assert hasattr(model, "writer")
     assert any(key.startswith("writer.") for key in model.state_dict())

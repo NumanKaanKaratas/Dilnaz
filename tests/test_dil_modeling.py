@@ -132,7 +132,10 @@ def test_dil_config_uses_left_context_contract():
     assert config.context_size == 5
     assert config.target_index == 2
     assert list(context_offsets(2)) == [-2, -1, 0, 1, 2]
-    assert config.checkpoint_format_version == 20
+    assert config.checkpoint_format_version == 21
+    assert config.writer_max_positions == config.max_word_bytes + 1
+    assert config.writer_stop_token_id == config.vocab_size
+    assert config.writer_vocab_size == config.vocab_size + 1
     assert not hasattr(config, "context_left_radius")
 
 
@@ -143,7 +146,7 @@ def test_dil_rejects_pre_parallel_writer_checkpoint_family():
     try:
         Dil(config)
     except ValueError as error:
-        assert "checkpoint_format_version=20" in str(error)
+        assert "checkpoint_format_version=21" in str(error)
     else:
         raise AssertionError("Dil accepted stale checkpoint_format_version")
 
@@ -254,16 +257,15 @@ def test_dil_context_attention_keeps_context_activations_read_only():
     assert float(target_grad.abs().sum()) > 0.0
 
 
-def test_dil_parallel_writer_outputs_token_and_length_logits():
+def test_dil_parallel_writer_outputs_surface_stop_logits():
     config = tiny_config()
     model = Dil(config)
     semantic = torch.randn(3, config.latent_size)
 
-    token_logits, length_logits = model.writer_outputs(semantic)
+    token_logits = model.writer_outputs(semantic)
     token_ids, token_masks, lengths = model.decode_semantic(semantic)
 
-    assert token_logits.shape == (3, config.max_word_bytes, config.vocab_size)
-    assert length_logits.shape == (3, config.max_word_bytes + 1)
+    assert token_logits.shape == (3, config.writer_max_positions, config.writer_vocab_size)
     assert token_ids.shape == (3, config.max_word_bytes)
     assert token_masks.shape == (3, config.max_word_bytes)
     assert lengths.shape == (3,)
@@ -406,8 +408,8 @@ def test_dil_writer_only_step_freezes_encoder():
     )
     labels = torch.tensor(
         [
-            [5, 6, 7, 1],
-            [11, 12, 13, 1],
+            [5, 6, 7, config.writer_stop_token_id, -100],
+            [11, 12, 13, config.writer_stop_token_id, -100],
         ],
         dtype=torch.long,
     )
@@ -417,17 +419,17 @@ def test_dil_writer_only_step_freezes_encoder():
         "labels": labels,
     }
 
-    loss, byte_acc, token_exact = writer_only_forward(model, batch)
+    loss, byte_acc, token_exact, stop_acc = writer_only_forward(model, batch)
     loss.backward()
 
     assert torch.isfinite(loss)
     assert torch.isfinite(byte_acc)
     assert torch.isfinite(token_exact)
+    assert torch.isfinite(stop_acc)
     assert grad_abs_sum(model.encoder.embed_tokens.weight) == 0.0
     assert grad_abs_sum(model.encoder.hidden_to_semantic.weight) == 0.0
     assert not hasattr(model, "semantic_normalizer")
     assert model.writer.token_head.weight.grad is not None
-    assert model.writer.length_head.weight.grad is not None
 
 
 def test_naz_uses_dil_encoder_semantic_with_zero_uncertainty(tmp_path):

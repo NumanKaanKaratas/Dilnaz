@@ -218,8 +218,9 @@ class ParallelDilBatchDataset(IterableDataset):
         self.context_radius = config.context_radius
         self.context_size = config.context_size
         self.max_word_bytes = config.max_word_bytes
+        self.writer_max_positions = config.writer_max_positions
         self.pad_token_id = config.pad_token_id
-        self.eos_token_id = config.eos_token_id
+        self.writer_stop_token_id = config.writer_stop_token_id
         self.batch_size = batch_size
         self.repeat = repeat
         self.max_samples = max_samples
@@ -244,7 +245,7 @@ class ParallelDilBatchDataset(IterableDataset):
             dtype=np.int64,
         )
         word_masks = np.zeros((size, self.context_size, self.max_word_bytes), dtype=np.bool_)
-        labels = np.full((size, self.max_word_bytes), -100, dtype=np.int64)
+        labels = np.full((size, self.writer_max_positions), -100, dtype=np.int64)
         teacher_text_indices = np.zeros((size,), dtype=np.int64)
         teacher_starts = np.zeros((size,), dtype=np.int64)
         teacher_ends = np.zeros((size,), dtype=np.int64)
@@ -292,7 +293,7 @@ class ParallelDilBatchDataset(IterableDataset):
 
             piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
             labels[row_idx, : piece_ids.shape[0]] = piece_ids
-            labels[row_idx, piece_ids.shape[0]] = self.eos_token_id
+            labels[row_idx, piece_ids.shape[0]] = self.writer_stop_token_id
             teacher_text_indices[row_idx] = text_idx
             teacher_starts[row_idx] = segment.start
             teacher_ends[row_idx] = segment.end

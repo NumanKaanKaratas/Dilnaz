@@ -270,6 +270,7 @@ def empty_metric_sums() -> dict[str, float]:
         "var": 0.0,
         "byte_acc": 0.0,
         "token_exact": 0.0,
+        "stop_acc": 0.0,
         "align_groups": 0.0,
     }
 
@@ -288,6 +289,7 @@ def accumulate_metrics(metric_sums: dict[str, float], loss, outputs, parallel_lo
     metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
     metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
     metric_sums["token_exact"] += float(outputs.token_exact.detach().cpu())
+    metric_sums["stop_acc"] += float(outputs.stop_acc.detach().cpu())
     metric_sums["align_groups"] += float(batch["parallel_alignment_scores"].shape[0])
 
 

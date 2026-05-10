@@ -32,7 +32,7 @@ from models.configuration_dil import DilConfig  # noqa: E402
 from models.modeling_dil import Dil  # noqa: E402
 
 
-CHECKPOINT_FORMAT_VERSION = 20
+CHECKPOINT_FORMAT_VERSION = 21
 WRITER_OBJECTIVE = "plain_text_writer_only"
 
 
@@ -56,12 +56,12 @@ def freeze_for_writer_only(model: Dil):
     model.writer.train()
 
 
-def writer_only_forward(model: Dil, batch: dict, training_step: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def writer_only_forward(model: Dil, batch: dict, training_step: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     labels = batch["labels"].to(batch["input_ids"].device)
     with torch.no_grad():
         semantic = model.encode(batch["input_ids"], batch["word_masks"]).float()
-    loss, _, _, byte_acc, token_exact, _ = model.writer_loss_and_metrics(semantic.detach(), labels, training_step)
-    return loss, byte_acc, token_exact
+    loss, _, byte_acc, token_exact, stop_acc = model.writer_loss_and_metrics(semantic.detach(), labels, training_step)
+    return loss, byte_acc, token_exact, stop_acc
 
 
 def materialize_writer_batches(dataset: HybridDilBatchDataset, device: torch.device, batch_size: int, seed: int):
@@ -152,14 +152,15 @@ def load_model_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[
 def evaluate(model, eval_loader, device, compile_mode: str, autocast_enabled: bool, cuda_prefetch: bool, max_batches: int):
     model.eval()
     model.encoder.eval()
-    total = {"loss": 0.0, "byte_acc": 0.0, "token_exact": 0.0, "batches": 0}
+    total = {"loss": 0.0, "byte_acc": 0.0, "token_exact": 0.0, "stop_acc": 0.0, "batches": 0}
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
         cudagraph_step_begin(device, compile_mode)
         with autocast_context(autocast_enabled):
-            loss, byte_acc, token_exact = writer_only_forward(model, batch)
+            loss, byte_acc, token_exact, stop_acc = writer_only_forward(model, batch)
         total["loss"] += float(loss.detach().cpu())
         total["byte_acc"] += float(byte_acc.detach().cpu())
         total["token_exact"] += float(token_exact.detach().cpu())
+        total["stop_acc"] += float(stop_acc.detach().cpu())
         total["batches"] += 1
         if batch_idx >= max_batches:
             break
@@ -175,6 +176,7 @@ def format_log(step: int, metrics: dict) -> str:
         f"loss={metrics['loss']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
         f"token_exact={metrics['token_exact']:.4f}",
+        f"stop_acc={metrics['stop_acc']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -338,7 +340,7 @@ def main():
     data_seconds = 0.0
     compute_seconds = 0.0
     source_lines_seen: set[int] = set()
-    metric_sums = {"loss": 0.0, "byte_acc": 0.0, "token_exact": 0.0}
+    metric_sums = {"loss": 0.0, "byte_acc": 0.0, "token_exact": 0.0, "stop_acc": 0.0}
     last_metrics = {}
     completed_step = 0
 
@@ -366,7 +368,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             cudagraph_step_begin(device, compile_mode)
             with autocast_context(autocast_enabled):
-                loss, byte_acc, token_exact = writer_only_forward(model, batch, step)
+                loss, byte_acc, token_exact, stop_acc = writer_only_forward(model, batch, step)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.writer.parameters(), args.max_grad_norm)
             optimizer.step()
@@ -384,6 +386,7 @@ def main():
             metric_sums["loss"] += float(loss.detach().cpu())
             metric_sums["byte_acc"] += float(byte_acc.detach().cpu())
             metric_sums["token_exact"] += float(token_exact.detach().cpu())
+            metric_sums["stop_acc"] += float(stop_acc.detach().cpu())
 
             should_log = step % args.log_every == 0 or step == 1 or step == args.max_steps
             should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0

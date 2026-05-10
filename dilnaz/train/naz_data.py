@@ -16,6 +16,49 @@ WHITESPACE_PATTERN = re.compile(r"\s+", re.UNICODE)
 TOKEN_CACHE_FORMAT_VERSION = 5
 
 
+def is_jsonl_path(path: Path) -> bool:
+    return path.suffix.casefold() == ".jsonl"
+
+
+def stream_jsonl_texts(path: Path):
+    emitted = False
+    with path.open("r", encoding="utf-8") as handle:
+        for line_idx, line in enumerate(handle):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_idx + 1} is not valid JSONL") from exc
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            emitted = True
+            yield text
+    if not emitted:
+        raise ValueError(f"{path} produced no JSONL text records")
+
+
+def stream_jsonl_prompt_answer_rows(path: Path):
+    emitted = False
+    with path.open("r", encoding="utf-8") as handle:
+        for line_idx, line in enumerate(handle):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_idx + 1} is not valid JSONL") from exc
+            prompt = payload.get("prompt")
+            answer = payload.get("answer")
+            if not isinstance(prompt, str) or not isinstance(answer, str) or not prompt or not answer:
+                raise ValueError(f"{path}:{line_idx + 1} must contain non-empty prompt and answer strings")
+            emitted = True
+            yield prompt, answer
+    if not emitted:
+        raise ValueError(f"{path} produced no JSONL prompt/answer records")
+
+
 def last_whitespace_end(text: str) -> int:
     boundary = -1
     for match in WHITESPACE_PATTERN.finditer(text):
@@ -24,6 +67,10 @@ def last_whitespace_end(text: str) -> int:
 
 
 def stream_text_blocks(path: Path, read_chars: int):
+    if is_jsonl_path(path):
+        yield from stream_jsonl_texts(path)
+        return
+
     carry = ""
     emitted = False
     with path.open("r", encoding="utf-8") as handle:
@@ -54,6 +101,10 @@ def stream_text_blocks(path: Path, read_chars: int):
 
 
 def stream_text_lines(path: Path, read_chars: int):
+    if is_jsonl_path(path):
+        yield from stream_jsonl_texts(path)
+        return
+
     emitted = False
     carry = ""
     with path.open("r", encoding="utf-8") as handle:
@@ -78,6 +129,10 @@ def stream_text_lines(path: Path, read_chars: int):
 
 
 def stream_prompt_answer_rows(path: Path, read_chars: int):
+    if is_jsonl_path(path):
+        yield from stream_jsonl_prompt_answer_rows(path)
+        return
+
     for line_idx, line in enumerate(stream_text_lines(path, read_chars)):
         text = line.rstrip("\r\n")
         parts = text.split("\t")
