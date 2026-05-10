@@ -207,6 +207,7 @@ class RandomWindowNazDataset(IterableDataset):
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
         self.sequence_length = sequence_length
+        self.horizons = getattr(config, "mtp_horizons", 3)
         self.batch_size = batch_size
         self.seed = seed
         self._byte_ids = None
@@ -229,29 +230,34 @@ class RandomWindowNazDataset(IterableDataset):
     def make_batch(self, starts: list[int]):
         starts_array = np.asarray(starts, dtype=np.int64).reshape(-1, 1)
         source_idx = starts_array + self.offsets
-        unit_mask_np = source_idx < (self.token_count - 1)
+        unit_mask_np = source_idx < self.token_count
         source_idx = np.minimum(source_idx, self.token_count - 1)
-        target_idx = np.minimum(source_idx + 1, self.token_count - 1)
+        horizon_offsets = np.arange(1, self.horizons + 1, dtype=np.int64).reshape(1, 1, self.horizons)
+        target_idx = source_idx[..., None] + horizon_offsets
+        target_mask_np = target_idx < self.token_count
+        target_idx = np.minimum(target_idx, self.token_count - 1)
 
         input_ids = torch.from_numpy(np.asarray(self.byte_ids[source_idx], dtype=np.int64))
         target_input_ids = torch.from_numpy(np.asarray(self.byte_ids[target_idx], dtype=np.int64))
         source_lengths = torch.from_numpy(np.asarray(self.lengths[source_idx], dtype=np.int64))
         target_lengths = torch.from_numpy(np.asarray(self.lengths[target_idx], dtype=np.int64))
         unit_mask = torch.from_numpy(unit_mask_np)
+        target_mask = torch.from_numpy(target_mask_np) & unit_mask.unsqueeze(-1)
         word_masks = (self.positions < source_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
-        target_word_masks = (self.positions < target_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
+        target_word_masks = (self.positions.unsqueeze(2) < target_lengths.unsqueeze(-1)) & target_mask.unsqueeze(-1)
         return {
             "input_ids": input_ids,
             "word_masks": word_masks,
             "target_input_ids": target_input_ids,
             "target_word_masks": target_word_masks,
             "unit_mask": unit_mask,
+            "target_mask": target_mask,
         }
 
     def sample_start(self, rng: random.Random) -> int:
-        if self.token_count <= self.sequence_length:
+        if self.token_count <= self.sequence_length + self.horizons:
             return 0
-        return rng.randint(0, self.token_count - self.sequence_length - 1)
+        return rng.randint(0, self.token_count - self.sequence_length - self.horizons)
 
     def iter_batches(self, rng: random.Random):
         while True:
@@ -282,6 +288,7 @@ class StreamingTextNazDataset(IterableDataset):
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
         self.sequence_length = sequence_length
+        self.horizons = getattr(config, "mtp_horizons", 3)
         self.batch_size = batch_size
         self.read_chars = read_chars
         self.repeat = repeat
@@ -289,34 +296,43 @@ class StreamingTextNazDataset(IterableDataset):
 
     def make_batch(self, windows: list[list[list[int]]]) -> dict:
         batch_size = len(windows)
-        source = [window[:-1] for window in windows]
-        target = [window[1:] for window in windows]
+        source = [window[: self.sequence_length] for window in windows]
         input_ids = torch.full(
             (batch_size, self.sequence_length, self.max_word_bytes),
             self.pad_token_id,
             dtype=torch.long,
         )
-        target_input_ids = torch.full_like(input_ids, self.pad_token_id)
+        target_input_ids = torch.full(
+            (batch_size, self.sequence_length, self.horizons, self.max_word_bytes),
+            self.pad_token_id,
+            dtype=torch.long,
+        )
         source_lengths = torch.zeros((batch_size, self.sequence_length), dtype=torch.long)
-        target_lengths = torch.zeros_like(source_lengths)
-        for row_idx, (source_window, target_window) in enumerate(zip(source, target)):
+        target_lengths = torch.zeros((batch_size, self.sequence_length, self.horizons), dtype=torch.long)
+        for row_idx, source_window in enumerate(source):
             for token_idx, token_ids in enumerate(source_window):
                 width = len(token_ids)
                 input_ids[row_idx, token_idx, :width] = torch.tensor(token_ids, dtype=torch.long)
                 source_lengths[row_idx, token_idx] = width
-            for token_idx, token_ids in enumerate(target_window):
-                width = len(token_ids)
-                target_input_ids[row_idx, token_idx, :width] = torch.tensor(token_ids, dtype=torch.long)
-                target_lengths[row_idx, token_idx] = width
+            for token_idx in range(self.sequence_length):
+                for horizon_idx in range(self.horizons):
+                    target_ids = windows[row_idx][token_idx + horizon_idx + 1]
+                    width = len(target_ids)
+                    target_input_ids[row_idx, token_idx, horizon_idx, :width] = torch.tensor(target_ids, dtype=torch.long)
+                    target_lengths[row_idx, token_idx, horizon_idx] = width
         unit_mask = source_lengths.gt(0)
         word_masks = (self.positions < source_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
-        target_word_masks = (self.positions < target_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
+        target_mask = target_lengths.gt(0) & unit_mask.unsqueeze(-1)
+        target_word_masks = (
+            self.positions.unsqueeze(2) < target_lengths.unsqueeze(-1)
+        ) & target_mask.unsqueeze(-1)
         return {
             "input_ids": input_ids,
             "word_masks": word_masks,
             "target_input_ids": target_input_ids,
             "target_word_masks": target_word_masks,
             "unit_mask": unit_mask,
+            "target_mask": target_mask,
         }
 
     def iter_windows_once(self, worker_id: int, worker_count: int):
@@ -329,7 +345,7 @@ class StreamingTextNazDataset(IterableDataset):
             self.read_chars,
         ):
             buffer.append(token_ids)
-            if len(buffer) == self.sequence_length + 1:
+            if len(buffer) == self.sequence_length + self.horizons:
                 if window_idx % worker_count == worker_id:
                     yield list(buffer)
                 window_idx += 1
@@ -373,6 +389,7 @@ class PromptAnswerNazDataset(IterableDataset):
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
         self.sequence_length = sequence_length
+        self.horizons = getattr(config, "mtp_horizons", 3)
         self.batch_size = batch_size
         self.read_chars = read_chars
         self.repeat = repeat
@@ -390,50 +407,59 @@ class PromptAnswerNazDataset(IterableDataset):
             if 0 < segment.piece_len <= self.max_word_bytes
         ]
         tokens = prompt_segments + answer_segments
-        target_answer_mask = [False] * max(len(prompt_segments) - 1, 0) + [True] * len(answer_segments)
-        source_tokens = tokens[:-1]
-        target_tokens = tokens[1:]
-        if len(source_tokens) != len(target_answer_mask):
-            raise ValueError("prompt-answer target mask construction mismatch")
-        if not source_tokens:
+        token_answer_mask = [False] * len(prompt_segments) + [True] * len(answer_segments)
+        if len(tokens) <= 1:
             raise ValueError("prompt-answer row produced no trainable token transitions")
-        return [source_tokens, target_tokens], target_answer_mask
+        return tokens, token_answer_mask
 
-    def make_batch(self, rows: list[tuple[list[list[int]], list[list[int]], list[bool]]]) -> dict:
+    def make_batch(self, rows: list[tuple[list[list[int]], list[bool]]]) -> dict:
         batch_size = len(rows)
         input_ids = torch.full(
             (batch_size, self.sequence_length, self.max_word_bytes),
             self.pad_token_id,
             dtype=torch.long,
         )
-        target_input_ids = torch.full_like(input_ids, self.pad_token_id)
+        target_input_ids = torch.full(
+            (batch_size, self.sequence_length, self.horizons, self.max_word_bytes),
+            self.pad_token_id,
+            dtype=torch.long,
+        )
         source_lengths = torch.zeros((batch_size, self.sequence_length), dtype=torch.long)
-        target_lengths = torch.zeros_like(source_lengths)
+        target_lengths = torch.zeros((batch_size, self.sequence_length, self.horizons), dtype=torch.long)
         unit_mask = torch.zeros((batch_size, self.sequence_length), dtype=torch.bool)
-        loss_mask = torch.zeros_like(unit_mask)
-        for row_idx, (source_tokens, target_tokens, target_answer_mask) in enumerate(rows):
-            if len(source_tokens) > self.sequence_length:
+        loss_mask = torch.zeros((batch_size, self.sequence_length, self.horizons), dtype=torch.bool)
+        for row_idx, (tokens, token_answer_mask) in enumerate(rows):
+            source_width = len(tokens) - 1
+            if source_width > self.sequence_length:
                 raise ValueError(
-                    f"prompt-answer row has {len(source_tokens)} transitions, sequence_length={self.sequence_length}"
+                    f"prompt-answer row has {source_width} transitions, sequence_length={self.sequence_length}"
                 )
-            width = len(source_tokens)
-            for token_idx in range(width):
-                source_ids = source_tokens[token_idx]
-                target_ids = target_tokens[token_idx]
+            for token_idx in range(source_width):
+                source_ids = tokens[token_idx]
                 input_ids[row_idx, token_idx, : len(source_ids)] = torch.tensor(source_ids, dtype=torch.long)
-                target_input_ids[row_idx, token_idx, : len(target_ids)] = torch.tensor(target_ids, dtype=torch.long)
                 source_lengths[row_idx, token_idx] = len(source_ids)
-                target_lengths[row_idx, token_idx] = len(target_ids)
                 unit_mask[row_idx, token_idx] = True
-                loss_mask[row_idx, token_idx] = target_answer_mask[token_idx]
+                for horizon_idx in range(self.horizons):
+                    target_idx = token_idx + horizon_idx + 1
+                    if target_idx >= len(tokens):
+                        continue
+                    target_ids = tokens[target_idx]
+                    target_input_ids[row_idx, token_idx, horizon_idx, : len(target_ids)] = torch.tensor(
+                        target_ids,
+                        dtype=torch.long,
+                    )
+                    target_lengths[row_idx, token_idx, horizon_idx] = len(target_ids)
+                    loss_mask[row_idx, token_idx, horizon_idx] = token_answer_mask[target_idx]
         word_masks = (self.positions < source_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
-        target_word_masks = (self.positions < target_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
+        target_mask = target_lengths.gt(0) & unit_mask.unsqueeze(-1)
+        target_word_masks = (self.positions.unsqueeze(2) < target_lengths.unsqueeze(-1)) & target_mask.unsqueeze(-1)
         return {
             "input_ids": input_ids,
             "word_masks": word_masks,
             "target_input_ids": target_input_ids,
             "target_word_masks": target_word_masks,
             "unit_mask": unit_mask,
+            "target_mask": target_mask,
             "loss_mask": loss_mask,
         }
 
@@ -441,9 +467,7 @@ class PromptAnswerNazDataset(IterableDataset):
         for row_idx, (prompt, answer) in enumerate(stream_prompt_answer_rows(self.train_file, self.read_chars)):
             if row_idx % worker_count != worker_id:
                 continue
-            source_target, target_answer_mask = self.encode_row(prompt, answer)
-            source_tokens, target_tokens = source_target
-            yield source_tokens, target_tokens, target_answer_mask
+            yield self.encode_row(prompt, answer)
 
     def __iter__(self):
         worker = get_worker_info()
@@ -451,7 +475,7 @@ class PromptAnswerNazDataset(IterableDataset):
         worker_count = 1 if worker is None else worker.num_workers
         while True:
             emitted = False
-            batch: list[tuple[list[list[int]], list[list[int]], list[bool]]] = []
+            batch: list[tuple[list[list[int]], list[bool]]] = []
             for row in self.iter_rows_once(worker_id, worker_count):
                 emitted = True
                 batch.append(row)
@@ -492,20 +516,21 @@ class ResidentNazBatcher:
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
         self.sequence_length = sequence_length
+        self.horizons = getattr(config, "mtp_horizons", 3)
         self.batch_size = batch_size
         self.device = device
         self.generator = torch.Generator(device=device)
         self.generator.manual_seed(seed)
         self.positions = torch.arange(self.max_word_bytes, device=device).reshape(1, 1, self.max_word_bytes)
         self.offsets = torch.arange(sequence_length, device=device).reshape(1, sequence_length)
-        if token_count < 2:
-            raise ValueError("resident Naz data needs at least two tokens")
+        if token_count <= self.horizons:
+            raise ValueError("resident Naz data needs more tokens than MTP horizons")
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        max_start = max(self.token_count - self.sequence_length - 1, 0)
+        max_start = max(self.token_count - self.sequence_length - self.horizons, 0)
         starts = torch.randint(
             max_start + 1,
             (self.batch_size, 1),
@@ -516,9 +541,12 @@ class ResidentNazBatcher:
 
     def make_batch(self, starts: torch.Tensor):
         source_idx = starts + self.offsets
-        unit_mask = source_idx < (self.token_count - 1)
+        unit_mask = source_idx < self.token_count
         source_idx = source_idx.clamp_max(self.token_count - 1)
-        target_idx = (source_idx + 1).clamp_max(self.token_count - 1)
+        horizon_offsets = torch.arange(1, self.horizons + 1, device=self.device).reshape(1, 1, self.horizons)
+        target_idx = source_idx.unsqueeze(-1) + horizon_offsets
+        target_mask = target_idx < self.token_count
+        target_idx = target_idx.clamp_max(self.token_count - 1)
         batch_size = starts.shape[0]
 
         input_ids = self.byte_ids.index_select(0, source_idx.reshape(-1)).reshape(
@@ -529,6 +557,7 @@ class ResidentNazBatcher:
         target_input_ids = self.byte_ids.index_select(0, target_idx.reshape(-1)).reshape(
             batch_size,
             self.sequence_length,
+            self.horizons,
             self.max_word_bytes,
         )
         source_lengths = self.lengths.index_select(0, source_idx.reshape(-1)).reshape(
@@ -539,14 +568,16 @@ class ResidentNazBatcher:
         target_lengths = self.lengths.index_select(0, target_idx.reshape(-1)).reshape(
             batch_size,
             self.sequence_length,
+            self.horizons,
             1,
         )
         return {
             "input_ids": input_ids,
             "word_masks": (self.positions < source_lengths) & unit_mask.unsqueeze(-1),
             "target_input_ids": target_input_ids,
-            "target_word_masks": (self.positions < target_lengths) & unit_mask.unsqueeze(-1),
+            "target_word_masks": (self.positions.unsqueeze(2) < target_lengths) & target_mask.unsqueeze(-1),
             "unit_mask": unit_mask,
+            "target_mask": target_mask,
         }
 
 
@@ -566,38 +597,41 @@ class ResidentNazSemanticBatcher:
     def __init__(
         self,
         semantic_states: torch.Tensor,
-        target_mean: torch.Tensor,
+        target_latents: torch.Tensor,
         byte_ids: torch.LongTensor,
         lengths: torch.LongTensor,
         sequence_length: int,
         batch_size: int,
         seed: int,
+        horizons: int = 3,
     ):
-        if semantic_states.shape[:-1] != target_mean.shape[:-1]:
+        if semantic_states.shape != target_latents.shape:
             raise ValueError("semantic and target caches must have matching token dimensions")
         if byte_ids.shape[0] != semantic_states.shape[0] or lengths.shape[0] != semantic_states.shape[0]:
             raise ValueError("surface cache must match semantic token count")
         self.semantic_states = semantic_states
-        self.target_mean = target_mean
+        self.target_latents = target_latents
         self.byte_ids = byte_ids.long()
         self.lengths = lengths.long()
         self.token_count = semantic_states.shape[0]
         self.max_word_bytes = byte_ids.shape[1]
         self.sequence_length = sequence_length
+        self.horizons = horizons
         self.batch_size = batch_size
         self.device = semantic_states.device
         self.generator = torch.Generator(device=self.device)
         self.generator.manual_seed(seed)
         self.offsets = torch.arange(sequence_length, device=self.device).reshape(1, sequence_length)
+        self.horizon_offsets = torch.arange(1, horizons + 1, device=self.device).reshape(1, 1, horizons)
         self.positions = torch.arange(self.max_word_bytes, device=self.device).reshape(1, 1, self.max_word_bytes)
-        if self.token_count < 2:
-            raise ValueError("resident semantic Naz data needs at least two tokens")
+        if self.token_count <= horizons:
+            raise ValueError("resident semantic Naz data needs more tokens than MTP horizons")
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        max_start = max(self.token_count - self.sequence_length - 1, 0)
+        max_start = max(self.token_count - self.sequence_length - self.horizons, 0)
         starts = torch.randint(
             max_start + 1,
             (self.batch_size, 1),
@@ -608,9 +642,11 @@ class ResidentNazSemanticBatcher:
 
     def make_batch(self, starts: torch.Tensor):
         source_idx = starts + self.offsets
-        unit_mask = source_idx < (self.token_count - 1)
+        unit_mask = source_idx < self.token_count
         source_idx = source_idx.clamp_max(self.token_count - 1)
-        target_idx = (source_idx + 1).clamp_max(self.token_count - 1)
+        target_idx = source_idx.unsqueeze(-1) + self.horizon_offsets
+        target_mask = target_idx < self.token_count
+        target_idx = target_idx.clamp_max(self.token_count - 1)
         batch_size = starts.shape[0]
         return {
             "semantic_states": self.semantic_states.index_select(0, source_idx.reshape(-1)).reshape(
@@ -618,12 +654,14 @@ class ResidentNazSemanticBatcher:
                 self.sequence_length,
                 -1,
             ),
-            "target_mean": self.target_mean.index_select(0, target_idx.reshape(-1)).reshape(
+            "target_latents": self.target_latents.index_select(0, target_idx.reshape(-1)).reshape(
                 batch_size,
                 self.sequence_length,
+                self.horizons,
                 -1,
             ),
             "unit_mask": unit_mask,
+            "target_mask": target_mask,
         }
 
 
@@ -633,7 +671,7 @@ class ResidentNazSemanticEvalLoader:
         self.batch_size = batch_size
 
     def __iter__(self):
-        max_start = max(self.batcher.token_count - self.batcher.sequence_length - 1, 0)
+        max_start = max(self.batcher.token_count - self.batcher.sequence_length - self.batcher.horizons, 0)
         starts = torch.arange(max_start + 1, device=self.batcher.device)
         for offset in range(0, starts.numel(), self.batch_size):
             yield self.batcher.make_batch(starts[offset : offset + self.batch_size].reshape(-1, 1))

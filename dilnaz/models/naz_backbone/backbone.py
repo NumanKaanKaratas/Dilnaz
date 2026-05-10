@@ -15,6 +15,8 @@ from .normalization import ZeroCenteredRMSNorm
 class NazBackboneOutput:
     last_hidden_state: torch.Tensor
     past_key_values: Optional[NazBackboneCache] = None
+    moe_balance_loss: Optional[torch.Tensor] = None
+    moe_usage: Optional[torch.Tensor] = None
 
 
 class NazSemanticBackbone(nn.Module):
@@ -35,7 +37,7 @@ class NazSemanticBackbone(nn.Module):
             for idx in range(config.num_hidden_layers)
         )
         self.layers = nn.ModuleList(
-            [NazHybridBlock(config, layer_type) for layer_type in self.layer_types]
+            [NazHybridBlock(config, layer_type, layer_idx) for layer_idx, layer_type in enumerate(self.layer_types)]
         )
         self.norm = ZeroCenteredRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -73,9 +75,11 @@ class NazSemanticBackbone(nn.Module):
 
         hidden_states = inputs_embeds
         cache_position = past_key_values.position if past_key_values is not None else 0
+        moe_balance_losses = []
+        moe_usages = []
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = past_key_values.layers[layer_idx] if past_key_values is not None else None
-            hidden_states = layer(
+            hidden_states, moe_balance_loss, moe_usage = layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -83,10 +87,21 @@ class NazSemanticBackbone(nn.Module):
                 use_cache=use_cache,
                 cache_position=cache_position,
             )
+            if layer.uses_moe:
+                moe_balance_losses.append(moe_balance_loss)
+                moe_usages.append(moe_usage)
         hidden_states = self.norm(hidden_states)
         if use_cache and past_key_values is not None:
             past_key_values.position += sequence_length
+        if moe_balance_losses:
+            moe_balance_loss = torch.stack(moe_balance_losses).mean()
+            moe_usage = torch.stack(moe_usages).mean(dim=0)
+        else:
+            moe_balance_loss = hidden_states.new_zeros(())
+            moe_usage = hidden_states.new_empty((0,))
         return NazBackboneOutput(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
+            moe_balance_loss=moe_balance_loss,
+            moe_usage=moe_usage,
         )

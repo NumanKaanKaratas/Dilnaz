@@ -8,12 +8,12 @@ from torch import nn
 from .attention import SemanticGlobalAttention
 from .cache import NazBackboneLayerCache
 from .delta import SemanticDeltaMixer
-from .feedforward import GatedFeedForward
+from .feedforward import GatedFeedForward, SparseMoEFeedForward
 from .normalization import ZeroCenteredRMSNorm
 
 
 class NazHybridBlock(nn.Module):
-    def __init__(self, config, layer_type: str):
+    def __init__(self, config, layer_type: str, layer_idx: int):
         super().__init__()
         if layer_type not in {"delta", "global"}:
             raise ValueError(f"unsupported NAZ layer_type={layer_type}")
@@ -25,7 +25,19 @@ class NazHybridBlock(nn.Module):
             if layer_type == "global"
             else SemanticDeltaMixer(config)
         )
-        self.feedforward = GatedFeedForward(config.hidden_size, config.intermediate_size)
+        moe_start = max(config.num_hidden_layers - config.moe_layers, 0)
+        self.uses_moe = layer_idx >= moe_start
+        self.feedforward = (
+            SparseMoEFeedForward(
+                hidden_size=config.hidden_size,
+                shared_intermediate_size=config.intermediate_size,
+                expert_intermediate_size=config.moe_expert_intermediate_size,
+                num_experts=config.moe_num_experts,
+                top_k=config.moe_top_k,
+            )
+            if self.uses_moe
+            else GatedFeedForward(config.hidden_size, config.intermediate_size)
+        )
 
     def forward(
         self,
@@ -35,7 +47,7 @@ class NazHybridBlock(nn.Module):
         cache: Optional[NazBackboneLayerCache] = None,
         use_cache: bool = False,
         cache_position: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         residual = hidden_states
         hidden_states = self.input_norm(hidden_states)
         if self.layer_type == "global":
@@ -55,5 +67,12 @@ class NazHybridBlock(nn.Module):
                 use_cache=use_cache,
             )
         hidden_states = residual + hidden_states
-        hidden_states = hidden_states + self.feedforward(self.post_mixer_norm(hidden_states))
-        return hidden_states
+        feedforward_input = self.post_mixer_norm(hidden_states)
+        if self.uses_moe:
+            feedforward_output, moe_balance_loss, moe_usage = self.feedforward(feedforward_input)
+        else:
+            feedforward_output = self.feedforward(feedforward_input)
+            moe_balance_loss = hidden_states.new_zeros(())
+            moe_usage = None
+        hidden_states = hidden_states + feedforward_output
+        return hidden_states, moe_balance_loss, moe_usage

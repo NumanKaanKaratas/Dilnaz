@@ -42,8 +42,8 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer
 
 
-CHECKPOINT_FORMAT_VERSION = 22
-OBJECTIVE = "lcm_next_dil_latent_mse"
+CHECKPOINT_FORMAT_VERSION = 23
+OBJECTIVE = "semantic_dynamics_moe_mtp_v1"
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -138,6 +138,13 @@ def add_output_metrics(total: dict, outputs):
     total["loss"] += float(outputs.loss.detach().cpu())
     total["reconstruction"] += float(outputs.reconstruction_loss.detach().cpu())
     total["mse"] += float(outputs.mse_loss.detach().cpu())
+    total["mixture_nll"] += float(outputs.mixture_nll.detach().cpu())
+    total["responsibility"] += float(outputs.responsibility_loss.detach().cpu())
+    total["usage_balance"] += float(outputs.usage_balance_loss.detach().cpu())
+    total["moe_balance"] += float(outputs.moe_balance_loss.detach().cpu())
+    total["min_mse"] += float(outputs.min_mse.detach().cpu()) * targets
+    total["chosen_mse"] += float(outputs.chosen_mse.detach().cpu()) * targets
+    total["router_entropy"] += float(outputs.router_entropy.detach().cpu()) * targets
     total["cosine_loss"] += float(outputs.cosine_loss.detach().cpu()) * targets
     total["latent_cos"] += float(outputs.latent_cos.detach().cpu()) * targets
     total["targets"] += targets
@@ -151,6 +158,13 @@ def reduce_output_metrics(total: dict) -> dict:
         "loss": total["loss"] / batches,
         "reconstruction": total["reconstruction"] / batches,
         "mse": total["mse"] / batches,
+        "mixture_nll": total["mixture_nll"] / batches,
+        "responsibility": total["responsibility"] / batches,
+        "usage_balance": total["usage_balance"] / batches,
+        "moe_balance": total["moe_balance"] / batches,
+        "min_mse": total["min_mse"] / targets,
+        "chosen_mse": total["chosen_mse"] / targets,
+        "router_entropy": total["router_entropy"] / targets,
         "mse_mean": total["mse"] / targets,
         "cosine_loss": total["cosine_loss"] / targets,
         "latent_cos": total["latent_cos"] / targets,
@@ -161,7 +175,22 @@ def reduce_output_metrics(total: dict) -> dict:
 @torch.no_grad()
 def evaluate(model, eval_loader, device, compile_mode: str, autocast_enabled: bool, max_batches: int, cuda_prefetch: bool):
     model.eval()
-    total = {"loss": 0.0, "reconstruction": 0.0, "mse": 0.0, "cosine_loss": 0.0, "latent_cos": 0.0, "targets": 0.0, "batches": 0}
+    total = {
+        "loss": 0.0,
+        "reconstruction": 0.0,
+        "mse": 0.0,
+        "mixture_nll": 0.0,
+        "responsibility": 0.0,
+        "usage_balance": 0.0,
+        "moe_balance": 0.0,
+        "min_mse": 0.0,
+        "chosen_mse": 0.0,
+        "router_entropy": 0.0,
+        "cosine_loss": 0.0,
+        "latent_cos": 0.0,
+        "targets": 0.0,
+        "batches": 0,
+    }
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
         cudagraph_step_begin(device, compile_mode)
         with autocast_context(autocast_enabled):
@@ -178,8 +207,15 @@ def format_log(step: int, metrics: dict) -> str:
     fields = [
         f"step={step}",
         f"loss={metrics['loss']:.4f}",
+        f"nll={metrics['mixture_nll']:.4f}",
+        f"resp={metrics['responsibility']:.4f}",
+        f"usage={metrics['usage_balance']:.4f}",
+        f"moe={metrics['moe_balance']:.4f}",
         f"mse_sum={metrics['mse']:.4f}",
         f"mse_mean={metrics['mse_mean']:.4f}",
+        f"min_mse={metrics['min_mse']:.4f}",
+        f"chosen_mse={metrics['chosen_mse']:.4f}",
+        f"router_h={metrics['router_entropy']:.4f}",
         f"cosine_loss={metrics['cosine_loss']:.4f}",
         f"latent_cos={metrics['latent_cos']:.4f}",
         f"target_count={metrics['targets']:.1f}",
@@ -236,8 +272,9 @@ def run_naz_batch(model, batch, training_step: int | None = None):
     if "semantic_states" in batch:
         return model.forward_semantic(
             semantic_states=batch["semantic_states"],
-            target_latents=batch["target_mean"],
+            target_latents=batch["target_latents"],
             unit_mask=batch["unit_mask"],
+            target_mask=batch["target_mask"],
         )
     return model(**batch, training_step=training_step)
 
@@ -291,6 +328,25 @@ def parse_args():
     parser.add_argument("--partial-rotary-factor", type=float, default=NAZ_MODEL_DEFAULTS["partial_rotary_factor"])
     parser.add_argument("--rope-theta", type=float, default=NAZ_MODEL_DEFAULTS["rope_theta"])
     parser.add_argument("--reconstruction-loss-weight", type=float, default=NAZ_MODEL_DEFAULTS["reconstruction_loss_weight"])
+    parser.add_argument("--num-semantic-candidates", type=int, default=NAZ_MODEL_DEFAULTS["num_semantic_candidates"])
+    parser.add_argument("--mtp-horizons", type=int, default=NAZ_MODEL_DEFAULTS["mtp_horizons"])
+    parser.add_argument(
+        "--mtp-loss-weights",
+        type=float,
+        nargs="+",
+        default=list(NAZ_MODEL_DEFAULTS["mtp_loss_weights"]),
+    )
+    parser.add_argument("--mixture-sigma", type=float, default=NAZ_MODEL_DEFAULTS["mixture_sigma"])
+    parser.add_argument("--usage-balance-weight", type=float, default=NAZ_MODEL_DEFAULTS["usage_balance_weight"])
+    parser.add_argument(
+        "--router-responsibility-weight",
+        type=float,
+        default=NAZ_MODEL_DEFAULTS["router_responsibility_weight"],
+    )
+    parser.add_argument("--moe-num-experts", type=int, default=NAZ_MODEL_DEFAULTS["moe_num_experts"])
+    parser.add_argument("--moe-top-k", type=int, default=NAZ_MODEL_DEFAULTS["moe_top_k"])
+    parser.add_argument("--moe-layers", type=int, default=NAZ_MODEL_DEFAULTS["moe_layers"])
+    parser.add_argument("--moe-balance-weight", type=float, default=NAZ_MODEL_DEFAULTS["moe_balance_weight"])
     parser.add_argument("--normalizer-epsilon", type=float, default=NAZ_MODEL_DEFAULTS["normalizer_epsilon"])
     return parser.parse_args()
 
@@ -318,6 +374,26 @@ def validate_args(args):
         raise ValueError("--dil-checkpoint-dir is required when --resume is not set")
     if args.reconstruction_loss_weight < 0.0:
         raise ValueError("--reconstruction-loss-weight must be >= 0")
+    if args.num_semantic_candidates <= 0:
+        raise ValueError("--num-semantic-candidates must be > 0")
+    if args.mtp_horizons <= 0:
+        raise ValueError("--mtp-horizons must be > 0")
+    if len(args.mtp_loss_weights) != args.mtp_horizons:
+        raise ValueError("--mtp-loss-weights count must equal --mtp-horizons")
+    if any(weight <= 0.0 for weight in args.mtp_loss_weights):
+        raise ValueError("--mtp-loss-weights must be positive")
+    if args.mixture_sigma <= 0.0:
+        raise ValueError("--mixture-sigma must be > 0")
+    if args.usage_balance_weight < 0.0 or args.router_responsibility_weight < 0.0:
+        raise ValueError("--usage-balance-weight and --router-responsibility-weight must be >= 0")
+    if args.moe_num_experts <= 0 or args.moe_top_k <= 0:
+        raise ValueError("--moe-num-experts and --moe-top-k must be > 0")
+    if args.moe_top_k > args.moe_num_experts:
+        raise ValueError("--moe-top-k must be <= --moe-num-experts")
+    if args.moe_layers < 0:
+        raise ValueError("--moe-layers must be >= 0")
+    if args.moe_balance_weight < 0.0:
+        raise ValueError("--moe-balance-weight must be >= 0")
     if args.normalizer_epsilon <= 0.0:
         raise ValueError("--normalizer-epsilon must be > 0")
     if args.full_attention_interval <= 0:
@@ -352,6 +428,16 @@ def build_config(args, dil_config: DilConfig):
         max_word_bytes=dil_config.max_word_bytes,
         latent_size=dil_config.latent_size,
         reconstruction_loss_weight=args.reconstruction_loss_weight,
+        num_semantic_candidates=args.num_semantic_candidates,
+        mtp_horizons=args.mtp_horizons,
+        mtp_loss_weights=tuple(args.mtp_loss_weights),
+        mixture_sigma=args.mixture_sigma,
+        usage_balance_weight=args.usage_balance_weight,
+        router_responsibility_weight=args.router_responsibility_weight,
+        moe_num_experts=args.moe_num_experts,
+        moe_top_k=args.moe_top_k,
+        moe_layers=args.moe_layers,
+        moe_balance_weight=args.moe_balance_weight,
         normalizer_epsilon=args.normalizer_epsilon,
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
@@ -455,7 +541,7 @@ def main():
             train_ids_path,
             train_lengths_path,
             train_token_count,
-            dil_config,
+            config,
             args.sequence_length,
             args.batch_size,
             device,
@@ -475,6 +561,7 @@ def main():
             sequence_length=args.sequence_length,
             batch_size=args.batch_size,
             seed=args.seed + start_step,
+            horizons=config.mtp_horizons,
         )
         eval_loader = None
         if eval_cache is not None:
@@ -483,7 +570,7 @@ def main():
                 eval_ids_path,
                 eval_lengths_path,
                 eval_token_count,
-                dil_config,
+                config,
                 args.sequence_length,
                 args.eval_batch_size,
                 device,
@@ -501,6 +588,7 @@ def main():
                     sequence_length=args.sequence_length,
                     batch_size=args.eval_batch_size,
                     seed=args.seed + 1,
+                    horizons=config.mtp_horizons,
                 ),
                 batch_size=args.eval_batch_size,
             )
@@ -509,7 +597,7 @@ def main():
             StreamingTextNazDataset(
                 args.train_file,
                 tokenizer,
-                dil_config,
+                config,
                 args.sequence_length,
                 args.batch_size,
                 args.text_read_chars,
@@ -525,7 +613,7 @@ def main():
                 StreamingTextNazDataset(
                     args.eval_file,
                     tokenizer,
-                    dil_config,
+                    config,
                     args.sequence_length,
                     args.eval_batch_size,
                     args.text_read_chars,
@@ -546,6 +634,13 @@ def main():
         "loss": 0.0,
         "reconstruction": 0.0,
         "mse": 0.0,
+        "mixture_nll": 0.0,
+        "responsibility": 0.0,
+        "usage_balance": 0.0,
+        "moe_balance": 0.0,
+        "min_mse": 0.0,
+        "chosen_mse": 0.0,
+        "router_entropy": 0.0,
         "cosine_loss": 0.0,
         "latent_cos": 0.0,
         "targets": 0.0,

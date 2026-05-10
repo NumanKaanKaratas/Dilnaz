@@ -14,6 +14,17 @@ class NazConfig(PretrainedConfig):
         max_word_bytes=32,
         latent_size=128,
         reconstruction_loss_weight=1.0,
+        num_semantic_candidates=4,
+        mtp_horizons=3,
+        mtp_loss_weights=(1.0, 0.3, 0.15),
+        mixture_sigma=0.55,
+        usage_balance_weight=0.05,
+        router_responsibility_weight=1.0,
+        moe_num_experts=8,
+        moe_top_k=2,
+        moe_layers=4,
+        moe_balance_weight=0.01,
+        moe_expert_intermediate_size=None,
         normalizer_epsilon=1e-6,
         repetition_cos_threshold=0.985,
         min_new_tokens=1,
@@ -51,6 +62,19 @@ class NazConfig(PretrainedConfig):
         self.max_word_bytes = max_word_bytes
         self.latent_size = latent_size
         self.reconstruction_loss_weight = reconstruction_loss_weight
+        self.num_semantic_candidates = num_semantic_candidates
+        self.mtp_horizons = mtp_horizons
+        self.mtp_loss_weights = tuple(float(weight) for weight in mtp_loss_weights)
+        self.mixture_sigma = mixture_sigma
+        self.usage_balance_weight = usage_balance_weight
+        self.router_responsibility_weight = router_responsibility_weight
+        self.moe_num_experts = moe_num_experts
+        self.moe_top_k = moe_top_k
+        self.moe_layers = moe_layers
+        self.moe_balance_weight = moe_balance_weight
+        self.moe_expert_intermediate_size = (
+            intermediate_size if moe_expert_intermediate_size is None else moe_expert_intermediate_size
+        )
         self.normalizer_epsilon = normalizer_epsilon
         self.repetition_cos_threshold = repetition_cos_threshold
         self.min_new_tokens = min_new_tokens

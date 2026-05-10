@@ -14,7 +14,8 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 22
+CHECKPOINT_FORMAT_VERSION = 23
+OBJECTIVE = "semantic_dynamics_moe_mtp_v1"
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -71,6 +72,8 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
     )
     if checkpoint["format_version"] != CHECKPOINT_FORMAT_VERSION:
         raise ValueError(f"unsupported checkpoint format_version={checkpoint.get('format_version')}")
+    if checkpoint["training_state"].get("objective") != OBJECTIVE:
+        raise ValueError(f"checkpoint objective is not {OBJECTIVE}")
     dil_path = Path(config.dil_path)
     if not dil_path.is_absolute():
         cwd_relative = dil_path.resolve()
