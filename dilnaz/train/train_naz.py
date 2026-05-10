@@ -42,7 +42,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer
 
 
-CHECKPOINT_FORMAT_VERSION = 23
+CHECKPOINT_FORMAT_VERSION = 25
 OBJECTIVE = "semantic_dynamics_moe_mtp_v1"
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
@@ -74,7 +74,7 @@ def json_training_state(config, step: int, metrics: dict, dil_checksum: str, com
         "compile_mode": compile_mode,
         "max_word_bytes": config.max_word_bytes,
         "latent_size": config.latent_size,
-        "semantic_space": "dil_latent",
+        "semantic_space": "dil_normalized_latent",
         "objective": OBJECTIVE,
         "byte_vocab_size": config.byte_vocab_size,
         "vocab_size": config.vocab_size,
@@ -237,7 +237,6 @@ def build_resident_semantic_cache(
     surface_batcher: ResidentNazBatcher,
     chunk_tokens: int,
     autocast_enabled: bool,
-    fit_normalizer: bool = False,
 ):
     model.eval()
     byte_ids = surface_batcher.byte_ids
@@ -249,21 +248,18 @@ def build_resident_semantic_cache(
     for start in range(0, token_count, chunk_tokens):
         end = min(start + chunk_tokens, token_count)
         context_start = max(0, start - context_radius)
-        context_end = end
+        context_end = min(token_count, end + context_radius)
         ids = byte_ids[context_start:context_end].unsqueeze(0)
         token_lengths = lengths[context_start:context_end].reshape(1, -1, 1)
         masks = positions < token_lengths
         unit_mask = torch.ones(ids.shape[:2], dtype=torch.bool, device=ids.device)
         with autocast_context(autocast_enabled):
-            mean, _ = model.raw_latent_distribution(ids, masks, unit_mask)
+            mean, _ = model.latent_distribution(ids, masks, unit_mask)
         local_start = start - context_start
         local_end = local_start + end - start
         mean = mean.reshape(1, context_end - context_start, -1)[:, local_start:local_end]
         means.append(mean.squeeze(0).float())
-    mean_cache = torch.cat(means, dim=0)
-    if fit_normalizer:
-        model.latent_normalizer.fit(mean_cache)
-    semantic_states = model.normalize_latents(mean_cache)
+    semantic_states = torch.cat(means, dim=0)
     model.train()
     return semantic_states, semantic_states, surface_batcher.byte_ids, surface_batcher.lengths
 
@@ -347,7 +343,9 @@ def parse_args():
     parser.add_argument("--moe-top-k", type=int, default=NAZ_MODEL_DEFAULTS["moe_top_k"])
     parser.add_argument("--moe-layers", type=int, default=NAZ_MODEL_DEFAULTS["moe_layers"])
     parser.add_argument("--moe-balance-weight", type=float, default=NAZ_MODEL_DEFAULTS["moe_balance_weight"])
-    parser.add_argument("--normalizer-epsilon", type=float, default=NAZ_MODEL_DEFAULTS["normalizer_epsilon"])
+    parser.add_argument("--naz-input-jitter-prob", type=float, default=NAZ_MODEL_DEFAULTS["naz_input_jitter_prob"])
+    parser.add_argument("--naz-input-jitter-min-cos", type=float, default=NAZ_MODEL_DEFAULTS["naz_input_jitter_min_cos"])
+    parser.add_argument("--naz-input-jitter-max-cos", type=float, default=NAZ_MODEL_DEFAULTS["naz_input_jitter_max_cos"])
     return parser.parse_args()
 
 
@@ -394,8 +392,12 @@ def validate_args(args):
         raise ValueError("--moe-layers must be >= 0")
     if args.moe_balance_weight < 0.0:
         raise ValueError("--moe-balance-weight must be >= 0")
-    if args.normalizer_epsilon <= 0.0:
-        raise ValueError("--normalizer-epsilon must be > 0")
+    if args.naz_input_jitter_prob < 0.0 or args.naz_input_jitter_prob > 1.0:
+        raise ValueError("--naz-input-jitter-prob must be inside [0, 1]")
+    if args.naz_input_jitter_min_cos <= 0.0 or args.naz_input_jitter_max_cos > 1.0:
+        raise ValueError("--naz-input-jitter cosine values must satisfy 0 < cos <= 1")
+    if args.naz_input_jitter_min_cos > args.naz_input_jitter_max_cos:
+        raise ValueError("--naz-input-jitter-min-cos must be <= --naz-input-jitter-max-cos")
     if args.full_attention_interval <= 0:
         raise ValueError("--full-attention-interval must be > 0")
     if args.num_attention_heads <= 0 or args.num_key_value_heads <= 0:
@@ -438,7 +440,9 @@ def build_config(args, dil_config: DilConfig):
         moe_top_k=args.moe_top_k,
         moe_layers=args.moe_layers,
         moe_balance_weight=args.moe_balance_weight,
-        normalizer_epsilon=args.normalizer_epsilon,
+        naz_input_jitter_prob=args.naz_input_jitter_prob,
+        naz_input_jitter_min_cos=args.naz_input_jitter_min_cos,
+        naz_input_jitter_max_cos=args.naz_input_jitter_max_cos,
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         num_hidden_layers=args.num_hidden_layers,
@@ -552,10 +556,7 @@ def main():
             train_surface,
             chunk_tokens=4096,
             autocast_enabled=autocast_enabled,
-            fit_normalizer=start_step == 0,
         )
-        if start_step == 0:
-            print("normalizer_fit=resident_train", flush=True)
         train_iter = ResidentNazSemanticBatcher(
             *semantic_cache,
             sequence_length=args.sequence_length,
@@ -583,7 +584,6 @@ def main():
                         eval_surface,
                         chunk_tokens=4096,
                         autocast_enabled=autocast_enabled,
-                        fit_normalizer=False,
                     ),
                     sequence_length=args.sequence_length,
                     batch_size=args.eval_batch_size,

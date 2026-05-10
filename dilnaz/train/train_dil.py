@@ -46,7 +46,7 @@ from models.modeling_dil import Dil
 from tokenization import default_vocab_path
 
 
-CHECKPOINT_FORMAT_VERSION = 17
+CHECKPOINT_FORMAT_VERSION = 20
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -199,6 +199,8 @@ def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_en
         "loss": 0.0,
         "distill": 0.0,
         "writer": 0.0,
+        "writer_token": 0.0,
+        "writer_length": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
         "geom_l3": 0.0,
@@ -207,6 +209,7 @@ def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_en
         "var": 0.0,
         "byte_acc": 0.0,
         "token_exact": 0.0,
+        "length_acc": 0.0,
         "batches": 0,
     }
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
@@ -222,6 +225,8 @@ def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_en
         total["loss"] += float(outputs.loss.detach().cpu())
         total["distill"] += float(outputs.distill_loss.detach().cpu())
         total["writer"] += float(outputs.writer_loss.detach().cpu())
+        total["writer_token"] += float(outputs.writer_token_loss.detach().cpu())
+        total["writer_length"] += float(outputs.writer_length_loss.detach().cpu())
         layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
         for idx in range(4):
             total[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
@@ -229,6 +234,7 @@ def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_en
         total["var"] += float(outputs.variance_loss.detach().cpu())
         total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
         total["token_exact"] += float(outputs.token_exact.detach().cpu())
+        total["length_acc"] += float(outputs.length_acc.detach().cpu())
         total["batches"] += 1
         if batch_idx >= max_batches:
             break
@@ -244,6 +250,8 @@ def format_log(step, metrics):
         f"loss={metrics['loss']:.4f}",
         f"distill={metrics['distill']:.4f}",
         f"writer={metrics['writer']:.4f}",
+        f"writer_tok={metrics['writer_token']:.4f}",
+        f"writer_len={metrics['writer_length']:.4f}",
         f"geom_l1={metrics['geom_l1']:.4f}",
         f"geom_l2={metrics['geom_l2']:.4f}",
         f"geom_l3={metrics['geom_l3']:.4f}",
@@ -252,6 +260,7 @@ def format_log(step, metrics):
         f"var={metrics['var']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
         f"token_exact={metrics['token_exact']:.4f}",
+        f"length_acc={metrics['length_acc']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -307,6 +316,9 @@ def parse_args():
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
     parser.add_argument("--max-word-bytes", type=int, default=DIL_MODEL_DEFAULTS["max_word_bytes"])
     parser.add_argument("--context-radius", type=int, default=DIL_MODEL_DEFAULTS["context_radius"])
+    parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
+    parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
+    parser.add_argument("--byte-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_expansion"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
     parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
@@ -314,7 +326,8 @@ def parse_args():
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
     parser.add_argument("--writer-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["writer_loss_weight"])
     parser.add_argument("--writer-num-layers", type=int, default=DIL_MODEL_DEFAULTS["writer_num_layers"])
-    parser.add_argument("--writer-attention-heads", type=int, default=DIL_MODEL_DEFAULTS["writer_attention_heads"])
+    parser.add_argument("--writer-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_kernel_size"])
+    parser.add_argument("--writer-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_expansion"])
     parser.add_argument("--writer-dropout", type=float, default=DIL_MODEL_DEFAULTS["writer_dropout"])
     parser.add_argument("--nllb-model-name", default="facebook/nllb-200-distilled-600M")
     parser.add_argument("--nllb-src-lang", default="tur_Latn")
@@ -334,12 +347,20 @@ def validate_args(args):
         raise ValueError("--text-read-chars must be > 0")
     if args.context_radius < 0:
         raise ValueError("--context-radius must be >= 0")
+    if args.byte_conv_layers < 0:
+        raise ValueError("--byte-conv-layers must be >= 0")
+    if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
+        raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
+    if args.byte_conv_expansion <= 0:
+        raise ValueError("--byte-conv-expansion must be > 0")
     if args.writer_loss_weight < 0.0:
         raise ValueError("--writer-loss-weight must be >= 0")
-    if args.writer_num_layers <= 0:
-        raise ValueError("--writer-num-layers must be > 0")
-    if args.writer_attention_heads <= 0:
-        raise ValueError("--writer-attention-heads must be > 0")
+    if args.writer_num_layers < 0:
+        raise ValueError("--writer-num-layers must be >= 0")
+    if args.writer_conv_kernel_size <= 0 or args.writer_conv_kernel_size % 2 == 0:
+        raise ValueError("--writer-conv-kernel-size must be a positive odd integer")
+    if args.writer_conv_expansion <= 0:
+        raise ValueError("--writer-conv-expansion must be > 0")
     if not 0.0 <= args.writer_dropout < 1.0:
         raise ValueError("--writer-dropout must be inside [0, 1)")
     if args.num_workers < 0:
@@ -372,6 +393,9 @@ def build_config(args, tokenizer):
         latent_size=args.latent_size,
         max_word_bytes=args.max_word_bytes,
         context_radius=args.context_radius,
+        byte_conv_layers=args.byte_conv_layers,
+        byte_conv_kernel_size=args.byte_conv_kernel_size,
+        byte_conv_expansion=args.byte_conv_expansion,
         dil_dropout=args.dil_dropout,
         distillation_weight=args.distillation_weight,
         layer_geometry_weight=args.layer_geometry_weight,
@@ -379,7 +403,8 @@ def build_config(args, tokenizer):
         variance_weight=args.variance_weight,
         writer_loss_weight=args.writer_loss_weight,
         writer_num_layers=args.writer_num_layers,
-        writer_attention_heads=args.writer_attention_heads,
+        writer_conv_kernel_size=args.writer_conv_kernel_size,
+        writer_conv_expansion=args.writer_conv_expansion,
         writer_dropout=args.writer_dropout,
         tokenizer_vocab_file=args.tokenizer_vocab.name,
         nllb_model_name=args.nllb_model_name,
@@ -574,6 +599,8 @@ def main():
         "loss": 0.0,
         "distill": 0.0,
         "writer": 0.0,
+        "writer_token": 0.0,
+        "writer_length": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
         "geom_l3": 0.0,
@@ -582,6 +609,7 @@ def main():
         "var": 0.0,
         "byte_acc": 0.0,
         "token_exact": 0.0,
+        "length_acc": 0.0,
     }
     completed_step = start_step
     current_batch = None
@@ -618,8 +646,10 @@ def main():
             compute_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             cudagraph_step_begin(device, compile_mode)
+            model_batch = model_inputs(batch)
+            model_batch["training_step"] = step
             with autocast_context(autocast_enabled):
-                outputs = model(**model_inputs(batch))
+                outputs = model(**model_batch)
 
             outputs.loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -644,6 +674,8 @@ def main():
             metric_sums["loss"] += float(outputs.loss.detach().cpu())
             metric_sums["distill"] += float(outputs.distill_loss.detach().cpu())
             metric_sums["writer"] += float(outputs.writer_loss.detach().cpu())
+            metric_sums["writer_token"] += float(outputs.writer_token_loss.detach().cpu())
+            metric_sums["writer_length"] += float(outputs.writer_length_loss.detach().cpu())
             layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
             for idx in range(4):
                 metric_sums[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
@@ -651,6 +683,7 @@ def main():
             metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
             metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
             metric_sums["token_exact"] += float(outputs.token_exact.detach().cpu())
+            metric_sums["length_acc"] += float(outputs.length_acc.detach().cpu())
 
             should_log = step % args.log_every == 0 or step == start_step + 1 or step == args.max_steps
             should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0

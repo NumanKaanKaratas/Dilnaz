@@ -10,7 +10,7 @@ from transformers.modeling_utils import PreTrainedModel
 
 from .configuration_dil import DilConfig
 from .configuration_naz import NazConfig
-from .modeling_dil import Dil
+from .modeling_dil import Dil, angular_noise_like, normalize_semantic_latents
 from .naz_backbone import NazBackboneCache, NazSemanticBackbone
 
 
@@ -109,7 +109,7 @@ class SemanticDynamicsMixtureHead(nn.Module):
         offset_gate = torch.sigmoid(
             self.offset_gate(shared).view(batch_size, sequence_length, self.horizons, self.num_candidates)
         ).unsqueeze(-1)
-        candidate_latents = base.unsqueeze(3) + offset_gate * offsets
+        candidate_latents = normalize_semantic_latents(base.unsqueeze(3) + offset_gate * offsets)
         router_logits = self.router(shared).view(batch_size, sequence_length, self.horizons, self.num_candidates)
         selected_indices = router_logits.argmax(dim=-1)
         gather_index = selected_indices.unsqueeze(-1).unsqueeze(-1).expand(
@@ -126,26 +126,6 @@ class SemanticDynamicsMixtureHead(nn.Module):
             selected_latents=selected_latents.float(),
             selected_indices=selected_indices,
         )
-
-
-class NazLatentNormalizer(nn.Module):
-    def __init__(self, latent_size: int, epsilon: float):
-        super().__init__()
-        self.epsilon = epsilon
-        self.register_buffer("mean", torch.zeros(latent_size), persistent=True)
-        self.register_buffer("scale", torch.ones(latent_size), persistent=True)
-
-    @torch.no_grad()
-    def fit(self, latents: torch.Tensor):
-        flat = latents.reshape(-1, latents.shape[-1]).float()
-        self.mean.copy_(flat.mean(dim=0))
-        self.scale.copy_(flat.std(dim=0, unbiased=False).clamp_min(self.epsilon))
-
-    def normalize(self, latents: torch.Tensor) -> torch.Tensor:
-        return (latents - self.mean.to(latents.device, latents.dtype)) / self.scale.to(latents.device, latents.dtype)
-
-    def denormalize(self, latents: torch.Tensor) -> torch.Tensor:
-        return latents * self.scale.to(latents.device, latents.dtype) + self.mean.to(latents.device, latents.dtype)
 
 
 class NazStudentCore(nn.Module):
@@ -193,7 +173,6 @@ class Naz(PreTrainedModel):
             raise ValueError("NazConfig.dil_path is required")
 
         self.student_core = NazStudentCore(config)
-        self.latent_normalizer = NazLatentNormalizer(config.latent_size, config.normalizer_epsilon)
         self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
         self.reconstruction_loss_weight = config.reconstruction_loss_weight
@@ -305,10 +284,17 @@ class Naz(PreTrainedModel):
             dtype=target_word_masks.dtype,
             device=target_word_masks.device,
         )
-        for context_idx, offset in enumerate(range(-context_radius, 1)):
+        for context_idx, offset in enumerate(range(-context_radius, context_radius + 1)):
             if offset < 0:
+                if -offset >= sequence_length:
+                    continue
                 dst = slice(-offset, sequence_length)
                 src = slice(0, sequence_length + offset)
+            elif offset > 0:
+                if offset >= sequence_length:
+                    continue
+                dst = slice(0, sequence_length - offset)
+                src = slice(offset, sequence_length)
             else:
                 dst = slice(0, sequence_length)
                 src = slice(0, sequence_length)
@@ -323,7 +309,7 @@ class Naz(PreTrainedModel):
         )
 
     @torch.no_grad()
-    def raw_latent_distribution(
+    def latent_distribution(
         self,
         input_ids: torch.LongTensor,
         word_masks: torch.Tensor,
@@ -334,15 +320,6 @@ class Naz(PreTrainedModel):
         mean = latent_states.float().clone()
         log_std = torch.zeros_like(mean)
         return mean, log_std
-
-    def latent_distribution(
-        self,
-        input_ids: torch.LongTensor,
-        word_masks: torch.Tensor,
-        unit_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        mean, log_std = self.raw_latent_distribution(input_ids, word_masks, unit_mask)
-        return self.normalize_latents(mean), log_std
 
     target_distribution = latent_distribution
 
@@ -421,6 +398,30 @@ class Naz(PreTrainedModel):
         hidden_states = self._student_hidden(semantic_states, unit_mask)
         return self.semantic_head(hidden_states)
 
+    def training_semantic_states(self, semantic_states: torch.Tensor, unit_mask: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.config.naz_input_jitter_prob <= 0.0:
+            return semantic_states
+        jitter_mask = unit_mask.bool() & torch.rand(unit_mask.shape, device=semantic_states.device).lt(
+            self.config.naz_input_jitter_prob
+        )
+        if not jitter_mask.any():
+            return semantic_states
+        noised = semantic_states.float().clone()
+        min_cos = torch.full(
+            jitter_mask.shape,
+            self.config.naz_input_jitter_min_cos,
+            device=semantic_states.device,
+            dtype=torch.float32,
+        )[jitter_mask]
+        max_cos = torch.full(
+            jitter_mask.shape,
+            self.config.naz_input_jitter_max_cos,
+            device=semantic_states.device,
+            dtype=torch.float32,
+        )[jitter_mask]
+        noised[jitter_mask] = angular_noise_like(noised[jitter_mask], min_cos, max_cos)
+        return noised.to(semantic_states.dtype)
+
     def predict_latents(
         self,
         input_ids: torch.LongTensor,
@@ -431,12 +432,6 @@ class Naz(PreTrainedModel):
             self.semantic_states(input_ids, word_masks, unit_mask),
             unit_mask,
         )
-
-    def normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        return self.latent_normalizer.normalize(latents.float())
-
-    def denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        return self.latent_normalizer.denormalize(latents.float())
 
     def lcm_mse_loss(self, predicted: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mse_per_target = F.mse_loss(predicted.float(), target.float(), reduction="none").sum(dim=-1)
@@ -508,7 +503,7 @@ class Naz(PreTrainedModel):
         unit_mask: torch.Tensor,
         target_mask: Optional[torch.Tensor] = None,
     ) -> NazOutput:
-        dynamics = self.predict_semantic_dynamics(semantic_states, unit_mask)
+        dynamics = self.predict_semantic_dynamics(self.training_semantic_states(semantic_states, unit_mask), unit_mask)
         if target_mask is None:
             target_mask = unit_mask.unsqueeze(-1).expand(
                 *unit_mask.shape,
@@ -557,9 +552,7 @@ class Naz(PreTrainedModel):
         mse_mean = losses["chosen_mse"]
         active_predicted = dynamics.selected_latents[target_mask]
         active_target = target_latents[target_mask]
-        raw_predicted = self.denormalize_latents(active_predicted)
-        raw_target = self.denormalize_latents(active_target)
-        cosine = F.cosine_similarity(raw_predicted.float(), raw_target.float(), dim=-1)
+        cosine = F.cosine_similarity(active_predicted.float(), active_target.float(), dim=-1)
         latent_cos = cosine.mean()
         cosine_loss = (1.0 - cosine).mean()
         loss = self.reconstruction_loss_weight * (
@@ -634,7 +627,7 @@ class Naz(PreTrainedModel):
                 repetition_cos_threshold=repetition_cos_threshold,
             )
         ]
-        prompt_latents = self.denormalize_latents(prompt_model_latents)
+        prompt_latents = prompt_model_latents
         generated_latents = torch.stack(generated, dim=1) if generated else prompt_latents.new_empty(
             prompt_latents.shape[0],
             0,
@@ -675,10 +668,9 @@ class Naz(PreTrainedModel):
             model_latent = dynamics.selected_latents[:, 0, 0].float()
             candidate_index = dynamics.selected_indices[:, 0, 0]
             repeated = F.cosine_similarity(previous_model_latent.float(), model_latent.float(), dim=-1).ge(repetition_cos_threshold)
-            latent = self.denormalize_latents(model_latent)
             should_stop = repeated & torch.full_like(repeated, generated_idx + 1 >= min_new_tokens)
             yield NazGenerationStep(
-                latent=latent,
+                latent=model_latent,
                 latent_cos_to_previous=F.cosine_similarity(previous_model_latent.float(), model_latent.float(), dim=-1),
                 should_stop=should_stop,
                 candidate_index=candidate_index,

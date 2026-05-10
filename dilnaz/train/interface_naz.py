@@ -14,7 +14,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 23
+CHECKPOINT_FORMAT_VERSION = 25
 OBJECTIVE = "semantic_dynamics_moe_mtp_v1"
 
 
@@ -101,13 +101,44 @@ def stream_text(
     max_new_tokens: int,
     min_new_tokens: int,
     repetition_cos_threshold: float,
+    writer_microbatch_size: int,
 ):
     if max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be > 0")
+    if writer_microbatch_size <= 0:
+        raise ValueError("--writer-microbatch-size must be > 0")
     input_ids, word_masks, unit_mask, _ = make_batch(prompt_segments, tokenizer, config, device)
     prompt_text = "".join(tokenizer.decode(segment.token_ids) for segment in prompt_segments)
     sys.stdout.write(prompt_text)
     sys.stdout.flush()
+
+    pending_latents: list[torch.Tensor] = []
+    pending_should_stop: list[bool] = []
+
+    def flush_pending() -> bool:
+        if not pending_latents:
+            return False
+        latents = torch.cat(pending_latents, dim=0)
+        token_ids, token_masks, lengths = model.dil_model.decode_semantic(latents)
+        stop_after_flush = False
+        for row_idx, should_stop in enumerate(pending_should_stop):
+            if int(lengths[row_idx].detach().cpu()) == 0:
+                stop_after_flush = True
+                break
+            token = decode_token_ids(tokenizer, token_ids[row_idx], token_masks[row_idx])
+            if not token and should_stop:
+                stop_after_flush = True
+                break
+            if token:
+                sys.stdout.write(token)
+                sys.stdout.flush()
+            if should_stop:
+                stop_after_flush = True
+                break
+        pending_latents.clear()
+        pending_should_stop.clear()
+        return stop_after_flush
+
     for step in model.generate_stream(
         input_ids=input_ids,
         word_masks=word_masks,
@@ -116,17 +147,13 @@ def stream_text(
         min_new_tokens=min_new_tokens,
         repetition_cos_threshold=repetition_cos_threshold,
     ):
-        token_ids, token_masks, lengths = model.dil_model.decode_semantic(step.latent)
-        if int(lengths[0].detach().cpu()) == 0:
-            break
-        token = decode_token_ids(tokenizer, token_ids[0], token_masks[0])
-        if not token and bool(step.should_stop[0].detach().cpu()):
-            break
-        if token:
-            sys.stdout.write(token)
-            sys.stdout.flush()
-        if bool(step.should_stop[0].detach().cpu()):
-            break
+        pending_latents.append(step.latent)
+        pending_should_stop.append(bool(step.should_stop[0].detach().cpu()))
+        if len(pending_latents) >= writer_microbatch_size or pending_should_stop[-1]:
+            if flush_pending():
+                break
+    else:
+        flush_pending()
     sys.stdout.write("\n")
     sys.stdout.flush()
 
@@ -139,6 +166,7 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--min-new-tokens", type=int, default=None)
     parser.add_argument("--repetition-cos-threshold", type=float, default=None)
+    parser.add_argument("--writer-microbatch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--compile-mode", choices=COMPILE_MODE_CHOICES, default="off")
@@ -170,6 +198,7 @@ def main():
         args.max_new_tokens,
         config.min_new_tokens if args.min_new_tokens is None else args.min_new_tokens,
         config.repetition_cos_threshold if args.repetition_cos_threshold is None else args.repetition_cos_threshold,
+        args.writer_microbatch_size,
     )
 
 

@@ -35,7 +35,7 @@ from naz_data import PromptAnswerNazDataset, make_naz_loader, stream_prompt_answ
 from tokenization import HybridTokenizer  # noqa: E402
 
 
-CHECKPOINT_FORMAT_VERSION = 23
+CHECKPOINT_FORMAT_VERSION = 25
 OBJECTIVE = "semantic_dynamics_moe_mtp_v1"
 
 
@@ -79,7 +79,7 @@ def save_checkpoint(
         "metrics": metrics,
         "dil_checksum": checksum,
         "compile_mode": compile_mode,
-        "semantic_space": "dil_latent",
+        "semantic_space": "dil_normalized_latent",
         "latent_size": config.latent_size,
         "vocab_size": config.vocab_size,
         "pad_token_id": config.pad_token_id,
@@ -425,7 +425,9 @@ def parse_args():
     parser.add_argument("--moe-top-k", type=int, default=NAZ_MODEL_DEFAULTS["moe_top_k"])
     parser.add_argument("--moe-layers", type=int, default=NAZ_MODEL_DEFAULTS["moe_layers"])
     parser.add_argument("--moe-balance-weight", type=float, default=NAZ_MODEL_DEFAULTS["moe_balance_weight"])
-    parser.add_argument("--normalizer-epsilon", type=float, default=NAZ_MODEL_DEFAULTS["normalizer_epsilon"])
+    parser.add_argument("--naz-input-jitter-prob", type=float, default=NAZ_MODEL_DEFAULTS["naz_input_jitter_prob"])
+    parser.add_argument("--naz-input-jitter-min-cos", type=float, default=NAZ_MODEL_DEFAULTS["naz_input_jitter_min_cos"])
+    parser.add_argument("--naz-input-jitter-max-cos", type=float, default=NAZ_MODEL_DEFAULTS["naz_input_jitter_max_cos"])
     return parser.parse_args()
 
 
@@ -470,6 +472,12 @@ def validate_args(args):
         raise ValueError("--moe-layers must be >= 0")
     if args.moe_balance_weight < 0.0:
         raise ValueError("--moe-balance-weight must be >= 0")
+    if args.naz_input_jitter_prob < 0.0 or args.naz_input_jitter_prob > 1.0:
+        raise ValueError("--naz-input-jitter-prob must be inside [0, 1]")
+    if args.naz_input_jitter_min_cos <= 0.0 or args.naz_input_jitter_max_cos > 1.0:
+        raise ValueError("--naz-input-jitter cosine values must satisfy 0 < cos <= 1")
+    if args.naz_input_jitter_min_cos > args.naz_input_jitter_max_cos:
+        raise ValueError("--naz-input-jitter-min-cos must be <= --naz-input-jitter-max-cos")
     if args.eval_every > 0 and args.eval_file is None:
         raise ValueError("--eval-file is required when --eval-every > 0")
     start_sources = sum(value is not None for value in (args.resume, args.init_naz_checkpoint, args.dil_checkpoint_dir))
@@ -501,7 +509,9 @@ def build_config(args, dil_config: DilConfig):
         moe_top_k=args.moe_top_k,
         moe_layers=args.moe_layers,
         moe_balance_weight=args.moe_balance_weight,
-        normalizer_epsilon=args.normalizer_epsilon,
+        naz_input_jitter_prob=args.naz_input_jitter_prob,
+        naz_input_jitter_min_cos=args.naz_input_jitter_min_cos,
+        naz_input_jitter_max_cos=args.naz_input_jitter_max_cos,
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         num_hidden_layers=args.num_hidden_layers,

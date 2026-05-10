@@ -123,6 +123,9 @@ def parse_args():
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
     parser.add_argument("--max-word-bytes", type=int, default=DIL_MODEL_DEFAULTS["max_word_bytes"])
     parser.add_argument("--context-radius", type=int, default=DIL_MODEL_DEFAULTS["context_radius"])
+    parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
+    parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
+    parser.add_argument("--byte-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_expansion"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
     parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
@@ -130,7 +133,8 @@ def parse_args():
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
     parser.add_argument("--writer-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["writer_loss_weight"])
     parser.add_argument("--writer-num-layers", type=int, default=DIL_MODEL_DEFAULTS["writer_num_layers"])
-    parser.add_argument("--writer-attention-heads", type=int, default=DIL_MODEL_DEFAULTS["writer_attention_heads"])
+    parser.add_argument("--writer-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_kernel_size"])
+    parser.add_argument("--writer-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_expansion"])
     parser.add_argument("--writer-dropout", type=float, default=DIL_MODEL_DEFAULTS["writer_dropout"])
     parser.add_argument("--parallel-alignment-weight", type=float, default=1.0)
     parser.add_argument("--nllb-model-name", default=DEFAULT_PARALLEL_NLLB_MODEL)
@@ -153,12 +157,20 @@ def validate_args(args):
         raise ValueError("--parallel-alignment-weight must be >= 0")
     if args.context_radius < 0:
         raise ValueError("--context-radius must be >= 0")
+    if args.byte_conv_layers < 0:
+        raise ValueError("--byte-conv-layers must be >= 0")
+    if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
+        raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
+    if args.byte_conv_expansion <= 0:
+        raise ValueError("--byte-conv-expansion must be > 0")
     if args.writer_loss_weight < 0.0:
         raise ValueError("--writer-loss-weight must be >= 0")
-    if args.writer_num_layers <= 0:
-        raise ValueError("--writer-num-layers must be > 0")
-    if args.writer_attention_heads <= 0:
-        raise ValueError("--writer-attention-heads must be > 0")
+    if args.writer_num_layers < 0:
+        raise ValueError("--writer-num-layers must be >= 0")
+    if args.writer_conv_kernel_size <= 0 or args.writer_conv_kernel_size % 2 == 0:
+        raise ValueError("--writer-conv-kernel-size must be a positive odd integer")
+    if args.writer_conv_expansion <= 0:
+        raise ValueError("--writer-conv-expansion must be > 0")
     if not 0.0 <= args.writer_dropout < 1.0:
         raise ValueError("--writer-dropout must be inside [0, 1)")
     if args.num_workers < 0:
@@ -185,6 +197,9 @@ def build_config(args, tokenizer):
         latent_size=args.latent_size,
         max_word_bytes=args.max_word_bytes,
         context_radius=args.context_radius,
+        byte_conv_layers=args.byte_conv_layers,
+        byte_conv_kernel_size=args.byte_conv_kernel_size,
+        byte_conv_expansion=args.byte_conv_expansion,
         dil_dropout=args.dil_dropout,
         distillation_weight=args.distillation_weight,
         layer_geometry_weight=args.layer_geometry_weight,
@@ -192,7 +207,8 @@ def build_config(args, tokenizer):
         variance_weight=args.variance_weight,
         writer_loss_weight=args.writer_loss_weight,
         writer_num_layers=args.writer_num_layers,
-        writer_attention_heads=args.writer_attention_heads,
+        writer_conv_kernel_size=args.writer_conv_kernel_size,
+        writer_conv_expansion=args.writer_conv_expansion,
         writer_dropout=args.writer_dropout,
         tokenizer_vocab_file=args.tokenizer_vocab.name,
         nllb_model_name=args.nllb_model_name,
@@ -433,8 +449,10 @@ def main():
             compute_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             cudagraph_step_begin(device, compile_mode)
+            model_batch = model_inputs(batch)
+            model_batch["training_step"] = step
             with autocast_context(autocast_enabled):
-                outputs = model(**model_inputs(batch))
+                outputs = model(**model_batch)
                 loss, parallel_loss = parallel_total_loss(outputs, batch, args.parallel_alignment_weight)
 
             loss.backward()

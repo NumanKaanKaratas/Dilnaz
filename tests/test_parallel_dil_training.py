@@ -206,6 +206,6 @@ def test_dil_checkpoint_format_matches_encoder_only_family():
     config = tiny_parallel_config(tokenizer)
     model = Dil(config)
 
-    assert config.checkpoint_format_version == 17
+    assert config.checkpoint_format_version == 20
     assert hasattr(model, "writer")
     assert any(key.startswith("writer.") for key in model.state_dict())

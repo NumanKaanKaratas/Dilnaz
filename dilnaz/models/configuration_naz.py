@@ -25,7 +25,9 @@ class NazConfig(PretrainedConfig):
         moe_layers=4,
         moe_balance_weight=0.01,
         moe_expert_intermediate_size=None,
-        normalizer_epsilon=1e-6,
+        naz_input_jitter_prob=0.10,
+        naz_input_jitter_min_cos=0.985,
+        naz_input_jitter_max_cos=0.995,
         repetition_cos_threshold=0.985,
         min_new_tokens=1,
         hidden_size=512,
@@ -75,7 +77,13 @@ class NazConfig(PretrainedConfig):
         self.moe_expert_intermediate_size = (
             intermediate_size if moe_expert_intermediate_size is None else moe_expert_intermediate_size
         )
-        self.normalizer_epsilon = normalizer_epsilon
+        if naz_input_jitter_prob < 0.0 or naz_input_jitter_prob > 1.0:
+            raise ValueError("naz_input_jitter_prob must be inside [0, 1]")
+        if naz_input_jitter_min_cos <= 0.0 or naz_input_jitter_max_cos > 1.0 or naz_input_jitter_min_cos > naz_input_jitter_max_cos:
+            raise ValueError("naz input jitter cosine range must satisfy 0 < min <= max <= 1")
+        self.naz_input_jitter_prob = naz_input_jitter_prob
+        self.naz_input_jitter_min_cos = naz_input_jitter_min_cos
+        self.naz_input_jitter_max_cos = naz_input_jitter_max_cos
         self.repetition_cos_threshold = repetition_cos_threshold
         self.min_new_tokens = min_new_tokens
         self.hidden_size = hidden_size

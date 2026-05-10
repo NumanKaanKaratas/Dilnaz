@@ -8,7 +8,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.optim import AdamW
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -33,7 +32,7 @@ from models.configuration_dil import DilConfig  # noqa: E402
 from models.modeling_dil import Dil  # noqa: E402
 
 
-CHECKPOINT_FORMAT_VERSION = 17
+CHECKPOINT_FORMAT_VERSION = 20
 WRITER_OBJECTIVE = "plain_text_writer_only"
 
 
@@ -57,17 +56,11 @@ def freeze_for_writer_only(model: Dil):
     model.writer.train()
 
 
-def writer_only_forward(model: Dil, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def writer_only_forward(model: Dil, batch: dict, training_step: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     labels = batch["labels"].to(batch["input_ids"].device)
     with torch.no_grad():
         semantic = model.encode(batch["input_ids"], batch["word_masks"]).float()
-    logits = model.writer_logits(semantic.detach(), labels).float()
-    loss = F.cross_entropy(
-        logits.reshape(-1, model.config.vocab_size),
-        labels.reshape(-1),
-        ignore_index=-100,
-    )
-    byte_acc, token_exact = model.writer_metrics(logits, labels)
+    loss, _, _, byte_acc, token_exact, _ = model.writer_loss_and_metrics(semantic.detach(), labels, training_step)
     return loss, byte_acc, token_exact
 
 
@@ -373,7 +366,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             cudagraph_step_begin(device, compile_mode)
             with autocast_context(autocast_enabled):
-                loss, byte_acc, token_exact = writer_only_forward(model, batch)
+                loss, byte_acc, token_exact = writer_only_forward(model, batch, step)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.writer.parameters(), args.max_grad_norm)
             optimizer.step()

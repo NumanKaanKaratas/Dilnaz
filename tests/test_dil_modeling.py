@@ -8,9 +8,17 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz" / "train"))
 
+from dil_data import context_offsets
 from models.configuration_dil import DilConfig
 from models.configuration_naz import NazConfig
-from models.modeling_dil import Dil, DilGatedMLP, DilRMSNorm
+from models.modeling_dil import (
+    Dil,
+    DilByteConvStem,
+    DilGatedMLP,
+    DilRMSNorm,
+    angular_noise_like,
+    normalize_semantic_latents,
+)
 from models.modeling_naz import Naz
 from models.naz_backbone import SemanticDeltaMixer, SemanticGlobalAttention, SparseMoEFeedForward, ZeroCenteredRMSNorm
 from naz_data import PromptAnswerNazDataset, ResidentNazBatcher, ResidentNazSemanticBatcher, StreamingTextNazDataset
@@ -38,21 +46,24 @@ class FakeGeneratedDil:
         self.max_word_bytes = max_word_bytes
         self.decoded_steps = decoded_steps
         self.calls = 0
+        self.cursor = 0
 
     def decode_semantic(self, latent: torch.Tensor):
-        value = self.decoded_steps[self.calls]
         self.calls += 1
         batch_size = latent.shape[0]
         token_ids = torch.full((batch_size, self.max_word_bytes), self.tokenizer.pad_token_id, dtype=torch.long)
         token_masks = torch.zeros_like(token_ids, dtype=torch.bool)
         lengths = torch.zeros((batch_size,), dtype=torch.long)
-        if value is None:
-            return token_ids, token_masks, lengths
-        segment = next(segment for segment in self.tokenizer.encode_segments(value) if segment.piece_len > 0)
-        ids = torch.tensor(segment.token_ids, dtype=torch.long)
-        token_ids[:, : ids.numel()] = ids
-        token_masks[:, : ids.numel()] = True
-        lengths[:] = ids.numel()
+        for row_idx in range(batch_size):
+            value = self.decoded_steps[self.cursor]
+            self.cursor += 1
+            if value is None:
+                continue
+            segment = next(segment for segment in self.tokenizer.encode_segments(value) if segment.piece_len > 0)
+            ids = torch.tensor(segment.token_ids, dtype=torch.long)
+            token_ids[row_idx, : ids.numel()] = ids
+            token_masks[row_idx, : ids.numel()] = True
+            lengths[row_idx] = ids.numel()
         return token_ids, token_masks, lengths
 
 
@@ -118,9 +129,10 @@ def test_dil_config_uses_left_context_contract():
     config = tiny_config()
 
     assert config.context_radius == 2
-    assert config.context_size == 3
+    assert config.context_size == 5
     assert config.target_index == 2
-    assert config.checkpoint_format_version == 17
+    assert list(context_offsets(2)) == [-2, -1, 0, 1, 2]
+    assert config.checkpoint_format_version == 20
     assert not hasattr(config, "context_left_radius")
 
 
@@ -131,9 +143,130 @@ def test_dil_rejects_pre_parallel_writer_checkpoint_family():
     try:
         Dil(config)
     except ValueError as error:
-        assert "checkpoint_format_version=17" in str(error)
+        assert "checkpoint_format_version=20" in str(error)
     else:
         raise AssertionError("Dil accepted stale checkpoint_format_version")
+
+
+def test_dil_native_semantic_has_no_post_fit_normalizer_symbols():
+    config = tiny_config()
+    model = Dil(config)
+
+    assert not hasattr(model, "semantic_normalizer")
+    assert not hasattr(model, "encode_raw")
+    assert not hasattr(model, "denormalize")
+
+
+def test_dil_encode_returns_native_normalized_semantic_contract():
+    config = tiny_config()
+    model = Dil(config).eval()
+    input_ids = torch.tensor(
+        [
+            [[2, 0, 0, 0], [3, 0, 0, 0], [4, 5, 0, 0], [6, 0, 0, 0], [7, 0, 0, 0]],
+        ],
+        dtype=torch.long,
+    )
+    word_masks = input_ids.ne(config.pad_token_id)
+
+    normalized = model.encode(input_ids, word_masks)
+    normalized_with_layers, layer_vectors = model.encode(input_ids, word_masks, output_hidden_states=True)
+    norms = normalized.float().norm(dim=-1)
+
+    assert torch.allclose(norms, torch.full_like(norms, config.latent_size**0.5), atol=1e-5)
+    assert torch.allclose(normalized_with_layers, normalized)
+    assert len(layer_vectors) == config.num_encoder_layers
+
+
+def test_normalize_semantic_latents_maps_to_fixed_radius():
+    config = tiny_config()
+    latents = torch.randn(6, config.latent_size)
+    latents[0].zero_()
+    normalized = normalize_semantic_latents(latents)
+
+    assert torch.allclose(
+        normalized.norm(dim=-1),
+        torch.full((6,), config.latent_size**0.5),
+        atol=1e-5,
+    )
+    assert normalized[0, 0] > 0.0
+
+
+def test_angular_noise_preserves_norm_and_cosine_range():
+    config = tiny_config()
+    latents = normalize_semantic_latents(torch.randn(8, config.latent_size))
+    min_cos = torch.full((8,), 0.985)
+    max_cos = torch.full((8,), 0.995)
+
+    noised = angular_noise_like(latents, min_cos, max_cos)
+    cosine = torch.nn.functional.cosine_similarity(latents, noised, dim=-1)
+
+    assert torch.allclose(noised.norm(dim=-1), latents.norm(dim=-1), atol=1e-5)
+    assert torch.all(cosine >= min_cos - 1e-5)
+    assert torch.all(cosine <= max_cos + 1e-5)
+
+
+def test_writer_training_semantic_noise_is_training_only_after_warmup():
+    config = tiny_config()
+    config.writer_noise_warmup_steps = 0
+    config.writer_noise_clean_ratio = 0.0
+    config.writer_noise_easy_ratio = 1.0
+    config.writer_noise_mid_ratio = 0.0
+    config.writer_noise_hard_ratio = 0.0
+    model = Dil(config)
+    semantic = normalize_semantic_latents(torch.randn(4, config.latent_size))
+
+    model.eval()
+    assert torch.equal(model.writer_training_semantic(semantic, training_step=1), semantic)
+
+    model.train()
+    noised = model.writer_training_semantic(semantic, training_step=1)
+    cosine = torch.nn.functional.cosine_similarity(semantic, noised, dim=-1)
+
+    assert not torch.equal(noised, semantic)
+    assert torch.all(cosine >= config.writer_noise_easy_min_cos - 1e-5)
+    assert torch.all(cosine <= config.writer_noise_easy_max_cos + 1e-5)
+
+
+def test_dil_byte_conv_stem_preserves_shape_and_padding_mask():
+    config = tiny_config()
+    stem = DilByteConvStem(config).eval()
+    hidden_states = torch.randn(2, config.context_size, config.max_word_bytes, config.hidden_size)
+    word_masks = torch.ones(2, config.context_size, config.max_word_bytes, dtype=torch.bool)
+    word_masks[:, :, -1] = False
+
+    output = stem(hidden_states, word_masks)
+
+    assert output.shape == hidden_states.shape
+    assert torch.equal(output[:, :, -1].abs().sum(dim=-1), torch.zeros(2, config.context_size))
+
+
+def test_dil_context_attention_keeps_context_activations_read_only():
+    config = tiny_config()
+    model = Dil(config)
+    token_states = torch.randn(2, config.context_size, config.hidden_size, requires_grad=True)
+    token_mask = torch.ones(2, config.context_size, dtype=torch.bool)
+
+    model.encoder.target_conditioned_by_context(token_states, token_mask).sum().backward()
+
+    context_grad = token_states.grad.index_select(1, model.encoder.context_indices)
+    target_grad = token_states.grad[:, config.target_index]
+    assert float(context_grad.abs().sum()) == 0.0
+    assert float(target_grad.abs().sum()) > 0.0
+
+
+def test_dil_parallel_writer_outputs_token_and_length_logits():
+    config = tiny_config()
+    model = Dil(config)
+    semantic = torch.randn(3, config.latent_size)
+
+    token_logits, length_logits = model.writer_outputs(semantic)
+    token_ids, token_masks, lengths = model.decode_semantic(semantic)
+
+    assert token_logits.shape == (3, config.max_word_bytes, config.vocab_size)
+    assert length_logits.shape == (3, config.max_word_bytes + 1)
+    assert token_ids.shape == (3, config.max_word_bytes)
+    assert token_masks.shape == (3, config.max_word_bytes)
+    assert lengths.shape == (3,)
 
 
 def test_dil_forward_keeps_target_latent_shape():
@@ -141,8 +274,8 @@ def test_dil_forward_keeps_target_latent_shape():
     model = Dil(config)
     input_ids = torch.tensor(
         [
-            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0]],
-            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0]],
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
         ],
         dtype=torch.long,
     )
@@ -175,6 +308,8 @@ def test_dil_encoder_conditions_target_with_left_context():
                     torch.tensor([2, 0, 0, 0]),
                     torch.tensor([3, 4, 0, 0]),
                     target,
+                    torch.tensor([18, 0, 0, 0]),
+                    torch.tensor([19, 0, 0, 0]),
                 ]
             ),
             torch.stack(
@@ -182,6 +317,8 @@ def test_dil_encoder_conditions_target_with_left_context():
                     torch.tensor([16, 0, 0, 0]),
                     torch.tensor([17, 0, 0, 0]),
                     target,
+                    torch.tensor([20, 0, 0, 0]),
+                    torch.tensor([21, 0, 0, 0]),
                 ]
             ),
         ]
@@ -205,6 +342,8 @@ def test_dil_encoder_uses_offset_order_for_context():
                     torch.tensor([2, 0, 0, 0]),
                     torch.tensor([3, 0, 0, 0]),
                     target,
+                    torch.tensor([4, 0, 0, 0]),
+                    torch.tensor([6, 0, 0, 0]),
                 ]
             ),
             torch.stack(
@@ -212,6 +351,8 @@ def test_dil_encoder_uses_offset_order_for_context():
                     torch.tensor([3, 0, 0, 0]),
                     torch.tensor([2, 0, 0, 0]),
                     target,
+                    torch.tensor([6, 0, 0, 0]),
+                    torch.tensor([4, 0, 0, 0]),
                 ]
             ),
         ]
@@ -229,8 +370,8 @@ def test_semantic_losses_update_semantic_encoder():
     model = Dil(config)
     input_ids = torch.tensor(
         [
-            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0]],
-            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0]],
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
         ],
         dtype=torch.long,
     )
@@ -258,8 +399,8 @@ def test_dil_writer_only_step_freezes_encoder():
     freeze_for_writer_only(model)
     input_ids = torch.tensor(
         [
-            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0]],
-            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0]],
+            [[2, 0, 0, 0], [3, 4, 0, 0], [5, 6, 7, 0], [14, 0, 0, 0], [15, 0, 0, 0]],
+            [[8, 0, 0, 0], [9, 10, 0, 0], [11, 12, 13, 0], [16, 0, 0, 0], [17, 0, 0, 0]],
         ],
         dtype=torch.long,
     )
@@ -284,7 +425,9 @@ def test_dil_writer_only_step_freezes_encoder():
     assert torch.isfinite(token_exact)
     assert grad_abs_sum(model.encoder.embed_tokens.weight) == 0.0
     assert grad_abs_sum(model.encoder.hidden_to_semantic.weight) == 0.0
-    assert model.writer.token_embeddings.weight.grad is not None
+    assert not hasattr(model, "semantic_normalizer")
+    assert model.writer.token_head.weight.grad is not None
+    assert model.writer.length_head.weight.grad is not None
 
 
 def test_naz_uses_dil_encoder_semantic_with_zero_uncertainty(tmp_path):
@@ -409,6 +552,17 @@ def test_naz_semantic_dynamics_head_predicts_mtp_candidates(tmp_path):
     assert dynamics.router_logits.shape == (2, 3, naz_config.mtp_horizons, naz_config.num_semantic_candidates)
     assert dynamics.selected_latents.shape == (2, 3, naz_config.mtp_horizons, dil_config.latent_size)
     assert dynamics.selected_indices.shape == (2, 3, naz_config.mtp_horizons)
+    expected_norm = dil_config.latent_size**0.5
+    assert torch.allclose(
+        dynamics.candidate_latents.float().norm(dim=-1),
+        torch.full(dynamics.candidate_latents.shape[:-1], expected_norm),
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        dynamics.selected_latents.float().norm(dim=-1),
+        torch.full(dynamics.selected_latents.shape[:-1], expected_norm),
+        atol=1e-5,
+    )
     assert model.student_core.semantic_embed_proj[0].in_features == dil_config.latent_size
     assert model.student_core.semantic_embed_proj[0].out_features == 2 * naz_config.hidden_size
     assert not hasattr(model, "latent_head")
@@ -416,6 +570,32 @@ def test_naz_semantic_dynamics_head_predicts_mtp_candidates(tmp_path):
     assert not hasattr(model, "mean_head")
     assert not hasattr(model, "writer_logits")
     assert hasattr(model.dil_model, "writer")
+
+
+def test_naz_training_jitter_only_perturbs_unmasked_inputs(tmp_path):
+    dil_config = tiny_config()
+    dil_model = Dil(dil_config)
+    dil_config.save_pretrained(tmp_path)
+    torch.save(
+        {
+            "format_version": dil_config.checkpoint_format_version,
+            "model_state_dict": dil_model.state_dict(),
+        },
+        tmp_path / "checkpoint.pt",
+    )
+    naz_config = tiny_naz_config(tmp_path, dil_config)
+    naz_config.naz_input_jitter_prob = 1.0
+    model = Naz(naz_config).train()
+    semantic_states = normalize_semantic_latents(torch.randn(1, 3, dil_config.latent_size))
+    unit_mask = torch.tensor([[True, False, True]])
+
+    noised = model.training_semantic_states(semantic_states, unit_mask)
+    cosine = torch.nn.functional.cosine_similarity(semantic_states, noised, dim=-1)
+
+    assert torch.allclose(noised.float().norm(dim=-1), semantic_states.float().norm(dim=-1), atol=1e-5)
+    assert torch.all(cosine[unit_mask] >= naz_config.naz_input_jitter_min_cos - 1e-5)
+    assert torch.all(cosine[unit_mask] <= naz_config.naz_input_jitter_max_cos + 1e-5)
+    assert torch.equal(noised[~unit_mask], semantic_states[~unit_mask])
 
 
 def test_naz_hybrid_backbone_uses_native_layer_pattern(tmp_path):
@@ -685,7 +865,7 @@ def test_naz_fixed_sigma_mixture_loss_matches_gaussian_constant(tmp_path):
     assert torch.allclose(losses["chosen_mse"], torch.zeros(()))
 
 
-def test_naz_normalizer_fits_latent_distribution(tmp_path):
+def test_naz_has_no_owned_latent_normalizer(tmp_path):
     dil_config = tiny_config()
     dil_model = Dil(dil_config)
     dil_config.save_pretrained(tmp_path)
@@ -697,13 +877,10 @@ def test_naz_normalizer_fits_latent_distribution(tmp_path):
         tmp_path / "checkpoint.pt",
     )
     model = Naz(tiny_naz_config(tmp_path, dil_config))
-    latents = torch.randn(16, dil_config.latent_size) * 3.0 + 2.0
 
-    model.latent_normalizer.fit(latents)
-    normalized = model.latent_normalizer.normalize(latents)
-
-    assert torch.allclose(normalized.mean(dim=0), torch.zeros(dil_config.latent_size), atol=1e-5, rtol=1e-5)
-    assert torch.all(model.latent_normalizer.scale > 0)
+    assert not hasattr(model, "latent_normalizer")
+    assert not hasattr(model, "normalize_latents")
+    assert not hasattr(model, "denormalize_latents")
 
 
 def test_naz_generation_feeds_predicted_latents_directly(tmp_path):
@@ -784,7 +961,7 @@ def test_naz_generate_stream_yields_latent_steps(tmp_path):
         assert step.should_stop.shape == (1,)
 
 
-def test_naz_generate_stream_denormalizes_output_latents(tmp_path):
+def test_naz_generate_stream_yields_normalized_output_latents(tmp_path):
     class ConstantBackbone(torch.nn.Module):
         def __init__(self, hidden_size: int):
             super().__init__()
@@ -818,8 +995,6 @@ def test_naz_generate_stream_denormalizes_output_latents(tmp_path):
     model.student_core.backbone = ConstantBackbone(model.config.hidden_size)
     for parameter in model.semantic_head.parameters():
         parameter.data.zero_()
-    model.latent_normalizer.mean.fill_(5.0)
-    model.latent_normalizer.scale.fill_(2.0)
     input_ids = torch.tensor([[[2, 0, 0, 0]]], dtype=torch.long)
     word_masks = input_ids.ne(dil_config.pad_token_id)
     unit_mask = torch.ones(input_ids.shape[:2], dtype=torch.bool)
@@ -834,7 +1009,7 @@ def test_naz_generate_stream_denormalizes_output_latents(tmp_path):
         )
     )
 
-    assert torch.allclose(step.latent, torch.full_like(step.latent, 5.0))
+    assert torch.allclose(step.latent.norm(dim=-1), torch.full((1,), dil_config.latent_size**0.5), atol=1e-5)
     assert torch.equal(step.candidate_index, torch.zeros_like(step.candidate_index))
 
 
@@ -1180,8 +1355,9 @@ def test_naz_interface_stream_stops_at_writer_eos(capsys):
         max_new_tokens=3,
         min_new_tokens=3,
         repetition_cos_threshold=1.1,
+        writer_microbatch_size=8,
     )
 
     captured = capsys.readouterr().out
     assert captured == f"{prompt}4\n"
-    assert model.dil_model.calls == 2
+    assert model.dil_model.calls == 1
