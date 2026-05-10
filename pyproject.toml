@@ -9,6 +9,7 @@ dependencies = [
   "pyarrow",
   "torch",
   "transformers",
+  "flash-linear-attention>=0.5.0",
 ]
 license = { file = "LICENSE" }
 

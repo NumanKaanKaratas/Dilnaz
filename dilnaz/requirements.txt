@@ -2,3 +2,4 @@ torch>=2.10.0
 transformers>=4.43.0
 numpy>=1.26.0
 pyarrow>=18.0.0
+flash-linear-attention>=0.5.0

@@ -21,6 +21,7 @@ from byte_trainer_utils import (
     DeviceBatchPrefetcher,
     autocast_context,
     compile_forward,
+    cudagraph_step_begin,
     cuda_sync,
     effective_compile_mode,
     load_checkpoint,
@@ -45,7 +46,7 @@ from models.modeling_dil import Dil
 from tokenization import default_vocab_path
 
 
-CHECKPOINT_FORMAT_VERSION = 16
+CHECKPOINT_FORMAT_VERSION = 17
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -119,6 +120,7 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "target_index": config.target_index,
         "latent_size": config.latent_size,
         "distillation_weight": config.distillation_weight,
+        "writer_loss_weight": config.writer_loss_weight,
     }
 
 
@@ -184,23 +186,27 @@ def model_inputs(batch: dict) -> dict:
     return {
         "input_ids": batch["input_ids"],
         "word_masks": batch["word_masks"],
+        "labels": batch["labels"],
         "teacher_layers": batch["teacher_layers"],
         "teacher_mask": batch["teacher_mask"],
     }
 
 
 @torch.no_grad()
-def evaluate(model, eval_loader, teacher, device, autocast_enabled: bool, cuda_prefetch: bool, max_batches: int):
+def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_enabled: bool, cuda_prefetch: bool, max_batches: int):
     model.eval()
     total = {
         "loss": 0.0,
-        "kl": 0.0,
+        "distill": 0.0,
+        "writer": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
         "geom_l3": 0.0,
         "geom_l4": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
+        "byte_acc": 0.0,
+        "token_exact": 0.0,
         "batches": 0,
     }
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
@@ -210,15 +216,19 @@ def evaluate(model, eval_loader, teacher, device, autocast_enabled: bool, cuda_p
             teacher_layers, teacher_mask = teacher.teacher_layers(batch)
             batch["teacher_layers"] = teacher_layers
             batch["teacher_mask"] = teacher_mask
+        cudagraph_step_begin(device, compile_mode)
         with autocast_context(autocast_enabled):
             outputs = model(**model_inputs(batch))
         total["loss"] += float(outputs.loss.detach().cpu())
-        total["kl"] += float(outputs.kl_loss.detach().cpu())
+        total["distill"] += float(outputs.distill_loss.detach().cpu())
+        total["writer"] += float(outputs.writer_loss.detach().cpu())
         layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
         for idx in range(4):
             total[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
         total["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
         total["var"] += float(outputs.variance_loss.detach().cpu())
+        total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
+        total["token_exact"] += float(outputs.token_exact.detach().cpu())
         total["batches"] += 1
         if batch_idx >= max_batches:
             break
@@ -232,14 +242,16 @@ def format_log(step, metrics):
     fields = [
         f"step={step}",
         f"loss={metrics['loss']:.4f}",
-        f"kl={metrics['kl']:.2f}",
-        f"kl_w={metrics['kl_weighted']:.4f}",
+        f"distill={metrics['distill']:.4f}",
+        f"writer={metrics['writer']:.4f}",
         f"geom_l1={metrics['geom_l1']:.4f}",
         f"geom_l2={metrics['geom_l2']:.4f}",
         f"geom_l3={metrics['geom_l3']:.4f}",
         f"geom_l4={metrics['geom_l4']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
+        f"byte_acc={metrics['byte_acc']:.4f}",
+        f"token_exact={metrics['token_exact']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -296,12 +308,14 @@ def parse_args():
     parser.add_argument("--max-word-bytes", type=int, default=DIL_MODEL_DEFAULTS["max_word_bytes"])
     parser.add_argument("--context-radius", type=int, default=DIL_MODEL_DEFAULTS["context_radius"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
-    parser.add_argument("--kl-clamp", type=float, default=DIL_MODEL_DEFAULTS["kl_clamp"])
-    parser.add_argument("--kl-weight", type=float, default=DIL_MODEL_DEFAULTS["kl_weight"])
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
     parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
+    parser.add_argument("--writer-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["writer_loss_weight"])
+    parser.add_argument("--writer-num-layers", type=int, default=DIL_MODEL_DEFAULTS["writer_num_layers"])
+    parser.add_argument("--writer-attention-heads", type=int, default=DIL_MODEL_DEFAULTS["writer_attention_heads"])
+    parser.add_argument("--writer-dropout", type=float, default=DIL_MODEL_DEFAULTS["writer_dropout"])
     parser.add_argument("--nllb-model-name", default="facebook/nllb-200-distilled-600M")
     parser.add_argument("--nllb-src-lang", default="tur_Latn")
     return parser.parse_args()
@@ -320,6 +334,14 @@ def validate_args(args):
         raise ValueError("--text-read-chars must be > 0")
     if args.context_radius < 0:
         raise ValueError("--context-radius must be >= 0")
+    if args.writer_loss_weight < 0.0:
+        raise ValueError("--writer-loss-weight must be >= 0")
+    if args.writer_num_layers <= 0:
+        raise ValueError("--writer-num-layers must be > 0")
+    if args.writer_attention_heads <= 0:
+        raise ValueError("--writer-attention-heads must be > 0")
+    if not 0.0 <= args.writer_dropout < 1.0:
+        raise ValueError("--writer-dropout must be inside [0, 1)")
     if args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
     if args.prefetch_factor <= 0:
@@ -351,12 +373,14 @@ def build_config(args, tokenizer):
         max_word_bytes=args.max_word_bytes,
         context_radius=args.context_radius,
         dil_dropout=args.dil_dropout,
-        kl_clamp=args.kl_clamp,
-        kl_weight=args.kl_weight,
         distillation_weight=args.distillation_weight,
         layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
+        writer_loss_weight=args.writer_loss_weight,
+        writer_num_layers=args.writer_num_layers,
+        writer_attention_heads=args.writer_attention_heads,
+        writer_dropout=args.writer_dropout,
         tokenizer_vocab_file=args.tokenizer_vocab.name,
         nllb_model_name=args.nllb_model_name,
         nllb_src_lang=args.nllb_src_lang,
@@ -396,6 +420,7 @@ def main():
     base_model.train()
     base_model.set_compiled_forwards(
         encoder_forward=compile_forward(base_model.encoder.forward, compile_mode, "DilEncoderCore"),
+        writer_forward=compile_forward(base_model.writer.forward, compile_mode, "DilConditionalWriter"),
     )
     model = base_model
     optimizer = AdamW(
@@ -547,14 +572,16 @@ def main():
     source_lines_seen: set[int] = set()
     metric_sums = {
         "loss": 0.0,
-        "kl": 0.0,
-        "kl_weighted": 0.0,
+        "distill": 0.0,
+        "writer": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
         "geom_l3": 0.0,
         "geom_l4": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
+        "byte_acc": 0.0,
+        "token_exact": 0.0,
     }
     completed_step = start_step
     current_batch = None
@@ -590,6 +617,7 @@ def main():
 
             compute_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
+            cudagraph_step_begin(device, compile_mode)
             with autocast_context(autocast_enabled):
                 outputs = model(**model_inputs(batch))
 
@@ -614,13 +642,15 @@ def main():
             if "source_line_ids" in batch:
                 source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
             metric_sums["loss"] += float(outputs.loss.detach().cpu())
-            metric_sums["kl"] += float(outputs.kl_loss.detach().cpu())
-            metric_sums["kl_weighted"] += float((outputs.kl_loss * config.kl_weight).detach().cpu())
+            metric_sums["distill"] += float(outputs.distill_loss.detach().cpu())
+            metric_sums["writer"] += float(outputs.writer_loss.detach().cpu())
             layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
             for idx in range(4):
                 metric_sums[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
             metric_sums["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
             metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
+            metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
+            metric_sums["token_exact"] += float(outputs.token_exact.detach().cpu())
 
             should_log = step % args.log_every == 0 or step == start_step + 1 or step == args.max_steps
             should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0
@@ -642,6 +672,7 @@ def main():
                             eval_loader,
                             teacher,
                             device,
+                            compile_mode,
                             autocast_enabled,
                             cuda_prefetch,
                             args.max_eval_batches,

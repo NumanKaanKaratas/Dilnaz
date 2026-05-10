@@ -64,6 +64,11 @@ def cuda_sync(device: torch.device):
         torch.cuda.synchronize(device)
 
 
+def cudagraph_step_begin(device: torch.device, compile_mode: str):
+    if device.type == "cuda" and compile_mode != "off":
+        torch.compiler.cudagraph_mark_step_begin()
+
+
 class DeviceBatchPrefetcher:
     def __init__(self, loader, device: torch.device, enabled: bool):
         self.loader_iter = iter(loader)

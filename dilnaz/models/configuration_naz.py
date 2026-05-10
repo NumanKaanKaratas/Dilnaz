@@ -13,20 +13,8 @@ class NazConfig(PretrainedConfig):
         eos_token_id=257,
         max_word_bytes=32,
         latent_size=128,
-        num_mlp_layers=4,
-        num_samples=4,
-        energy_target_samples=100,
-        beta=1.0,
-        noise_size=64,
-        decode_chunk_size=512,
-        num_writer_layers=4,
-        mean_loss_weight=0.25,
-        cosine_loss_weight=0.25,
-        energy_loss_weight=1.0,
-        writer_loss_weight=1.0,
-        writer_target_warmup_steps=200,
-        writer_candidate_start_step=1000,
-        writer_candidate_probability=0.25,
+        reconstruction_loss_weight=1.0,
+        normalizer_epsilon=1e-6,
         repetition_cos_threshold=0.985,
         min_new_tokens=1,
         hidden_size=512,
@@ -62,20 +50,8 @@ class NazConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.max_word_bytes = max_word_bytes
         self.latent_size = latent_size
-        self.num_mlp_layers = num_mlp_layers
-        self.num_samples = num_samples
-        self.energy_target_samples = energy_target_samples
-        self.beta = beta
-        self.noise_size = noise_size
-        self.decode_chunk_size = decode_chunk_size
-        self.num_writer_layers = num_writer_layers
-        self.mean_loss_weight = mean_loss_weight
-        self.cosine_loss_weight = cosine_loss_weight
-        self.energy_loss_weight = energy_loss_weight
-        self.writer_loss_weight = writer_loss_weight
-        self.writer_target_warmup_steps = writer_target_warmup_steps
-        self.writer_candidate_start_step = writer_candidate_start_step
-        self.writer_candidate_probability = writer_candidate_probability
+        self.reconstruction_loss_weight = reconstruction_loss_weight
+        self.normalizer_epsilon = normalizer_epsilon
         self.repetition_cos_threshold = repetition_cos_threshold
         self.min_new_tokens = min_new_tokens
         self.hidden_size = hidden_size
@@ -111,4 +87,3 @@ class NazConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-

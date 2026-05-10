@@ -16,7 +16,7 @@ from models.modeling_dil import Dil
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 16
+CHECKPOINT_FORMAT_VERSION = 17
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -133,9 +133,16 @@ def load_model(checkpoint_dir: Path, device: torch.device):
 
 @torch.no_grad()
 def encode_tokens(model: Dil, input_ids: torch.Tensor, word_masks: torch.Tensor):
-    latent_states = model.encode(input_ids=input_ids, word_masks=word_masks)
-    mean, _ = torch.chunk(latent_states, 2, dim=-1)
-    return mean.float()
+    return model.encode(input_ids=input_ids, word_masks=word_masks).float()
+
+
+@torch.no_grad()
+def decode_tokens(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor) -> list[str]:
+    token_ids, _, _ = model.decode_semantic(latents)
+    return [
+        tokenizer.decode([int(token_id) for token_id in row.tolist()])
+        for row in token_ids
+    ]
 
 
 def similarity_matrix(latents: torch.Tensor) -> list[list[float]]:
@@ -232,6 +239,7 @@ def main():
     decoded_tokens = [tokenizer.decode(segment.token_ids) for segment in segments]
     input_ids, word_masks, byte_lengths = make_batch(segments, tokenizer, config, device)
     latents = encode_tokens(model, input_ids, word_masks)
+    roundtrip_tokens = decode_tokens(model, tokenizer, latents)
     similarities = similarity_matrix(latents)
     mapping = build_auto_mapping(tokens, similarities)
 
@@ -256,6 +264,7 @@ def main():
                 f"[{idx}]",
                 decoded_tokens[idx],
                 str(byte_lengths[idx]),
+                roundtrip_tokens[idx],
                 str(mapping.get(idx, idx)),
             ]
         )
@@ -264,12 +273,11 @@ def main():
             "index",
             "target",
             "piece_len",
+            "writer",
             "mapped_source",
         ],
         rows,
     )
-    print()
-    print("DIL encoder-only: surface writing is handled by NAZ writer.")
 
 
 if __name__ == "__main__":

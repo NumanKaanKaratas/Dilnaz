@@ -17,19 +17,22 @@ class DilConfig(PretrainedConfig):
         max_word_bytes=32,
         context_radius=2,
         dil_dropout=0.15,
-        kl_clamp=0.5,
-        kl_weight=1e-3,
         distillation_weight=16.0,
         layer_geometry_weight=4.0,
         mean_geometry_weight=8.0,
         variance_weight=0.05,
+        writer_loss_weight=1.0,
+        writer_num_layers=4,
+        writer_attention_heads=8,
+        writer_dropout=0.1,
+        decoder_start_token_id=None,
         tokenizer_vocab_file="hybrid_surface_vocab.json",
         nllb_model_name="facebook/nllb-200-distilled-600M",
         nllb_src_lang="tur_Latn",
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=16,
+        checkpoint_format_version=17,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:
@@ -51,12 +54,15 @@ class DilConfig(PretrainedConfig):
         self.context_size = context_radius + 1
         self.target_index = context_radius
         self.dil_dropout = dil_dropout
-        self.kl_clamp = kl_clamp
-        self.kl_weight = kl_weight
         self.distillation_weight = distillation_weight
         self.layer_geometry_weight = layer_geometry_weight
         self.mean_geometry_weight = mean_geometry_weight
         self.variance_weight = variance_weight
+        self.writer_loss_weight = writer_loss_weight
+        self.writer_num_layers = writer_num_layers
+        self.writer_attention_heads = writer_attention_heads
+        self.writer_dropout = writer_dropout
+        self.decoder_start_token_id = eos_token_id if decoder_start_token_id is None else decoder_start_token_id
         self.tokenizer_vocab_file = tokenizer_vocab_file
         self.nllb_model_name = nllb_model_name
         self.nllb_src_lang = nllb_src_lang
@@ -68,5 +74,6 @@ class DilConfig(PretrainedConfig):
         super().__init__(
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
+            decoder_start_token_id=self.decoder_start_token_id,
             **kwargs,
         )

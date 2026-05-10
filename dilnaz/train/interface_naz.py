@@ -14,7 +14,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 21
+CHECKPOINT_FORMAT_VERSION = 22
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -82,9 +82,6 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
     model.dil_model.set_compiled_forwards(
         encoder_forward=compile_forward(model.dil_model.encoder.forward, compile_mode, "DilEncoderCore"),
     )
-    model.set_compiled_writer_forward(
-        compile_forward(model.writer.forward, compile_mode, "NazLatentWriter")
-    )
     model.eval()
     dil_config = DilConfig.from_pretrained(dil_path)
     tokenizer = HybridTokenizer.from_file(dil_path / dil_config.tokenizer_vocab_file)
@@ -99,14 +96,11 @@ def stream_text(
     prompt_segments: list[TokenSegment],
     device: torch.device,
     max_new_tokens: int,
-    num_samples: int,
     min_new_tokens: int,
     repetition_cos_threshold: float,
 ):
     if max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be > 0")
-    if num_samples <= 0:
-        raise ValueError("--num-samples must be > 0")
     input_ids, word_masks, unit_mask, _ = make_batch(prompt_segments, tokenizer, config, device)
     prompt_text = "".join(tokenizer.decode(segment.token_ids) for segment in prompt_segments)
     sys.stdout.write(prompt_text)
@@ -116,14 +110,20 @@ def stream_text(
         word_masks=word_masks,
         unit_mask=unit_mask,
         max_new_tokens=max_new_tokens,
-        num_samples=num_samples,
         min_new_tokens=min_new_tokens,
         repetition_cos_threshold=repetition_cos_threshold,
     ):
-        token = decode_token_ids(tokenizer, step.token_ids[0], step.word_masks[0])
+        token_ids, token_masks, lengths = model.dil_model.decode_semantic(step.latent)
+        if int(lengths[0].detach().cpu()) == 0:
+            break
+        token = decode_token_ids(tokenizer, token_ids[0], token_masks[0])
+        if not token and bool(step.should_stop[0].detach().cpu()):
+            break
         if token:
             sys.stdout.write(token)
             sys.stdout.flush()
+        if bool(step.should_stop[0].detach().cpu()):
+            break
     sys.stdout.write("\n")
     sys.stdout.flush()
 
@@ -134,7 +134,6 @@ def parse_args():
     parser.add_argument("--text", type=str, default=None)
     parser.add_argument("--text-file", type=Path, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16)
-    parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--min-new-tokens", type=int, default=None)
     parser.add_argument("--repetition-cos-threshold", type=float, default=None)
     parser.add_argument("--seed", type=int, default=1)
@@ -166,7 +165,6 @@ def main():
         segments,
         device,
         args.max_new_tokens,
-        args.num_samples,
         config.min_new_tokens if args.min_new_tokens is None else args.min_new_tokens,
         config.repetition_cos_threshold if args.repetition_cos_threshold is None else args.repetition_cos_threshold,
     )

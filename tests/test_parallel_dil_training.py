@@ -164,7 +164,7 @@ def test_parallel_total_loss_adds_weighted_alignment_loss():
         [ParallelAlignmentGroup((0,), (1,), 1.0)],
         torch.device("cpu"),
     )
-    outputs = SimpleNamespace(loss=torch.tensor(2.0), mean=mean)
+    outputs = SimpleNamespace(loss=torch.tensor(2.0), semantic=mean)
 
     total, alignment = parallel_total_loss(outputs, batch, 0.25)
 
@@ -195,7 +195,7 @@ def test_parallel_dil_mock_teacher_forward_backward(tmp_path):
 
     assert torch.isfinite(loss)
     assert torch.isfinite(alignment)
-    assert outputs.kl_loss is not None
+    assert outputs.writer_loss is not None
     assert outputs.distill_loss is not None
     assert not hasattr(outputs, "ce_loss")
     assert model.encoder.embed_tokens.weight.grad is not None
@@ -206,6 +206,6 @@ def test_dil_checkpoint_format_matches_encoder_only_family():
     config = tiny_parallel_config(tokenizer)
     model = Dil(config)
 
-    assert config.checkpoint_format_version == 16
-    assert not hasattr(model, "decoder")
-    assert not any(key.startswith("decoder.") for key in model.state_dict())
+    assert config.checkpoint_format_version == 17
+    assert hasattr(model, "writer")
+    assert any(key.startswith("writer.") for key in model.state_dict())

@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import LambdaLR
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from byte_trainer_utils import (
+from byte_trainer_utils import (  # noqa: E402
     COMPILE_MODE_CHOICES,
     DeviceBatchPrefetcher,
     autocast_context,
@@ -27,24 +27,16 @@ from byte_trainer_utils import (
     rng_state,
     validate_compile_environment,
 )
-from dilnaz_config import NAZ_MODEL_DEFAULTS, NAZ_TRAIN_DEFAULTS
-from naz_data import (
-    ResidentNazBatcher,
-    ResidentNazSemanticBatcher,
-    ResidentNazSemanticEvalLoader,
-    StreamingTextNazDataset,
-    build_token_cache,
-    make_naz_loader,
-)
-from models.configuration_dil import DilConfig
-from models.configuration_naz import NazConfig
-from models.modeling_naz import Naz
-from tokenization import HybridTokenizer
+from dilnaz_config import NAZ_MODEL_DEFAULTS, NAZ_TRAIN_DEFAULTS  # noqa: E402
+from models.configuration_dil import DilConfig  # noqa: E402
+from models.configuration_naz import NazConfig  # noqa: E402
+from models.modeling_naz import Naz, NazOutput  # noqa: E402
+from naz_data import PromptAnswerNazDataset, make_naz_loader, stream_prompt_answer_rows  # noqa: E402
+from tokenization import HybridTokenizer  # noqa: E402
 
 
 CHECKPOINT_FORMAT_VERSION = 22
-OBJECTIVE = "lcm_next_dil_latent_mse"
-DATALOADER_WORKER_EXIT = "DataLoader worker"
+OBJECTIVE = "lcm_target_dil_latent_mse"
 
 
 def make_scheduler(optimizer, learning_rate: float, warmup_steps: int):
@@ -65,23 +57,6 @@ def dil_checksum(model: Naz) -> str:
     return digest.hexdigest()
 
 
-def json_training_state(config, step: int, metrics: dict, dil_checksum: str, compile_mode: str):
-    return {
-        "format_version": CHECKPOINT_FORMAT_VERSION,
-        "step": step,
-        "metrics": metrics,
-        "dil_checksum": dil_checksum,
-        "compile_mode": compile_mode,
-        "max_word_bytes": config.max_word_bytes,
-        "latent_size": config.latent_size,
-        "semantic_space": "dil_latent",
-        "objective": OBJECTIVE,
-        "byte_vocab_size": config.byte_vocab_size,
-        "vocab_size": config.vocab_size,
-        "pad_token_id": config.pad_token_id,
-    }
-
-
 def save_checkpoint(
     output_dir: Path,
     model,
@@ -90,14 +65,25 @@ def save_checkpoint(
     config,
     step: int,
     metrics: dict,
-    dil_checksum: str,
+    checksum: str,
     compile_mode: str,
     checkpoint_name: str = "",
 ):
     checkpoint_dir = output_dir / checkpoint_name if checkpoint_name else output_dir
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     config.save_pretrained(checkpoint_dir)
-    state = json_training_state(config, step, metrics, dil_checksum, compile_mode)
+    state = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "objective": OBJECTIVE,
+        "step": step,
+        "metrics": metrics,
+        "dil_checksum": checksum,
+        "compile_mode": compile_mode,
+        "semantic_space": "dil_latent",
+        "latent_size": config.latent_size,
+        "vocab_size": config.vocab_size,
+        "pad_token_id": config.pad_token_id,
+    }
     torch.save(
         {
             "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -128,9 +114,68 @@ def restore_checkpoint(path: Path, model, optimizer, scheduler, device: torch.de
     return int(training_state["step"]), dict(training_state["metrics"])
 
 
-def is_dataloader_worker_exit(error: RuntimeError) -> bool:
-    message = str(error)
-    return DATALOADER_WORKER_EXIT in message and "exited unexpectedly" in message
+def load_init_checkpoint(path: Path, model: Naz, device: torch.device) -> dict:
+    checkpoint = load_checkpoint(path, device)
+    if checkpoint["format_version"] != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(f"unsupported checkpoint format_version={checkpoint.get('format_version')}")
+    model.load_trainable_state_dict(checkpoint["model_state_dict"])
+    return checkpoint.get("training_state", {})
+
+
+def masked_sft_forward(model: Naz, batch: dict) -> NazOutput:
+    unit_mask = batch["unit_mask"]
+    loss_mask = batch["loss_mask"] & unit_mask
+    target_latents, _ = model.target_distribution(
+        batch["target_input_ids"],
+        batch["target_word_masks"],
+        unit_mask,
+    )
+    semantic_states = model.semantic_states(batch["input_ids"], batch["word_masks"], unit_mask)
+    predicted_full = model.predict_semantic_latents(semantic_states, unit_mask)
+    active_predicted = predicted_full[loss_mask]
+    target_full = torch.zeros_like(predicted_full)
+    target_full[unit_mask] = target_latents
+    active_target = target_full[loss_mask]
+
+    if active_target.shape[0] == 0:
+        raise ValueError("prompt-answer batch has no answer targets")
+
+    reconstruction_loss, mse_per_target = model.lcm_mse_loss(active_predicted, active_target)
+    mse_loss = reconstruction_loss
+    mse_mean = mse_per_target.mean()
+    raw_predicted = model.denormalize_latents(active_predicted)
+    raw_target = model.denormalize_latents(active_target)
+    cosine = torch.nn.functional.cosine_similarity(raw_predicted.float(), raw_target.float(), dim=-1)
+    latent_cos = cosine.mean()
+    cosine_loss = (1.0 - cosine).mean()
+    loss = model.reconstruction_loss_weight * reconstruction_loss
+    return NazOutput(
+        loss=loss,
+        reconstruction_loss=reconstruction_loss,
+        mse_loss=mse_loss,
+        mse_mean=mse_mean,
+        cosine_loss=cosine_loss,
+        latent_cos=latent_cos,
+        latent_predictions=predicted_full,
+        predicted_latents=active_predicted,
+        target_latents=active_target,
+        num_targets=torch.tensor(active_target.shape[0], dtype=torch.long, device=predicted_full.device),
+    )
+
+
+@torch.no_grad()
+def evaluate_loss(model, eval_loader, device, compile_mode: str, autocast_enabled: bool, max_batches: int, cuda_prefetch: bool):
+    model.eval()
+    total = {"loss": 0.0, "reconstruction": 0.0, "mse": 0.0, "cosine_loss": 0.0, "latent_cos": 0.0, "targets": 0.0, "batches": 0}
+    for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
+        cudagraph_step_begin(device, compile_mode)
+        with autocast_context(autocast_enabled):
+            outputs = masked_sft_forward(model, batch)
+        add_output_metrics(total, outputs)
+        if batch_idx >= max_batches:
+            break
+    model.train()
+    return {f"eval_{key}": value for key, value in reduce_output_metrics(total).items()}
 
 
 def add_output_metrics(total: dict, outputs):
@@ -158,20 +203,124 @@ def reduce_output_metrics(total: dict) -> dict:
     }
 
 
+def tokenize_prompt(prompt: str, tokenizer: HybridTokenizer, config: NazConfig, device: torch.device):
+    segments = [segment for segment in tokenizer.encode_segments(prompt) if segment.piece_len > 0]
+    input_ids = torch.full((1, len(segments), config.max_word_bytes), config.pad_token_id, dtype=torch.long, device=device)
+    word_masks = torch.zeros_like(input_ids, dtype=torch.bool)
+    for idx, segment in enumerate(segments):
+        token_ids = segment.token_ids
+        if len(token_ids) > config.max_word_bytes:
+            raise ValueError(f"prompt token exceeds max_word_bytes={config.max_word_bytes}")
+        input_ids[0, idx, : len(token_ids)] = torch.tensor(token_ids, dtype=torch.long, device=device)
+        word_masks[0, idx, : len(token_ids)] = True
+    unit_mask = torch.ones((1, len(segments)), dtype=torch.bool, device=device)
+    return input_ids, word_masks, unit_mask
+
+
+def tokenize_prompt_cpu(prompt: str, tokenizer: HybridTokenizer, config: NazConfig):
+    rows = []
+    for segment in tokenizer.encode_segments(prompt):
+        if segment.piece_len <= 0:
+            continue
+        if segment.piece_len > config.max_word_bytes:
+            raise ValueError(f"prompt token exceeds max_word_bytes={config.max_word_bytes}")
+        rows.append(segment.token_ids)
+    if not rows:
+        raise ValueError("prompt produced no tokens")
+    return rows
+
+
+def make_prompt_batch(token_rows: list[list[list[int]]], config: NazConfig, device: torch.device):
+    batch_size = len(token_rows)
+    prompt_length = len(token_rows[0])
+    input_ids = torch.full(
+        (batch_size, prompt_length, config.max_word_bytes),
+        config.pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    word_masks = torch.zeros_like(input_ids, dtype=torch.bool)
+    for row_idx, row in enumerate(token_rows):
+        if len(row) != prompt_length:
+            raise ValueError("batched prompt rows must have equal token lengths")
+        for token_idx, token_ids in enumerate(row):
+            ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+            input_ids[row_idx, token_idx, : ids.numel()] = ids
+            word_masks[row_idx, token_idx, : ids.numel()] = True
+    unit_mask = torch.ones((batch_size, prompt_length), dtype=torch.bool, device=device)
+    return input_ids, word_masks, unit_mask
+
+
+def decode_token_ids(tokenizer: HybridTokenizer, token_ids: torch.Tensor, token_mask: torch.Tensor) -> str:
+    return tokenizer.decode(token_ids[token_mask].detach().cpu().tolist())
+
+
 @torch.no_grad()
-def evaluate(model, eval_loader, device, compile_mode: str, autocast_enabled: bool, max_batches: int, cuda_prefetch: bool):
+def exact_answer_accuracy(
+    model: Naz,
+    eval_file: Path,
+    tokenizer: HybridTokenizer,
+    config: NazConfig,
+    device: torch.device,
+    read_chars: int,
+    max_examples: int,
+    max_new_tokens: int,
+    print_examples: int,
+) -> dict:
     model.eval()
-    total = {"loss": 0.0, "reconstruction": 0.0, "mse": 0.0, "cosine_loss": 0.0, "latent_cos": 0.0, "targets": 0.0, "batches": 0}
-    for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
-        cudagraph_step_begin(device, compile_mode)
-        with autocast_context(autocast_enabled):
-            outputs = run_naz_batch(model, batch)
-        add_output_metrics(total, outputs)
-        if batch_idx >= max_batches:
+    rows_by_prompt_length: dict[int, list[tuple[str, list[list[int]], str]]] = {}
+    for prompt, answer in stream_prompt_answer_rows(eval_file, read_chars):
+        prompt_tokens = tokenize_prompt_cpu(prompt, tokenizer, config)
+        rows_by_prompt_length.setdefault(len(prompt_tokens), []).append((prompt, prompt_tokens, answer.strip()))
+        if sum(len(rows) for rows in rows_by_prompt_length.values()) >= max_examples:
             break
 
+    correct = 0
+    total = 0
+    printed = 0
+    for rows in rows_by_prompt_length.values():
+        prompts = [prompt for prompt, _, _ in rows]
+        answers = [answer for _, _, answer in rows]
+        input_ids, word_masks, unit_mask = make_prompt_batch([tokens for _, tokens, _ in rows], config, device)
+        generated = [""] * len(rows)
+        active = [True] * len(rows)
+        for step in model.generate_stream(
+            input_ids=input_ids,
+            word_masks=word_masks,
+            unit_mask=unit_mask,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=max_new_tokens,
+            repetition_cos_threshold=1.1,
+        ):
+            token_ids, token_masks, lengths = model.dil_model.decode_semantic(step.latent)
+            decoded_lengths = lengths.detach().cpu().tolist()
+            for row_idx, length in enumerate(decoded_lengths):
+                if not active[row_idx]:
+                    continue
+                if int(length) == 0:
+                    active[row_idx] = False
+                    continue
+                generated[row_idx] += decode_token_ids(tokenizer, token_ids[row_idx], token_masks[row_idx])
+            if not any(active):
+                break
+        for prompt, predicted, answer in zip(prompts, generated, answers):
+            stripped = predicted.strip()
+            total += 1
+            exact = stripped == answer
+            correct += int(exact)
+            if printed < print_examples:
+                print(
+                    f"eval_exact_sample idx={total} exact={int(exact)} prompt={prompt!r} "
+                    f"target={answer!r} predicted={stripped!r}",
+                    flush=True,
+                )
+                printed += 1
     model.train()
-    return {f"eval_{key}": value for key, value in reduce_output_metrics(total).items()}
+    return {
+        "eval_exact_answer_acc": correct / max(total, 1),
+        "eval_exact_answer_correct": float(correct),
+        "eval_exact_answer_total": float(total),
+    }
 
 
 def format_log(step: int, metrics: dict) -> str:
@@ -195,53 +344,6 @@ def format_log(step: int, metrics: dict) -> str:
     return " ".join(fields)
 
 
-@torch.no_grad()
-def build_resident_semantic_cache(
-    model: Naz,
-    surface_batcher: ResidentNazBatcher,
-    chunk_tokens: int,
-    autocast_enabled: bool,
-    fit_normalizer: bool = False,
-):
-    model.eval()
-    byte_ids = surface_batcher.byte_ids
-    lengths = surface_batcher.lengths
-    token_count = surface_batcher.token_count
-    positions = surface_batcher.positions.reshape(1, 1, surface_batcher.max_word_bytes)
-    context_radius = model.dil_config.context_radius
-    means = []
-    for start in range(0, token_count, chunk_tokens):
-        end = min(start + chunk_tokens, token_count)
-        context_start = max(0, start - context_radius)
-        context_end = end
-        ids = byte_ids[context_start:context_end].unsqueeze(0)
-        token_lengths = lengths[context_start:context_end].reshape(1, -1, 1)
-        masks = positions < token_lengths
-        unit_mask = torch.ones(ids.shape[:2], dtype=torch.bool, device=ids.device)
-        with autocast_context(autocast_enabled):
-            mean, _ = model.raw_latent_distribution(ids, masks, unit_mask)
-        local_start = start - context_start
-        local_end = local_start + end - start
-        mean = mean.reshape(1, context_end - context_start, -1)[:, local_start:local_end]
-        means.append(mean.squeeze(0).float())
-    mean_cache = torch.cat(means, dim=0)
-    if fit_normalizer:
-        model.latent_normalizer.fit(mean_cache)
-    semantic_states = model.normalize_latents(mean_cache)
-    model.train()
-    return semantic_states, semantic_states, surface_batcher.byte_ids, surface_batcher.lengths
-
-
-def run_naz_batch(model, batch, training_step: int | None = None):
-    if "semantic_states" in batch:
-        return model.forward_semantic(
-            semantic_states=batch["semantic_states"],
-            target_latents=batch["target_mean"],
-            unit_mask=batch["unit_mask"],
-        )
-    return model(**batch, training_step=training_step)
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-file", type=Path, required=True)
@@ -249,12 +351,8 @@ def parse_args():
     parser.add_argument("--dil-checkpoint-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--init-naz-checkpoint", type=Path, default=None)
     parser.add_argument("--compile-mode", choices=COMPILE_MODE_CHOICES, default=None)
-    parser.add_argument(
-        "--data-mode",
-        choices=("streaming", "resident"),
-        default=NAZ_TRAIN_DEFAULTS["data_mode"],
-    )
     parser.add_argument("--max-steps", type=int, default=NAZ_TRAIN_DEFAULTS["max_steps"])
     parser.add_argument("--batch-size", type=int, default=NAZ_TRAIN_DEFAULTS["batch_size"])
     parser.add_argument("--eval-batch-size", type=int, default=NAZ_TRAIN_DEFAULTS["eval_batch_size"])
@@ -266,11 +364,14 @@ def parse_args():
     parser.add_argument("--warmup-steps", type=int, default=NAZ_TRAIN_DEFAULTS["warmup_steps"])
     parser.add_argument("--max-grad-norm", type=float, default=NAZ_TRAIN_DEFAULTS["max_grad_norm"])
     parser.add_argument("--log-every", type=int, default=NAZ_TRAIN_DEFAULTS["log_every"])
-    parser.add_argument("--checkpoint-every", type=int, default=NAZ_TRAIN_DEFAULTS["checkpoint_every"])
     parser.add_argument("--eval-every", type=int, default=NAZ_TRAIN_DEFAULTS["eval_every"])
+    parser.add_argument("--eval-exact-every", type=int, default=0)
+    parser.add_argument("--checkpoint-every", type=int, default=NAZ_TRAIN_DEFAULTS["checkpoint_every"])
     parser.add_argument("--max-eval-batches", type=int, default=NAZ_TRAIN_DEFAULTS["max_eval_batches"])
+    parser.add_argument("--max-exact-eval-examples", type=int, default=100)
+    parser.add_argument("--print-exact-eval-examples", type=int, default=5)
+    parser.add_argument("--max-answer-tokens", type=int, default=8)
     parser.add_argument("--text-read-chars", type=int, default=NAZ_TRAIN_DEFAULTS["text_read_chars"])
-    parser.add_argument("--token-cache-dir", type=Path, default=None)
     parser.add_argument("--num-workers", type=int, default=NAZ_TRAIN_DEFAULTS["num_workers"])
     parser.add_argument("--prefetch-factor", type=int, default=NAZ_TRAIN_DEFAULTS["prefetch_factor"])
     parser.add_argument("--no-cuda-prefetch", action="store_true")
@@ -304,45 +405,30 @@ def validate_args(args):
         raise ValueError("--sequence-length must be > 0")
     if args.text_read_chars <= 0:
         raise ValueError("--text-read-chars must be > 0")
-    if args.max_eval_batches <= 0:
-        raise ValueError("--max-eval-batches must be > 0")
     if args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
     if args.prefetch_factor <= 0:
         raise ValueError("--prefetch-factor must be > 0")
     if args.eval_every < 0 or args.checkpoint_every < 0:
         raise ValueError("--eval-every and --checkpoint-every must be >= 0")
-    if args.eval_every > 0 and args.eval_file is None:
-        raise ValueError("--eval-file is required when --eval-every > 0")
-    if args.resume is None and args.dil_checkpoint_dir is None:
-        raise ValueError("--dil-checkpoint-dir is required when --resume is not set")
+    if args.eval_exact_every < 0:
+        raise ValueError("--eval-exact-every must be >= 0")
+    if args.print_exact_eval_examples < 0:
+        raise ValueError("--print-exact-eval-examples must be >= 0")
     if args.reconstruction_loss_weight < 0.0:
         raise ValueError("--reconstruction-loss-weight must be >= 0")
-    if args.normalizer_epsilon <= 0.0:
-        raise ValueError("--normalizer-epsilon must be > 0")
-    if args.full_attention_interval <= 0:
-        raise ValueError("--full-attention-interval must be > 0")
-    if args.num_attention_heads <= 0 or args.num_key_value_heads <= 0:
-        raise ValueError("--num-attention-heads and --num-key-value-heads must be > 0")
-    if args.num_attention_heads % args.num_key_value_heads != 0:
-        raise ValueError("--num-attention-heads must be divisible by --num-key-value-heads")
-    if args.hidden_size != args.num_attention_heads * args.head_dim:
-        raise ValueError("--hidden-size must equal --num-attention-heads * --head-dim")
-    if args.linear_key_head_dim <= 0 or args.linear_value_head_dim <= 0:
-        raise ValueError("--linear-key-head-dim and --linear-value-head-dim must be > 0")
-    if args.linear_num_key_heads <= 0 or args.linear_num_value_heads <= 0:
-        raise ValueError("--linear-num-key-heads and --linear-num-value-heads must be > 0")
-    if args.linear_conv_kernel_size <= 0:
-        raise ValueError("--linear-conv-kernel-size must be > 0")
-    if args.partial_rotary_factor <= 0.0 or args.partial_rotary_factor > 1.0:
-        raise ValueError("--partial-rotary-factor must be in (0, 1]")
-    if args.rope_theta <= 0.0:
-        raise ValueError("--rope-theta must be > 0")
+    if args.eval_every > 0 and args.eval_file is None:
+        raise ValueError("--eval-file is required when --eval-every > 0")
+    start_sources = sum(value is not None for value in (args.resume, args.init_naz_checkpoint, args.dil_checkpoint_dir))
+    if start_sources != 1:
+        raise ValueError("use exactly one of --resume, --init-naz-checkpoint, or --dil-checkpoint-dir")
 
 
 def build_config(args, dil_config: DilConfig):
     if args.resume is not None:
         return NazConfig.from_pretrained(args.resume.parent)
+    if args.init_naz_checkpoint is not None:
+        return NazConfig.from_pretrained(args.init_naz_checkpoint.parent)
     return NazConfig(
         dil_path=str(args.dil_checkpoint_dir),
         byte_vocab_size=dil_config.byte_vocab_size,
@@ -377,9 +463,9 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    if args.resume is not None:
-        resume_config = NazConfig.from_pretrained(args.resume.parent)
-        dil_checkpoint_dir = Path(resume_config.dil_path)
+    if args.resume is not None or args.init_naz_checkpoint is not None:
+        source_config = NazConfig.from_pretrained((args.resume or args.init_naz_checkpoint).parent)
+        dil_checkpoint_dir = Path(source_config.dil_path)
     else:
         dil_checkpoint_dir = args.dil_checkpoint_dir
     dil_config = DilConfig.from_pretrained(dil_checkpoint_dir)
@@ -393,38 +479,15 @@ def main():
     cuda_prefetch = bool(device.type == "cuda" and not args.no_cuda_prefetch)
     tokenizer = HybridTokenizer.from_file(dil_checkpoint_dir / dil_config.tokenizer_vocab_file)
 
-    token_cache_dir = args.token_cache_dir or args.output_dir / "naz_token_cache"
-    train_cache = None
-    eval_cache = None
-    if args.data_mode == "resident":
-        train_cache = build_token_cache(
-            args.train_file,
-            tokenizer,
-            dil_config.max_word_bytes,
-            dil_config.pad_token_id,
-            args.text_read_chars,
-            token_cache_dir,
-        )
-        if args.eval_every > 0:
-            eval_cache = build_token_cache(
-                args.eval_file,
-                tokenizer,
-                dil_config.max_word_bytes,
-                dil_config.pad_token_id,
-                args.text_read_chars,
-                token_cache_dir,
-            )
-
-    base_model = Naz(config).to(device)
-    base_model.train()
-    initial_dil_checksum = dil_checksum(base_model)
-    base_model.dil_model.set_compiled_forwards(
-        encoder_forward=compile_forward(base_model.dil_model.encoder.forward, compile_mode, "DilEncoderCore"),
+    model = Naz(config).to(device)
+    model.train()
+    initial_dil_checksum = dil_checksum(model)
+    model.dil_model.set_compiled_forwards(
+        encoder_forward=compile_forward(model.dil_model.encoder.forward, compile_mode, "DilEncoderCore"),
     )
-    base_model.set_compiled_student_forward(
-        compile_forward(base_model.student_core.forward, compile_mode, "NazStudentCore")
+    model.set_compiled_student_forward(
+        compile_forward(model.student_core.forward, compile_mode, "NazStudentCore")
     )
-    model = base_model
     optimizer = AdamW(
         (param for param in model.parameters() if param.requires_grad),
         lr=args.learning_rate,
@@ -432,180 +495,99 @@ def main():
         weight_decay=args.weight_decay,
     )
     scheduler = make_scheduler(optimizer, args.learning_rate, args.warmup_steps)
-
     start_step = 0
     last_metrics = {}
     if args.resume is not None:
         start_step, last_metrics = restore_checkpoint(args.resume, model, optimizer, scheduler, device)
-        resume_dil_checksum = dil_checksum(model)
-        expected_checksum = load_checkpoint(args.resume, device)["training_state"]["dil_checksum"]
-        if resume_dil_checksum != expected_checksum:
+        expected = load_checkpoint(args.resume, device)["training_state"]["dil_checksum"]
+        if dil_checksum(model) != expected:
             raise RuntimeError("resumed Dil checksum does not match checkpoint")
-        initial_dil_checksum = resume_dil_checksum
+        initial_dil_checksum = expected
+    elif args.init_naz_checkpoint is not None:
+        init_state = load_init_checkpoint(args.init_naz_checkpoint, model, device)
+        init_objective = init_state.get("objective", "unknown")
+        print(f"initialized_from={args.init_naz_checkpoint} init_objective={init_objective}", flush=True)
+        initial_dil_checksum = dil_checksum(model)
 
-    print(
-        f"device={device.type} bf16={int(autocast_enabled)} compile_mode={compile_mode} "
-        f"data_mode={args.data_mode} objective={OBJECTIVE} resume_step={start_step}",
-        flush=True,
-    )
-
-    if args.data_mode == "resident":
-        train_ids_path, train_lengths_path, train_token_count = train_cache
-        train_surface = ResidentNazBatcher(
-            train_ids_path,
-            train_lengths_path,
-            train_token_count,
+    train_loader = make_naz_loader(
+        PromptAnswerNazDataset(
+            args.train_file,
+            tokenizer,
             dil_config,
             args.sequence_length,
             args.batch_size,
-            device,
-            args.seed + start_step,
-        )
-        semantic_cache = build_resident_semantic_cache(
-            model,
-            train_surface,
-            chunk_tokens=4096,
-            autocast_enabled=autocast_enabled,
-            fit_normalizer=start_step == 0,
-        )
-        if start_step == 0:
-            print("normalizer_fit=resident_train", flush=True)
-        train_iter = ResidentNazSemanticBatcher(
-            *semantic_cache,
-            sequence_length=args.sequence_length,
-            batch_size=args.batch_size,
-            seed=args.seed + start_step,
-        )
-        eval_loader = None
-        if eval_cache is not None:
-            eval_ids_path, eval_lengths_path, eval_token_count = eval_cache
-            eval_surface = ResidentNazBatcher(
-                eval_ids_path,
-                eval_lengths_path,
-                eval_token_count,
-                dil_config,
-                args.sequence_length,
-                args.eval_batch_size,
-                device,
-                args.seed + 1,
-            )
-            eval_loader = ResidentNazSemanticEvalLoader(
-                ResidentNazSemanticBatcher(
-                    *build_resident_semantic_cache(
-                        model,
-                        eval_surface,
-                        chunk_tokens=4096,
-                        autocast_enabled=autocast_enabled,
-                        fit_normalizer=False,
-                    ),
-                    sequence_length=args.sequence_length,
-                    batch_size=args.eval_batch_size,
-                    seed=args.seed + 1,
-                ),
-                batch_size=args.eval_batch_size,
-            )
-    else:
-        train_loader = make_naz_loader(
-            StreamingTextNazDataset(
-                args.train_file,
+            args.text_read_chars,
+            repeat=True,
+        ),
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        prefetch_factor=args.prefetch_factor,
+    )
+    train_iter = DeviceBatchPrefetcher(train_loader, device, cuda_prefetch)
+    eval_loader = None
+    if args.eval_every > 0:
+        eval_loader = make_naz_loader(
+            PromptAnswerNazDataset(
+                args.eval_file,
                 tokenizer,
                 dil_config,
                 args.sequence_length,
-                args.batch_size,
+                args.eval_batch_size,
                 args.text_read_chars,
-                repeat=True,
+                repeat=False,
             ),
             num_workers=args.num_workers,
             pin_memory=device.type == "cuda",
             prefetch_factor=args.prefetch_factor,
         )
-        eval_loader = None
-        if args.eval_every > 0:
-            eval_loader = make_naz_loader(
-                StreamingTextNazDataset(
-                    args.eval_file,
-                    tokenizer,
-                    dil_config,
-                    args.sequence_length,
-                    args.eval_batch_size,
-                    args.text_read_chars,
-                    repeat=False,
-                ),
-                num_workers=args.num_workers,
-                pin_memory=device.type == "cuda",
-                prefetch_factor=args.prefetch_factor,
-            )
-        train_iter = DeviceBatchPrefetcher(train_loader, device, cuda_prefetch)
+
+    print(
+        f"device={device.type} bf16={int(autocast_enabled)} compile_mode={compile_mode} "
+        f"objective={OBJECTIVE} resume_step={start_step}",
+        flush=True,
+    )
+
     log_start = time.perf_counter()
     log_tokens = 0
     log_steps = 0
     data_seconds = 0.0
     transfer_seconds = 0.0
     compute_seconds = 0.0
-    metric_sums = {
-        "loss": 0.0,
-        "reconstruction": 0.0,
-        "mse": 0.0,
-        "cosine_loss": 0.0,
-        "latent_cos": 0.0,
-        "targets": 0.0,
-        "batches": 0,
-    }
+    metric_sums = {"loss": 0.0, "reconstruction": 0.0, "mse": 0.0, "cosine_loss": 0.0, "latent_cos": 0.0, "targets": 0.0, "batches": 0}
     completed_step = start_step
 
-    def save_interrupted():
-        interrupted_dil_checksum = dil_checksum(model)
-        if interrupted_dil_checksum != initial_dil_checksum:
-            raise RuntimeError("frozen Dil checksum changed during training")
-        interrupted_dir = save_checkpoint(
-            args.output_dir,
-            model,
-            optimizer,
-            scheduler,
-            config,
-            completed_step,
-            last_metrics,
-            interrupted_dil_checksum,
-            compile_mode,
-        )
-        print(f"interrupted_saved={interrupted_dir}", flush=True)
+    def save_current():
+        checksum = dil_checksum(model)
+        if checksum != initial_dil_checksum:
+            raise RuntimeError("frozen Dil checksum changed during SFT")
+        path = save_checkpoint(args.output_dir, model, optimizer, scheduler, config, completed_step, last_metrics, checksum, compile_mode)
+        print(f"interrupted_saved={path}", flush=True)
 
     try:
         for step in range(start_step + 1, args.max_steps + 1):
-            data_start = time.perf_counter()
             batch = next(train_iter)
-            if args.data_mode == "resident":
-                data_seconds += time.perf_counter() - data_start
-                transfer_seconds += 0.0
-            else:
-                data_seconds += train_iter.last_data_seconds
-                transfer_seconds += train_iter.last_transfer_seconds
-
+            data_seconds += train_iter.last_data_seconds
+            transfer_seconds += train_iter.last_transfer_seconds
             cuda_sync(device)
             compute_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             cudagraph_step_begin(device, compile_mode)
             with autocast_context(autocast_enabled):
-                outputs = run_naz_batch(model, batch, training_step=step)
-
+                outputs = masked_sft_forward(model, batch)
             outputs.loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                (param for param in model.parameters() if param.requires_grad),
-                args.max_grad_norm,
-            )
+            torch.nn.utils.clip_grad_norm_((param for param in model.parameters() if param.requires_grad), args.max_grad_norm)
             optimizer.step()
             scheduler.step()
             cuda_sync(device)
             compute_seconds += time.perf_counter() - compute_start
             completed_step = step
 
-            real_tokens = int(outputs.num_targets.detach().cpu())
-            log_tokens += real_tokens
+            log_tokens += int(outputs.num_targets.detach().cpu())
             log_steps += 1
             add_output_metrics(metric_sums, outputs)
 
             should_log = step % args.log_every == 0 or step == start_step + 1 or step == args.max_steps
-            should_eval = eval_loader is not None and step % args.eval_every == 0
+            should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0
             if should_log or should_eval:
                 elapsed = max(time.perf_counter() - log_start, 1e-9)
                 averaged = reduce_output_metrics(metric_sums)
@@ -616,17 +598,21 @@ def main():
                 averaged["tokens_per_second"] = log_tokens / elapsed
                 averaged["steps_per_second"] = log_steps / elapsed
                 if should_eval:
-                    averaged.update(
-                        evaluate(
-                            model,
-                            eval_loader,
-                            device,
-                            compile_mode,
-                            autocast_enabled,
-                            args.max_eval_batches,
-                            cuda_prefetch,
+                    averaged.update(evaluate_loss(model, eval_loader, device, compile_mode, autocast_enabled, args.max_eval_batches, cuda_prefetch))
+                    if args.eval_exact_every > 0 and step % args.eval_exact_every == 0:
+                        averaged.update(
+                            exact_answer_accuracy(
+                                model,
+                                args.eval_file,
+                                tokenizer,
+                                config,
+                                device,
+                                args.text_read_chars,
+                                args.max_exact_eval_examples,
+                                args.max_answer_tokens,
+                                args.print_exact_eval_examples,
+                            )
                         )
-                    )
                 print(format_log(step, averaged), flush=True)
                 last_metrics = averaged
                 log_start = time.perf_counter()
@@ -639,46 +625,17 @@ def main():
                     metric_sums[key] = 0.0
 
             if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
-                save_checkpoint(
-                    args.output_dir,
-                    model,
-                    optimizer,
-                    scheduler,
-                    config,
-                    step,
-                    last_metrics,
-                    initial_dil_checksum,
-                    compile_mode,
-                    checkpoint_name=f"checkpoint-{step}",
-                )
+                save_checkpoint(args.output_dir, model, optimizer, scheduler, config, step, last_metrics, initial_dil_checksum, compile_mode, checkpoint_name=f"checkpoint-{step}")
     except KeyboardInterrupt:
-        save_interrupted()
-        return
-    except RuntimeError as error:
-        if not is_dataloader_worker_exit(error):
-            raise
-        save_interrupted()
+        save_current()
         return
 
-    final_dil_checksum = dil_checksum(model)
-    if final_dil_checksum != initial_dil_checksum:
-        raise RuntimeError("frozen Dil checksum changed during training")
-
-    final_dir = save_checkpoint(
-        args.output_dir,
-        model,
-        optimizer,
-        scheduler,
-        config,
-        args.max_steps,
-        last_metrics,
-        final_dil_checksum,
-        compile_mode,
-    )
+    final_checksum = dil_checksum(model)
+    if final_checksum != initial_dil_checksum:
+        raise RuntimeError("frozen Dil checksum changed during SFT")
+    final_dir = save_checkpoint(args.output_dir, model, optimizer, scheduler, config, args.max_steps, last_metrics, final_checksum, compile_mode)
     print(f"saved={final_dir}", flush=True)
 
 
 if __name__ == "__main__":
     main()
-
-

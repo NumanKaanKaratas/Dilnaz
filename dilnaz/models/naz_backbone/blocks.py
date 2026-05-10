@@ -34,6 +34,7 @@ class NazHybridBlock(nn.Module):
         position_ids: torch.LongTensor,
         cache: Optional[NazBackboneLayerCache] = None,
         use_cache: bool = False,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_norm(hidden_states)
@@ -44,9 +45,15 @@ class NazHybridBlock(nn.Module):
                 position_ids=position_ids,
                 cache=cache,
                 use_cache=use_cache,
+                cache_position=cache_position,
             )
         else:
-            hidden_states = self.mixer(hidden_states, cache=cache, use_cache=use_cache)
+            hidden_states = self.mixer(
+                hidden_states,
+                attention_mask=attention_mask,
+                cache=cache,
+                use_cache=use_cache,
+            )
         hidden_states = residual + hidden_states
         hidden_states = hidden_states + self.feedforward(self.post_mixer_norm(hidden_states))
         return hidden_states

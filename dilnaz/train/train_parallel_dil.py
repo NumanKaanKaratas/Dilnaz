@@ -18,6 +18,7 @@ from byte_trainer_utils import (  # noqa: E402
     DeviceBatchPrefetcher,
     autocast_context,
     compile_forward,
+    cudagraph_step_begin,
     cuda_sync,
     effective_compile_mode,
     validate_compile_environment,
@@ -123,12 +124,14 @@ def parse_args():
     parser.add_argument("--max-word-bytes", type=int, default=DIL_MODEL_DEFAULTS["max_word_bytes"])
     parser.add_argument("--context-radius", type=int, default=DIL_MODEL_DEFAULTS["context_radius"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
-    parser.add_argument("--kl-clamp", type=float, default=DIL_MODEL_DEFAULTS["kl_clamp"])
-    parser.add_argument("--kl-weight", type=float, default=DIL_MODEL_DEFAULTS["kl_weight"])
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
     parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
+    parser.add_argument("--writer-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["writer_loss_weight"])
+    parser.add_argument("--writer-num-layers", type=int, default=DIL_MODEL_DEFAULTS["writer_num_layers"])
+    parser.add_argument("--writer-attention-heads", type=int, default=DIL_MODEL_DEFAULTS["writer_attention_heads"])
+    parser.add_argument("--writer-dropout", type=float, default=DIL_MODEL_DEFAULTS["writer_dropout"])
     parser.add_argument("--parallel-alignment-weight", type=float, default=1.0)
     parser.add_argument("--nllb-model-name", default=DEFAULT_PARALLEL_NLLB_MODEL)
     parser.add_argument("--source-lang", default=DEFAULT_SOURCE_LANG)
@@ -150,6 +153,14 @@ def validate_args(args):
         raise ValueError("--parallel-alignment-weight must be >= 0")
     if args.context_radius < 0:
         raise ValueError("--context-radius must be >= 0")
+    if args.writer_loss_weight < 0.0:
+        raise ValueError("--writer-loss-weight must be >= 0")
+    if args.writer_num_layers <= 0:
+        raise ValueError("--writer-num-layers must be > 0")
+    if args.writer_attention_heads <= 0:
+        raise ValueError("--writer-attention-heads must be > 0")
+    if not 0.0 <= args.writer_dropout < 1.0:
+        raise ValueError("--writer-dropout must be inside [0, 1)")
     if args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
     if args.prefetch_factor <= 0:
@@ -175,12 +186,14 @@ def build_config(args, tokenizer):
         max_word_bytes=args.max_word_bytes,
         context_radius=args.context_radius,
         dil_dropout=args.dil_dropout,
-        kl_clamp=args.kl_clamp,
-        kl_weight=args.kl_weight,
         distillation_weight=args.distillation_weight,
         layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
+        writer_loss_weight=args.writer_loss_weight,
+        writer_num_layers=args.writer_num_layers,
+        writer_attention_heads=args.writer_attention_heads,
+        writer_dropout=args.writer_dropout,
         tokenizer_vocab_file=args.tokenizer_vocab.name,
         nllb_model_name=args.nllb_model_name,
         nllb_src_lang=args.source_lang,
@@ -200,14 +213,16 @@ def format_parallel_log(step: int, metrics: dict) -> str:
         f"dil={metrics['dil_loss']:.4f}",
         f"parallel={metrics['parallel']:.4f}",
         f"parallel_w={metrics['parallel_weighted']:.4f}",
-        f"kl={metrics['kl']:.2f}",
-        f"kl_w={metrics['kl_weighted']:.4f}",
+        f"distill={metrics['distill']:.4f}",
+        f"writer={metrics['writer']:.4f}",
         f"geom_l1={metrics['geom_l1']:.4f}",
         f"geom_l2={metrics['geom_l2']:.4f}",
         f"geom_l3={metrics['geom_l3']:.4f}",
         f"geom_l4={metrics['geom_l4']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
+        f"byte_acc={metrics['byte_acc']:.4f}",
+        f"token_exact={metrics['token_exact']:.4f}",
         f"align_groups={metrics['align_groups']:.1f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
@@ -229,14 +244,16 @@ def empty_metric_sums() -> dict[str, float]:
         "dil_loss": 0.0,
         "parallel": 0.0,
         "parallel_weighted": 0.0,
-        "kl": 0.0,
-        "kl_weighted": 0.0,
+        "distill": 0.0,
+        "writer": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
         "geom_l3": 0.0,
         "geom_l4": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
+        "byte_acc": 0.0,
+        "token_exact": 0.0,
         "align_groups": 0.0,
     }
 
@@ -246,13 +263,15 @@ def accumulate_metrics(metric_sums: dict[str, float], loss, outputs, parallel_lo
     metric_sums["dil_loss"] += float(outputs.loss.detach().cpu())
     metric_sums["parallel"] += float(parallel_loss.detach().cpu())
     metric_sums["parallel_weighted"] += float((parallel_loss * weight).detach().cpu())
-    metric_sums["kl"] += float(outputs.kl_loss.detach().cpu())
-    metric_sums["kl_weighted"] += float((outputs.kl_loss * config.kl_weight).detach().cpu())
+    metric_sums["distill"] += float(outputs.distill_loss.detach().cpu())
+    metric_sums["writer"] += float(outputs.writer_loss.detach().cpu())
     layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
     for idx in range(4):
         metric_sums[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
     metric_sums["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
+    metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
+    metric_sums["token_exact"] += float(outputs.token_exact.detach().cpu())
     metric_sums["align_groups"] += float(batch["parallel_alignment_scores"].shape[0])
 
 
@@ -262,6 +281,7 @@ def evaluate_parallel(
     eval_loader,
     teacher: ParallelNllbTeacher,
     device,
+    compile_mode: str,
     autocast_enabled: bool,
     cuda_prefetch: bool,
     max_batches: int,
@@ -272,6 +292,7 @@ def evaluate_parallel(
     batches = 0
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
         teacher.materialize(batch)
+        cudagraph_step_begin(device, compile_mode)
         with autocast_context(autocast_enabled):
             outputs = model(**model_inputs(batch))
             loss, parallel_loss = parallel_total_loss(outputs, batch, parallel_alignment_weight)
@@ -311,6 +332,7 @@ def main():
     base_model.train()
     base_model.set_compiled_forwards(
         encoder_forward=compile_forward(base_model.encoder.forward, compile_mode, "DilEncoderCore"),
+        writer_forward=compile_forward(base_model.writer.forward, compile_mode, "DilConditionalWriter"),
     )
     model = base_model
     optimizer = AdamW(
@@ -410,6 +432,7 @@ def main():
             batch = current_batch
             compute_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
+            cudagraph_step_begin(device, compile_mode)
             with autocast_context(autocast_enabled):
                 outputs = model(**model_inputs(batch))
                 loss, parallel_loss = parallel_total_loss(outputs, batch, args.parallel_alignment_weight)
@@ -461,6 +484,7 @@ def main():
                             eval_loader,
                             teacher,
                             device,
+                            compile_mode,
                             autocast_enabled,
                             cuda_prefetch,
                             args.max_eval_batches,

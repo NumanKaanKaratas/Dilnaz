@@ -20,6 +20,7 @@ class NazBackboneOutput:
 class NazSemanticBackbone(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         if config.full_attention_interval <= 0:
             raise ValueError("full_attention_interval must be > 0")
         if config.num_attention_heads % config.num_key_value_heads != 0:
@@ -45,10 +46,22 @@ class NazSemanticBackbone(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[NazBackboneCache] = None,
         use_cache: bool = False,
+        max_cache_length: Optional[int] = None,
     ) -> NazBackboneOutput:
-        if use_cache and past_key_values is None:
-            past_key_values = NazBackboneCache.empty(len(self.layers))
         batch_size, sequence_length, _ = inputs_embeds.shape
+        if use_cache and past_key_values is None:
+            past_key_values = NazBackboneCache.empty(
+                len(self.layers),
+                batch_size=batch_size,
+                max_cache_length=max_cache_length,
+                num_key_value_heads=self.config.num_key_value_heads,
+                head_dim=self.config.head_dim,
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+                global_layer_indices=tuple(
+                    idx for idx, layer_type in enumerate(self.layer_types) if layer_type == "global"
+                ),
+            )
         if position_ids is None:
             start = past_key_values.position if past_key_values is not None else 0
             position_ids = torch.arange(
@@ -59,6 +72,7 @@ class NazSemanticBackbone(nn.Module):
             position_ids = position_ids.expand(batch_size, sequence_length)
 
         hidden_states = inputs_embeds
+        cache_position = past_key_values.position if past_key_values is not None else 0
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = past_key_values.layers[layer_idx] if past_key_values is not None else None
             hidden_states = layer(
@@ -67,6 +81,7 @@ class NazSemanticBackbone(nn.Module):
                 position_ids=position_ids,
                 cache=layer_cache,
                 use_cache=use_cache,
+                cache_position=cache_position,
             )
         hidden_states = self.norm(hidden_states)
         if use_cache and past_key_values is not None:

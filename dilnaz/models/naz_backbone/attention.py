@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -51,6 +50,7 @@ class SemanticGlobalAttention(nn.Module):
         position_ids: torch.LongTensor,
         cache: Optional[NazBackboneLayerCache] = None,
         use_cache: bool = False,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         batch_size, query_length, _ = hidden_states.shape
         query_states = self.q_norm(self._shape_q(self.q_proj(hidden_states)))
@@ -59,31 +59,45 @@ class SemanticGlobalAttention(nn.Module):
         query_states, key_states = self.rotary(query_states, key_states, position_ids)
 
         if use_cache and cache is not None:
-            if cache.key is not None:
-                key_states = torch.cat((cache.key, key_states), dim=1)
-                value_states = torch.cat((cache.value, value_states), dim=1)
-            cache.key = key_states
-            cache.value = value_states
-
-        key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=2)
-        value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=2)
-        scores = torch.einsum("bthd,bshd->bhts", query_states, key_states) * self.scale
+            cache_start = cache_position
+            cache_end = cache_start + query_length
+            cache.ensure_kv_capacity(
+                batch_size,
+                cache_end,
+                self.num_key_value_heads,
+                self.head_dim,
+                key_states.device,
+                key_states.dtype,
+            )
+            cache.key[:, cache_start:cache_end].copy_(key_states)
+            cache.value[:, cache_start:cache_end].copy_(value_states)
+            key_states = cache.key[:, :cache_end]
+            value_states = cache.value[:, :cache_end]
 
         key_length = key_states.shape[1]
         key_positions = torch.arange(key_length, device=hidden_states.device)
-        causal_mask = key_positions.view(1, 1, 1, key_length) <= position_ids.view(
+        attention_mask_4d = key_positions.view(1, 1, 1, key_length) <= position_ids.view(
             batch_size,
             1,
             query_length,
             1,
         )
-        scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
         if attention_mask is not None and attention_mask.shape[1] == key_length:
-            scores = scores.masked_fill(~attention_mask[:, None, None, :], torch.finfo(scores.dtype).min)
+            attention_mask_4d = attention_mask_4d & attention_mask[:, None, None, :]
 
-        attn = torch.softmax(scores.float(), dim=-1).to(hidden_states.dtype)
-        attn = F.dropout(attn, p=self.dropout, training=self.training)
-        output = torch.einsum("bhts,bshd->bthd", attn, value_states)
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        output = F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask_4d,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+            scale=self.scale,
+            enable_gqa=self.num_key_value_groups > 1,
+        ).transpose(1, 2)
         gate = torch.sigmoid(self._shape_q(self.gate_proj(hidden_states)))
         output = (output * gate).reshape(batch_size, query_length, self.num_heads * self.head_dim)
         return self.o_proj(output)

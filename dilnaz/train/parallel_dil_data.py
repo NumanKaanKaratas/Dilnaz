@@ -668,7 +668,7 @@ def parallel_alignment_loss(mean: torch.Tensor, batch: dict) -> torch.Tensor:
 def parallel_total_loss(outputs, batch: dict, parallel_alignment_weight: float) -> tuple[torch.Tensor, torch.Tensor]:
     if outputs.loss is None:
         raise ValueError("DIL outputs.loss is required for parallel training")
-    alignment_loss = parallel_alignment_loss(outputs.mean, batch)
+    alignment_loss = parallel_alignment_loss(outputs.semantic, batch)
     return outputs.loss + alignment_loss * parallel_alignment_weight, alignment_loss
 
 
