@@ -629,6 +629,37 @@ def test_naz_hybrid_backbone_uses_native_layer_pattern(tmp_path):
     assert isinstance(model.transformer.layers[-1].feedforward, SparseMoEFeedForward)
 
 
+def test_sparse_moe_selected_expert_dispatch_matches_dense_reference():
+    torch.manual_seed(7)
+    moe = SparseMoEFeedForward(
+        hidden_size=6,
+        shared_intermediate_size=10,
+        expert_intermediate_size=8,
+        num_experts=5,
+        top_k=2,
+    ).eval()
+    hidden_states = torch.randn(3, 4, 6, requires_grad=True)
+
+    output, balance_loss, usage = moe(hidden_states)
+
+    flat_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    router_probs = torch.softmax(moe.router(flat_states).float(), dim=-1).to(hidden_states.dtype)
+    top_weights, top_indices = torch.topk(router_probs, k=moe.top_k, dim=-1)
+    top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(top_weights.dtype).eps)
+    route_weights = flat_states.new_zeros(flat_states.shape[0], moe.num_experts)
+    route_weights.scatter_add_(dim=1, index=top_indices, src=top_weights)
+    expert_gate = torch.einsum("th,eih->tei", flat_states, moe.expert_gate_weight)
+    expert_up = torch.einsum("th,eih->tei", flat_states, moe.expert_up_weight)
+    expert_hidden = torch.nn.functional.silu(expert_gate) * expert_up
+    expert_output = torch.einsum("tei,ehi->teh", expert_hidden, moe.expert_down_weight)
+    dense_routed = torch.sum(expert_output * route_weights.unsqueeze(-1), dim=1)
+    expected = moe.shared(hidden_states) + dense_routed.reshape_as(hidden_states)
+
+    assert torch.allclose(output, expected, atol=1e-6)
+    assert torch.isfinite(balance_loss)
+    assert usage.shape == (moe.num_experts,)
+
+
 def test_naz_global_attention_uses_sdpa_without_expanding_gqa_cache():
     root = Path(__file__).resolve().parents[1]
     source = (root / "dilnaz" / "models" / "naz_backbone" / "attention.py").read_text(encoding="utf-8")
@@ -1213,6 +1244,7 @@ def test_streaming_text_naz_dataset_reads_plain_text_without_cache(tmp_path):
     assert batch["target_word_masks"].dtype == torch.bool
     assert batch["target_mask"].shape == (2, 3, 3)
     assert batch["unit_mask"].all()
+    assert batch["attention_mask"] is None
     assert not any(tmp_path.glob("*.npy"))
 
 
@@ -1300,6 +1332,71 @@ def test_naz_sft_forward_uses_answer_loss_mask(tmp_path):
     assert torch.isfinite(outputs.loss)
     assert int(outputs.num_targets) == 1
     assert outputs.predicted_latents.shape == (1, dil_config.latent_size)
+
+
+def test_naz_live_batch_latents_uses_single_extended_dil_pass(tmp_path):
+    dil_config = tiny_config()
+    dil_model = Dil(dil_config)
+    dil_config.save_pretrained(tmp_path)
+    torch.save(
+        {
+            "format_version": dil_config.checkpoint_format_version,
+            "model_state_dict": dil_model.state_dict(),
+        },
+        tmp_path / "checkpoint.pt",
+    )
+    model = Naz(tiny_naz_config(tmp_path, dil_config))
+    extended_ids = torch.tensor(
+        [[[2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0], [5, 0, 0, 0], [6, 0, 0, 0], [1, 0, 0, 0]]],
+        dtype=torch.long,
+    )
+    horizons = model.config.mtp_horizons
+    sequence_length = 3
+    input_ids = extended_ids[:, :sequence_length]
+    word_masks = input_ids.ne(dil_config.pad_token_id)
+    target_positions = torch.arange(sequence_length).view(1, sequence_length, 1) + torch.arange(
+        1,
+        horizons + 1,
+    ).view(1, 1, horizons)
+    target_input_ids = extended_ids.gather(
+        dim=1,
+        index=target_positions.reshape(1, sequence_length * horizons, 1).expand(
+            1,
+            -1,
+            dil_config.max_word_bytes,
+        ),
+    ).reshape(1, sequence_length, horizons, dil_config.max_word_bytes)
+    target_word_masks = target_input_ids.ne(dil_config.pad_token_id)
+    unit_mask = torch.ones(1, sequence_length, dtype=torch.bool)
+    target_mask = torch.ones(1, sequence_length, horizons, dtype=torch.bool)
+
+    semantic_states, target_latents = model.live_batch_latents(
+        input_ids,
+        word_masks,
+        target_input_ids,
+        target_word_masks,
+        unit_mask,
+        target_mask,
+    )
+    expected_source = model.semantic_states(
+        input_ids,
+        word_masks,
+        unit_mask,
+    )
+    expected_targets = model.semantic_states(
+        extended_ids,
+        extended_ids.ne(dil_config.pad_token_id),
+        torch.ones(1, sequence_length + horizons, dtype=torch.bool),
+    )
+
+    assert torch.allclose(semantic_states, expected_source, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(target_latents[:, :, 0], expected_targets[:, 1 : sequence_length + 1], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(
+        target_latents[:, :, -1],
+        expected_targets[:, horizons : sequence_length + horizons],
+        atol=1e-6,
+        rtol=1e-5,
+    )
 
 
 def test_naz_sft_exact_eval_stops_at_writer_eos(tmp_path, capsys):

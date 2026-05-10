@@ -55,16 +55,35 @@ class SparseMoEFeedForward(nn.Module):
         top_weights, top_indices = torch.topk(router_probs, k=self.top_k, dim=-1)
         top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(top_weights.dtype).eps)
 
-        route_weights = flat_states.new_zeros(flat_states.shape[0], self.num_experts)
-        route_weights.scatter_add_(dim=1, index=top_indices, src=top_weights)
-        expert_gate = torch.einsum("th,eih->tei", flat_states, self.expert_gate_weight)
-        expert_up = torch.einsum("th,eih->tei", flat_states, self.expert_up_weight)
-        expert_hidden = F.silu(expert_gate) * expert_up
-        expert_output = torch.einsum("tei,ehi->teh", expert_hidden, self.expert_down_weight)
-        routed = torch.sum(expert_output * route_weights.unsqueeze(-1), dim=1)
+        token_indices = torch.arange(flat_states.shape[0], device=flat_states.device).unsqueeze(1).expand_as(top_indices)
+        token_indices = token_indices.reshape(-1)
+        selected_experts = top_indices.reshape(-1)
+        selected_weights = top_weights.reshape(-1)
+        sorted_order = torch.argsort(selected_experts)
+        selected_experts = selected_experts.index_select(0, sorted_order)
+        token_indices = token_indices.index_select(0, sorted_order)
+        selected_weights = selected_weights.index_select(0, sorted_order)
+
+        routed = flat_states.new_zeros(flat_states.shape)
+        expert_counts = torch.bincount(selected_experts, minlength=self.num_experts)
+        expert_offsets = expert_counts.cumsum(dim=0)
+        start = 0
+        for expert_idx, end_tensor in enumerate(expert_offsets):
+            end = int(end_tensor.item())
+            if end == start:
+                continue
+            current_tokens = token_indices[start:end]
+            expert_input = flat_states.index_select(0, current_tokens)
+            gate = F.linear(expert_input, self.expert_gate_weight[expert_idx])
+            up = F.linear(expert_input, self.expert_up_weight[expert_idx])
+            expert_hidden = F.silu(gate) * up
+            expert_output = F.linear(expert_hidden, self.expert_down_weight[expert_idx])
+            expert_output = expert_output * selected_weights[start:end].unsqueeze(-1)
+            routed.index_add_(0, current_tokens, expert_output)
+            start = end
 
         usage = router_probs.float().mean(dim=0)
-        load = route_weights.gt(0).float().mean(dim=0)
+        load = expert_counts.to(dtype=torch.float32) / flat_states.shape[0]
         uniform = self._uniform_usage.to(device=usage.device, dtype=usage.dtype)
         balance_loss = (
             usage * (usage.clamp_min(1e-8).log() - uniform.log())

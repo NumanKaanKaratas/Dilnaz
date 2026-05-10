@@ -127,12 +127,14 @@ def masked_sft_forward(model: Naz, batch: dict) -> NazOutput:
     loss_mask = batch["loss_mask"] & batch["target_mask"] & unit_mask.unsqueeze(-1)
     if not bool(loss_mask.any().detach().cpu()):
         raise ValueError("prompt-answer batch has no answer targets")
-    target_latents = model.target_horizon_distribution(
+    semantic_states, target_latents = model.live_batch_latents(
+        batch["input_ids"],
+        batch["word_masks"],
         batch["target_input_ids"],
         batch["target_word_masks"],
+        unit_mask,
         batch["target_mask"],
     )
-    semantic_states = model.semantic_states(batch["input_ids"], batch["word_masks"], unit_mask)
     return model.forward_semantic(
         semantic_states=semantic_states,
         target_latents=target_latents,

@@ -13,6 +13,8 @@ from .configuration_naz import NazConfig
 from .modeling_dil import Dil, angular_noise_like, normalize_semantic_latents
 from .naz_backbone import NazBackboneCache, NazSemanticBackbone
 
+_DEFAULT_ATTENTION_MASK = object()
+
 
 @dataclass
 class NazOutput(ModelOutput):
@@ -149,13 +151,14 @@ class NazStudentCore(nn.Module):
         self,
         semantic_states: torch.Tensor,
         unit_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[NazBackboneCache] = None,
         use_cache: bool = False,
     ):
         inputs_embeds = self.embed_semantic_states(semantic_states)
         output = self.backbone(
             inputs_embeds=inputs_embeds,
-            attention_mask=unit_mask,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
         )
@@ -345,6 +348,83 @@ class Naz(PreTrainedModel):
         ]
         return torch.stack(horizon_latents, dim=2)
 
+    def live_batch_latents(
+        self,
+        input_ids: torch.LongTensor,
+        word_masks: torch.Tensor,
+        target_input_ids: torch.LongTensor,
+        target_word_masks: torch.Tensor,
+        unit_mask: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, sequence_length = self.validate_byte_inputs(input_ids)
+        if target_input_ids.dim() != 4:
+            raise ValueError("target_input_ids must be shaped [batch, sequence, horizons, bytes]")
+        if target_word_masks.shape != target_input_ids.shape:
+            raise ValueError("target_word_masks must match target_input_ids")
+        if target_mask.shape != target_input_ids.shape[:3]:
+            raise ValueError("target_mask must be shaped [batch, sequence, horizons]")
+        if target_input_ids.shape[:2] != (batch_size, sequence_length):
+            raise ValueError("target_input_ids must share input batch and sequence dimensions")
+
+        horizons = target_input_ids.shape[2]
+        byte_width = target_input_ids.shape[3]
+        last_source = unit_mask.long().sum(dim=1).clamp_min(1) - 1
+        tail_index = last_source.view(batch_size, 1, 1, 1).expand(-1, 1, horizons, byte_width)
+        tail_ids = target_input_ids.gather(dim=1, index=tail_index).squeeze(1)
+        tail_word_masks = target_word_masks.gather(dim=1, index=tail_index).squeeze(1)
+        tail_mask = target_mask.gather(
+            dim=1,
+            index=last_source.view(batch_size, 1, 1).expand(-1, 1, horizons),
+        ).squeeze(1)
+
+        extended_ids = torch.cat((input_ids, tail_ids), dim=1)
+        extended_word_masks = torch.cat((word_masks, tail_word_masks), dim=1)
+        extended_unit_mask = torch.cat((unit_mask, tail_mask), dim=1)
+        source_context_ids, source_context_masks, source_active = self.dil_context_inputs(input_ids, word_masks, unit_mask)
+        target_context_ids, target_context_masks, target_active = self.dil_context_inputs(
+            extended_ids,
+            extended_word_masks,
+            extended_unit_mask,
+        )
+        source_count = source_context_ids.shape[0]
+        encoded = self.dil_model.encode(
+            input_ids=torch.cat((source_context_ids, target_context_ids), dim=0),
+            word_masks=torch.cat((source_context_masks, target_context_masks), dim=0),
+        ).float()
+        source_mean = encoded[:source_count]
+        target_mean = encoded[source_count:]
+
+        source_semantic = torch.zeros(
+            (batch_size * sequence_length, self.config.latent_size),
+            dtype=source_mean.dtype,
+            device=source_mean.device,
+        )
+        source_semantic[source_active] = source_mean
+        source_semantic = source_semantic.reshape(batch_size, sequence_length, self.config.latent_size)
+
+        extended_semantic = torch.zeros(
+            (batch_size * (sequence_length + horizons), self.config.latent_size),
+            dtype=target_mean.dtype,
+            device=target_mean.device,
+        )
+        extended_semantic[target_active] = target_mean
+        extended_semantic = extended_semantic.reshape(batch_size, sequence_length + horizons, self.config.latent_size)
+
+        horizon_positions = (
+            torch.arange(sequence_length, device=input_ids.device).view(1, sequence_length, 1)
+            + torch.arange(1, horizons + 1, device=input_ids.device).view(1, 1, horizons)
+        )
+        target_latents = extended_semantic.gather(
+            dim=1,
+            index=horizon_positions.reshape(1, sequence_length * horizons, 1).expand(
+                batch_size,
+                -1,
+                self.config.latent_size,
+            ),
+        ).reshape(batch_size, sequence_length, horizons, self.config.latent_size)
+        return source_semantic, target_latents
+
     def semantic_states(
         self,
         input_ids: torch.LongTensor,
@@ -376,26 +456,29 @@ class Naz(PreTrainedModel):
         self,
         semantic_states: torch.Tensor,
         unit_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         compiled_forward = getattr(self, "_student_core_forward", None)
         if compiled_forward is not None:
-            return compiled_forward(semantic_states, unit_mask)
-        return self.student_core(semantic_states, unit_mask)
+            return compiled_forward(semantic_states, unit_mask, attention_mask)
+        return self.student_core(semantic_states, unit_mask, attention_mask=attention_mask)
 
     def predict_semantic_latents(
         self,
         semantic_states: torch.Tensor,
         unit_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self._student_hidden(semantic_states, unit_mask)
+        hidden_states = self._student_hidden(semantic_states, unit_mask, attention_mask=attention_mask)
         return self.semantic_head(hidden_states).selected_latents[:, :, 0].float()
 
     def predict_semantic_dynamics(
         self,
         semantic_states: torch.Tensor,
         unit_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> NazDynamicsOutput:
-        hidden_states = self._student_hidden(semantic_states, unit_mask)
+        hidden_states = self._student_hidden(semantic_states, unit_mask, attention_mask=attention_mask)
         return self.semantic_head(hidden_states)
 
     def training_semantic_states(self, semantic_states: torch.Tensor, unit_mask: torch.Tensor) -> torch.Tensor:
@@ -502,8 +585,14 @@ class Naz(PreTrainedModel):
         target_latents: torch.Tensor,
         unit_mask: torch.Tensor,
         target_mask: Optional[torch.Tensor] = None,
+        attention_mask=_DEFAULT_ATTENTION_MASK,
     ) -> NazOutput:
-        dynamics = self.predict_semantic_dynamics(self.training_semantic_states(semantic_states, unit_mask), unit_mask)
+        student_attention_mask = unit_mask if attention_mask is _DEFAULT_ATTENTION_MASK else attention_mask
+        dynamics = self.predict_semantic_dynamics(
+            self.training_semantic_states(semantic_states, unit_mask),
+            unit_mask,
+            attention_mask=student_attention_mask,
+        )
         if target_mask is None:
             target_mask = unit_mask.unsqueeze(-1).expand(
                 *unit_mask.shape,
@@ -591,15 +680,24 @@ class Naz(PreTrainedModel):
         target_word_masks: torch.Tensor,
         unit_mask: torch.Tensor,
         target_mask: torch.Tensor,
+        attention_mask=_DEFAULT_ATTENTION_MASK,
         training_step: Optional[int] = None,
     ) -> NazOutput:
         del training_step
-        target_latents = self.target_horizon_distribution(target_input_ids, target_word_masks, target_mask)
+        semantic_states, target_latents = self.live_batch_latents(
+            input_ids,
+            word_masks,
+            target_input_ids,
+            target_word_masks,
+            unit_mask,
+            target_mask,
+        )
         return self.forward_semantic(
-            self.semantic_states(input_ids, word_masks, unit_mask),
+            semantic_states,
             target_latents,
             unit_mask,
             target_mask,
+            attention_mask=attention_mask,
         )
 
     @torch.no_grad()

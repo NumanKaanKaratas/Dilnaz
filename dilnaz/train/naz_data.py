@@ -388,6 +388,7 @@ class StreamingTextNazDataset(IterableDataset):
             "target_word_masks": target_word_masks,
             "unit_mask": unit_mask,
             "target_mask": target_mask,
+            "attention_mask": None,
         }
 
     def iter_windows_once(self, worker_id: int, worker_count: int):
