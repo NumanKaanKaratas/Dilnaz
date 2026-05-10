@@ -7,121 +7,154 @@
 ![PyTorch](https://img.shields.io/badge/backend-PyTorch-ee4c2c.svg)
 ![Status: research](https://img.shields.io/badge/status-research-orange.svg)
 
-Dilnaz is a two-stage semantic language modeling research project. Instead of training the autoregressive model to predict the next discrete token directly, Dilnaz trains it to predict the next semantic distribution and then renders that distribution back into surface text.
+Dilnaz is a two-stage semantic language modeling research project. The first model, `DIL`, maps surface text into a normalized continuous semantic latent space and renders latents back into text. The second model, `NAZ`, learns autoregressive dynamics in that semantic space instead of predicting discrete token ids directly.
 
-The core hypothesis is simple: a model that learns the flow of meaning before surface form can generalize differently from a model that only learns token transitions. Words such as `araba`, `otomobil`, and `car` are different byte/token sequences, but they can occupy nearby regions in a multilingual semantic space. Dilnaz is built around that distinction.
+The working idea is:
 
-> :star: **Star the project:** If this research direction is interesting to you, giving the repository a star helps it reach more researchers and builders.
+```text
+surface text -> DIL semantic latent -> NAZ next semantic latent -> DIL writer -> surface text
+```
+
+This is not a tokenizer-only project and it is not a wrapper around an external language model. The runtime tokenizer handles surface segmentation; the semantic learning target is the normalized DIL latent space shaped by reconstruction and NLLB teacher geometry.
 
 ## Architecture
-
-Dilnaz has two models:
 
 ```mermaid
 flowchart LR
     A[Surface text] --> B[HybridTokenizer]
-    B --> C[DIL encoder<br/>surface + context]
-    C --> D[(Semantic distribution<br/>mean + log_std)]
-    D --> E[NAZ semantic backbone<br/>meaning sequence model]
-    E --> F[(Next semantic distribution<br/>pred_mean + pred_log_std)]
-    F --> G[DIL renderer<br/>latent to bytes]
+    B --> C[DIL encoder<br/>surface + symmetric context]
+    C --> D[(Normalized semantic latent)]
+    D --> E[NAZ semantic backbone<br/>semantic dynamics model]
+    E --> F[(Next normalized semantic latent)]
+    F --> G[DIL parallel writer<br/>latent to surface pieces]
     G --> H[Surface text]
-    T[NLLB teacher<br/>multilingual geometry] -. distillation .-> C
-    T -. grouped geometry .-> D
+    T[NLLB encoder<br/>multilingual geometry] -. grouped geometry .-> C
+    T -. mean geometry .-> D
 ```
 
-```text
-surface text
-  -> HybridTokenizer
-  -> DIL: surface/context -> semantic distribution
-  -> NAZ: semantic sequence -> next semantic distribution
-  -> DIL renderer: semantic distribution -> surface text
-```
+The active pipeline has three practical stages:
 
-### DIL
+1. Train `DIL` so surface pieces become semantic latents and can be written back.
+2. Optionally fine-tune only the `DIL` writer from plain text while keeping the encoder contract fixed.
+3. Train `NAZ` from a frozen `DIL` checkpoint so it predicts future semantic latents.
+
+## DIL
 
 `DIL` is the bridge between surface text and semantic space.
 
-It reads hybrid-tokenized text with left context and produces a latent distribution:
+The encoder reads a fixed-width hybrid-tokenized target piece plus symmetric context:
 
 ```text
-surface/context -> encoder -> mean, log_std
+context_radius = 2
+context_size = 2 * context_radius + 1
+target_index = context_radius
 ```
 
-It also renders latent vectors back to byte/surface output:
+The encoder output is normalized to a fixed-radius semantic latent:
 
 ```text
-latent -> renderer -> byte logits + length logits
+semantic_norm = sqrt(latent_size)
 ```
 
-DIL is trained with:
+The current `DIL` model does not expose a learned post-fit semantic normalizer or a `mean/log_std` VAE distribution. The active contract is native normalized latents.
 
-- reconstruction cross entropy
-- length loss
-- KL loss
-- NLLB-based grouped layer geometry distillation
-- mean geometry loss
+`DIL` has two coupled but separable jobs:
+
+- encoder: surface/context -> normalized semantic latent
+- writer: semantic latent -> parallel surface-piece logits with an explicit stop token
+
+Main training losses and metrics:
+
+- NLLB grouped layer geometry loss
+- NLLB mean geometry loss
 - variance regularization
+- writer token cross entropy
+- byte accuracy, token exact match, stop accuracy
 
-This keeps DIL from becoming only a memorizing autoencoder. Reconstruction preserves the written form; NLLB distillation shapes the latent space toward multilingual semantic geometry.
+The writer path is deliberately fed with detached semantic latents during normal DIL training. That keeps surface-writing gradients from changing the semantic encoder path.
 
-### NAZ
+## DIL Writer-Only Training
+
+`train_dil_writer.py` loads an existing DIL checkpoint, freezes the encoder, and trains only the writer on plain text. This is used when surface rendering needs improvement without changing the semantic trunk.
+
+The objective is:
+
+```text
+objective = plain_text_writer_only
+loss = writer token cross entropy
+```
+
+This path uses the same checkpoint family as DIL:
+
+```text
+DIL checkpoint format_version = 21
+```
+
+## NAZ
 
 `NAZ` is the semantic sequence model.
 
-Its target is not a token id. Its target is the next `mean + log_std` semantic distribution produced by a frozen DIL encoder:
+It does not predict token ids. It predicts the next normalized DIL latent, and can train multiple future horizons at once:
 
 ```text
-meaning_1, meaning_2, meaning_3 -> meaning_4
+z_t -> z_(t+1), z_(t+2), z_(t+3)
 ```
 
-During generation, NAZ does not decode generated text and re-encode it. DIL encodes the prompt once, NAZ continues in semantic space, and DIL renders the generated semantic plan at the end or in decode chunks:
+The active objective is:
 
 ```text
-prompt surface -> DIL encoder once -> initial semantic states
-NAZ -> next_mean, next_log_std
-NAZ -> next_mean, next_log_std
-...
-generated means -> DIL renderer -> text
+objective = semantic_dynamics_moe_mtp_v1
 ```
 
-This semantic loop keeps generation focused on meaning flow instead of feeding surface reconstruction errors back into the model.
+The prediction head is a semantic dynamics mixture head:
 
-## Semantic Backbone
+- multiple semantic candidates per horizon
+- router logits over candidates
+- mixture negative log likelihood
+- router responsibility loss
+- candidate usage balance
+- selected-latent MSE and cosine metrics
 
-NAZ uses a native Dilnaz semantic backbone. It is not a wrapper around an external language-model backbone.
-
-The default pattern is:
+The backbone is native Dilnaz code. It alternates cheap semantic mixing with periodic full attention:
 
 ```text
-L0  SemanticDeltaMixer
-L1  SemanticDeltaMixer
-L2  SemanticDeltaMixer
-L3  SemanticGlobalAttention
+SemanticDeltaMixer
+SemanticDeltaMixer
+SemanticDeltaMixer
+SemanticGlobalAttention
 repeat...
 ```
 
-The backbone combines:
+Backbone components include:
 
-- recurrent semantic mixing for long-range flow
-- periodic global attention for direct context access
-- partial rotary embeddings
-- zero-centered RMS normalization
-- gated feed-forward layers
-- explicit generation cache
+- `ZeroCenteredRMSNorm`
+- `PartialRotaryEmbedding`
+- `SemanticDeltaMixer`
+- `SemanticGlobalAttention`
+- `SparseMoEFeedForward`
+- `NazBackboneCache`
 
-The backbone operates over semantic vectors, not vocabulary logits.
+Generation is a semantic loop. The prompt is encoded by DIL once. After that, generated surface text is not fed back into the encoder:
+
+```text
+prompt surface -> DIL encoder -> prompt latents
+NAZ -> next latent
+NAZ -> next latent
+DIL writer -> surface text
+```
 
 ## Hybrid Tokenizer
 
-Dilnaz uses a hybrid surface tokenizer:
+Dilnaz owns its runtime tokenizer in `dilnaz/tokenization`.
 
-- byte fallback for coverage
-- compact surface pieces for frequent forms
-- fixed-width segment encoding through `max_word_bytes`
-- preserved punctuation and spacing behavior
+The tokenizer provides:
 
-The tokenizer is a surface interface. It does not define semantic meaning by itself. Semantic alignment is learned by DIL through reconstruction and NLLB teacher geometry.
+- byte fallback
+- compact surface pieces for common forms
+- leading-space variants for boundary-aware decoding
+- numeric, punctuation, common-word, contextual and character pieces
+- fixed-width segment tensors through `max_word_bytes`
+- roundtrip decoding tests for Turkish text, digits, punctuation and JSONL newline escapes
 
 Default vocabulary:
 
@@ -129,120 +162,278 @@ Default vocabulary:
 dilnaz/tokenization/hybrid_surface_vocab.json
 ```
 
-## Why NLLB?
+The tokenizer is a surface contract. It does not decide semantic meaning. Semantic geometry comes from DIL training and NLLB teacher supervision.
 
-NLLB is used as a multilingual semantic teacher. Dilnaz needs a semantic space where related meanings can be close even when surface forms differ across languages.
+## Data Formats
 
-DIL does not use NLLB as a decoder. It uses NLLB encoder representations as a geometry target:
+Text training files can be plain text or JSONL.
+
+Plain text:
 
 ```text
-NLLB encoder layers -> grouped geometry targets -> DIL layer vectors + latent mean
+Bir cumle.
+Baska bir cumle.
 ```
 
-This helps DIL learn not only how to reconstruct a word, but also how words and context pieces relate semantically.
+JSONL:
+
+```json
+{"text": "Bir cumle."}
+{"text": "Baska bir cumle."}
+```
+
+NAZ supervised fine-tuning also supports prompt/answer rows through `train_naz_finetune.py`.
+
+TSV prompt/answer format:
+
+```text
+15 + 4241 =	4256
+```
+
+JSONL prompt/answer format:
+
+```json
+{"prompt": "15 + 4241 =", "answer": "4256"}
+```
+
+`scripts/generate_math_sequence_data.py` can create math continuation and prompt/answer datasets.
 
 ## Training
 
-Train DIL first:
+Install dependencies from the project metadata or the training requirements, then run from the repository root or from `dilnaz/train`. The examples below use PowerShell.
+
+### 1. Train DIL
 
 ```powershell
-cd D:\Projects\Dilnaz\dilnaz\train
+cd D:\Projects\Dilnaz
 
-python train_dil.py `
-  --train-file ../../TrainDatas/Test1.txt `
-  --output-dir ../../checkpoints/Dil `
-  --max-steps 50000 `
-  --batch-size 1024 `
+python .\dilnaz\train\train_dil.py `
+  --train-file .\TrainDatas\Test1.jsonl `
+  --eval-file .\TrainDatas\TestCümleler.jsonl `
+  --output-dir .\checkpoints\Dil `
+  --data-mode streaming `
+  --max-steps 30000 `
+  --batch-size 64 `
+  --eval-batch-size 64 `
   --log-every 50 `
+  --eval-every 500 `
   --checkpoint-every 5000 `
-  --data-mode resident
+  --compile-mode reduce-overhead `
+  --bf16
 ```
 
-Then train NAZ from the frozen DIL checkpoint:
+Set `--compile-mode off` when the machine does not have a C compiler available for `torch.compile`.
+
+### 2. Train Only The DIL Writer
 
 ```powershell
-cd D:\Projects\Dilnaz\dilnaz\train
+cd D:\Projects\Dilnaz
 
-python train_naz.py `
-  --train-file ../../TrainDatas/Test1.txt `
-  --dil-checkpoint-dir ../../checkpoints/Dil `
-  --output-dir ../../checkpoints/Naz `
+python .\dilnaz\train\train_dil_writer.py `
+  --train-file .\TrainDatas\Test1.jsonl `
+  --eval-file .\TrainDatas\TestCümleler.jsonl `
+  --checkpoint .\checkpoints\Dil\checkpoint.pt `
+  --output-dir .\checkpoints\Dil `
+  --data-mode streaming `
+  --max-steps 30000 `
+  --batch-size 64 `
+  --eval-batch-size 64 `
+  --log-every 50 `
+  --eval-every 500 `
+  --checkpoint-every 5000 `
+  --compile-mode reduce-overhead `
+  --bf16
+```
+
+### 3. Train NAZ
+
+```powershell
+cd D:\Projects\Dilnaz
+
+python .\dilnaz\train\train_naz.py `
+  --train-file .\TrainDatas\Test1.jsonl `
+  --eval-file .\TrainDatas\TestCümleler.jsonl `
+  --dil-checkpoint-dir .\checkpoints\Dil `
+  --output-dir .\checkpoints\Naz `
+  --data-mode streaming `
   --max-steps 30000 `
   --batch-size 8 `
-  --sequence-length 256 `
+  --eval-batch-size 8 `
+  --sequence-length 258 `
   --log-every 50 `
-  --data-mode resident
+  --eval-every 500 `
+  --checkpoint-every 5000 `
+  --compile-mode reduce-overhead `
+  --bf16
 ```
 
-`resident` mode caches data in memory for fast experiments. `streaming` mode keeps the pipeline usable for larger text files.
+`resident` mode pre-materializes/cache data for smaller experiments. `streaming` mode is the default and keeps the pipeline usable for larger files.
 
-## Inference
-
-Inspect DIL reconstruction and semantic behavior:
+### One-Command Pipeline
 
 ```powershell
-cd D:\Projects\Dilnaz\dilnaz\train
+cd D:\Projects\Dilnaz
 
-python interface_dil.py `
-  --checkpoint-dir ../../checkpoints/Dil `
-  --text "Yahudi toplulukları ile olan irtibatlarının oldukça azalması."
+.\scripts\train_jsonl_pipeline.ps1 `
+  -TrainFile .\TrainDatas\Test1.jsonl `
+  -EvalFile .\TrainDatas\TestCümleler.jsonl `
+  -DataMode streaming `
+  -CompileMode reduce-overhead `
+  -Bf16
 ```
 
-Generate with NAZ:
+The pipeline runs DIL semantic training, DIL writer-only training, and NAZ training in order.
+
+## Supervised NAZ Fine-Tuning
+
+`train_naz_finetune.py` trains NAZ on prompt/answer rows while applying loss only to answer targets.
 
 ```powershell
-cd D:\Projects\Dilnaz\dilnaz\train
+cd D:\Projects\Dilnaz
 
-python interface_naz.py `
-  --checkpoint-dir ../../checkpoints/Naz `
-  --max-new-tokens 512 `
-  --num-samples 8 `
-  --text "Yahudiler, dünyanın dört bir tarafına dağılmış topluluklardan"
+python .\dilnaz\train\train_naz_finetune.py `
+  --train-file .\TrainDatas\Math_Add_1M_SFT.tsv `
+  --eval-file .\TrainDatas\Math_Add_Eval_100_SFT.tsv `
+  --dil-checkpoint-dir .\checkpoints\Dil `
+  --output-dir .\checkpoints\NazSft `
+  --max-steps 30000 `
+  --batch-size 8 `
+  --sequence-length 128 `
+  --eval-every 500 `
+  --eval-exact-every 500 `
+  --checkpoint-every 5000 `
+  --compile-mode reduce-overhead `
+  --bf16
 ```
+
+Resume with `--resume path\to\checkpoint.pt`, or initialize from an existing NAZ checkpoint with `--init-naz-checkpoint path\to\checkpoint.pt`.
+
+## Inference And Inspection
+
+### Inspect DIL
+
+```powershell
+cd D:\Projects\Dilnaz
+
+python .\dilnaz\train\interface_dil.py `
+  --checkpoint-dir .\checkpoints\Dil `
+  --text "Disi aslanin disi kirildi."
+```
+
+This prints tokenizer pieces, DIL semantic similarity, NLLB teacher similarity, decoded writer output, and an automatic latent swap probe.
+
+### Generate With NAZ
+
+```powershell
+cd D:\Projects\Dilnaz
+
+python .\dilnaz\train\interface_naz.py `
+  --checkpoint-dir .\checkpoints\Naz `
+  --text "15 + 4241 =" `
+  --max-new-tokens 8 `
+  --writer-microbatch-size 8 `
+  --compile-mode off
+```
+
+`interface_naz.py` streams generated surface text by batching pending semantic latents through the DIL writer. It stops when the writer returns an empty/stop output or when semantic repetition crosses the configured threshold after `min_new_tokens`.
+
+## Checkpoint Contracts
+
+Current checkpoint families:
+
+```text
+DIL format_version = 21
+NAZ format_version = 25
+NAZ objective = semantic_dynamics_moe_mtp_v1
+DIL writer-only objective = plain_text_writer_only
+semantic_space = dil_normalized_latent
+```
+
+Backward checkpoint compatibility is intentionally not maintained while the architecture is moving. Old checkpoint families are rejected instead of silently converted.
 
 ## Compile Strategy
 
-Dilnaz compiles only pure tensor cores:
-
-- `DilEncoderCore`
-- `DilDecoderRenderer`
-- `NazStudentCore`
-
-It does not compile the full model object. Tokenization, checkpointing, cache objects, random sampling, and loss bookkeeping stay outside the compiled graph.
-
-Current checkpoint contracts:
+Compile is optional and controlled by `--compile-mode`:
 
 ```text
-DIL format_version = 7
-NAZ format_version = 10
+off
+default
+reduce-overhead
+max-autotune
 ```
 
-Backward checkpoint compatibility is intentionally not maintained while the architecture is evolving.
+Default behavior:
+
+- CUDA: `reduce-overhead`
+- CPU: `off`
+
+Only pure tensor forwards are compiled:
+
+- `DilEncoderCore.forward`
+- `DilConditionalWriter.forward`
+- `NazStudentCore` / semantic backbone path
+
+Tokenization, checkpointing, cache setup, random state handling and log bookkeeping remain outside the compiled graph.
 
 ## Repository Layout
 
 ```text
 dilnaz/
   models/
+    configuration_dil.py
+    configuration_naz.py
     modeling_dil.py
     modeling_naz.py
     naz_backbone/
   tokenization/
+    hybrid_tokenizer.py
+    hybrid_surface_vocab.json
   train/
     train_dil.py
+    train_dil_writer.py
+    train_parallel_dil.py
     train_naz.py
+    train_naz_finetune.py
     interface_dil.py
     interface_naz.py
+    dil_data.py
+    naz_data.py
+    parallel_dil_data.py
+    byte_trainer_utils.py
+scripts/
+  train_jsonl_pipeline.ps1
+  generate_math_sequence_data.py
+  naz_attention_benchmark.py
 tests/
 ```
 
-Large artifacts are intentionally ignored:
+## Validation
 
-- checkpoints
-- external references
-- local training datasets
-- generated caches
+Focused local validation for the active DIL/NAZ surface:
+
+```powershell
+cd D:\Projects\Dilnaz
+
+python -m pytest -q tests\test_dil_modeling.py tests\test_hybrid_tokenizer.py tests\test_parallel_dil_training.py tests\test_parallel_tr_en_encoder_aligner.py
+```
+
+At the time of this README update, the focused suite above passes. The full `pytest` suite can be blocked by `tests/test_subword_merge.py` because it imports a sibling `DataCreator` symbol that may not exist in the current local checkout.
+
+## Development Principles
+
+- No backward compatibility layers for stale architecture.
+- Keep semantic learning separate from surface writing.
+- Keep DIL and NAZ responsibilities separate.
+- Do not feed generated surface text back into NAZ during generation.
+- Validate tensor contracts with tests before treating a checkpoint as usable.
+- Prefer explicit checkpoint/objective rejection over hidden fallback behavior.
 
 ## Status
 
-Dilnaz is an experimental research codebase. The current focus is validating semantic next-step modeling, improving DIL reconstruction quality, scaling NAZ context length, and testing multilingual semantic generalization.
+Dilnaz is an experimental research codebase. The current focus is:
+
+- stronger DIL semantic geometry and writer reconstruction
+- stable NAZ semantic dynamics over longer contexts
+- prompt/answer fine-tuning on semantic targets
+- multilingual semantic alignment experiments
+- practical generation interfaces that match the training contract

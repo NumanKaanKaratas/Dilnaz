@@ -7,115 +7,123 @@
 ![PyTorch](https://img.shields.io/badge/backend-PyTorch-ee4c2c.svg)
 ![Durum: araştırma](https://img.shields.io/badge/durum-araştırma-orange.svg)
 
-Dilnaz, bir sonraki yazı parçasını doğrudan token olarak tahmin etmek yerine bir sonraki anlam dağılımını tahmin etmeyi hedefleyen iki aşamalı bir semantic language modeling araştırma projesidir.
+Dilnaz iki aşamalı bir semantic language modeling araştırma projesidir. İlk model olan `DIL`, yüzey metni normalize edilmiş continuous semantic latent uzaya taşır ve latentleri tekrar metne yazar. İkinci model olan `NAZ`, discrete token id tahmin etmek yerine bu semantic uzayda autoregressive dinamikleri öğrenir.
 
-Temel fikir şudur: klasik dil modelleri çoğunlukla "sıradaki token ne olmalı?" sorusunu öğrenir. Dilnaz ise önce "sıradaki anlam ne olmalı?" sorusunu öğrenir, sonra bu anlamı yazıya döker. Bu ayrım özellikle çok dilli genelleme, yüzey biçimi değişiklikleri, eş anlamlı kelimeler ve yazım farklılıkları için daha esnek bir temsil alanı oluşturmayı amaçlar.
+Aktif fikir:
 
-> :star: **Projeye yıldız verin:** Bu araştırma yönünü ilginç buluyorsanız, repo'ya yıldız vermeniz projenin daha fazla araştırmacı ve geliştiriciye ulaşmasına yardımcı olur.
+```text
+yüzey metni -> DIL semantic latent -> NAZ sonraki semantic latent -> DIL writer -> yüzey metni
+```
 
-## Amaç
-
-Dilnaz'ın uzun vadeli hedefi, metni yalnızca karakter veya token dizisi olarak değil, anlam akışı olarak modellemektir.
-
-Örneğin `araba`, `otomobil`, `car` ve başka dillerdeki yakın karşılıklar yüzeyde farklıdır; ancak aynı veya çok yakın bir kavrama işaret ederler. Dilnaz bu tür parçaları mümkün olduğunca aynı semantic uzayın yakın bölgelerine yerleştirmeyi, ikinci aşamada ise bu semantic uzayda bir sonraki anlamı tahmin etmeyi hedefler.
-
-Bu mimaride yazım biçimi tamamen yok sayılmaz. Dil modeli geçmişteki dil, biçim ve bağlam sinyallerini kullanarak hangi anlamın hangi yüzey biçimiyle yazılması gerektiğini de öğrenir. Yani önce anlam tahmin edilir, sonra bu anlam bulunduğu bağlama uygun yüzey biçimine çevrilir.
+Bu proje yalnızca tokenizer projesi değildir ve dışarıdan bir language model backbone wrapper'ı da değildir. Runtime tokenizer yüzey segmentasyonunu yapar; semantic hedef ise reconstruction ve NLLB teacher geometry ile şekillenen normalize DIL latent uzayıdır.
 
 ## Mimari
-
-Dilnaz iki ana modelden oluşur:
 
 ```mermaid
 flowchart LR
     A[Surface text] --> B[HybridTokenizer]
-    B --> C[DIL encoder<br/>surface + bağlam]
-    C --> D[(Semantic dağılım<br/>mean + log_std)]
-    D --> E[NAZ semantic backbone<br/>anlam akışı modeli]
-    E --> F[(Sonraki semantic dağılım<br/>pred_mean + pred_log_std)]
-    F --> G[DIL renderer<br/>latent -> byte]
+    B --> C[DIL encoder<br/>surface + simetrik context]
+    C --> D[(Normalize semantic latent)]
+    D --> E[NAZ semantic backbone<br/>semantic dynamics modeli]
+    E --> F[(Sonraki normalize semantic latent)]
+    F --> G[DIL parallel writer<br/>latent -> surface pieces]
     G --> H[Surface text]
-    T[NLLB teacher<br/>çok dilli geometri] -. distillation .-> C
-    T -. grouped geometry .-> D
+    T[NLLB encoder<br/>cok dilli geometri] -. grouped geometry .-> C
+    T -. mean geometry .-> D
 ```
+
+Aktif pipeline üç pratik aşamadan oluşur:
+
+1. `DIL` eğitilir; yüzey parçaları semantic latente dönüşür ve tekrar yazılabilir hale gelir.
+2. Gerekirse sadece `DIL` writer plain text ile fine-tune edilir; encoder contract sabit kalır.
+3. `NAZ`, frozen `DIL` checkpointinden üretilen semantic latentler ile eğitilir.
+
+## DIL
+
+`DIL`, yüzey metni ile semantic uzay arasındaki köprüdür.
+
+Encoder fixed-width hybrid-tokenized target parçasını ve simetrik context'i okur:
 
 ```text
-surface text
-  -> HybridTokenizer
-  -> DIL: surface/context -> semantic distribution
-  -> NAZ: semantic sequence -> next semantic distribution
-  -> DIL renderer: semantic distribution -> surface text
+context_radius = 2
+context_size = 2 * context_radius + 1
+target_index = context_radius
 ```
 
-### DIL
-
-`DIL`, surface ile semantic uzay arasındaki çift yönlü köprüdür.
-
-Görevleri:
-
-- hybrid tokenizer çıktısını ve sol bağlamı okuyarak semantic latent dağılım üretmek
-- her parça için `mean + log_std` dağılımı oluşturmak
-- latent dağılımdan tekrar byte/surface düzeyinde yazı üretmek
-- NLLB teacher'dan gelen çok dilli semantic geometriye yaklaşmak
-
-DIL bir VAE benzeri akış kullanır:
+Encoder çıktısı sabit yarıçaplı semantic latente normalize edilir:
 
 ```text
-surface/context -> encoder -> mean, log_std -> sampled latent -> renderer -> surface
+semantic_norm = sqrt(latent_size)
 ```
 
-Eğitim kayıpları:
+Güncel `DIL` modeli learned post-fit semantic normalizer veya `mean/log_std` VAE dağılımı sunmaz. Aktif contract native normalize latenttir.
 
-- reconstruction cross entropy
-- length loss
-- KL loss
+`DIL` iki işi birbirinden ayırarak yapar:
+
+- encoder: surface/context -> normalize semantic latent
+- writer: semantic latent -> explicit stop token içeren parallel surface-piece logits
+
+Ana loss ve metricler:
+
 - NLLB grouped layer geometry loss
-- mean geometry loss
-- variance regularizer
+- NLLB mean geometry loss
+- variance regularization
+- writer token cross entropy
+- byte accuracy, token exact match, stop accuracy
 
-DIL'in amacı yalnızca ezberci bir autoencoder olmak değildir. Reconstruction yüzey biçimini korur; NLLB distillation ise latent uzayın semantic olarak anlamlı kalmasını sağlar.
+Normal DIL eğitiminde writer detached semantic latent ile beslenir. Bu sayede yüzey yazma gradientleri semantic encoder trunk'ını bozmaz.
 
-### NAZ
+## DIL Writer-Only Eğitimi
 
-`NAZ`, DIL'in ürettiği semantic dağılımlar üzerinde çalışan ikinci aşama modeldir.
+`train_dil_writer.py` mevcut DIL checkpointini yükler, encoder'ı freeze eder ve yalnızca writer'ı plain text üzerinde eğitir. Amaç surface rendering kalitesini artırırken semantic trunk'ı değiştirmemektir.
 
-Görevi:
+Objective:
 
 ```text
-meaning_1, meaning_2, meaning_3 -> meaning_4
+objective = plain_text_writer_only
+loss = writer token cross entropy
 ```
 
-Yani NAZ'ın hedefi token id değildir. Hedef, frozen DIL encoder tarafından üretilen bir sonraki parçanın `target_mean + target_log_std` dağılımıdır.
-
-NAZ generation sırasında yazıyı tekrar encode ederek döngüye sokmaz. Prompt yalnızca başlangıçta DIL encoder'dan geçirilir. Sonrasında NAZ kendi ürettiği semantic dağılımı tekrar input olarak kullanır:
+Bu yol aynı DIL checkpoint ailesini kullanır:
 
 ```text
-prompt surface -> DIL encoder once -> initial semantic states
-NAZ -> next_mean, next_log_std
-NAZ -> next_mean, next_log_std
-...
-generated means -> DIL renderer -> text
+DIL checkpoint format_version = 21
 ```
 
-Bu semantic-loop tasarımının amacı, generation sırasında yüzey yazım hatalarının tekrar semantic input'a taşınmasını engellemek ve uzun üretimlerde modeli anlam akışı üzerinde tutmaktır.
+## NAZ
 
-## NAZ Semantic Backbone
+`NAZ`, semantic sequence modelidir.
 
-NAZ backbone tamamen Dilnaz'a ait native bir semantic backbone'dur. Dış bir transformer model wrapper'ı kullanılmaz.
-
-Blok düzeni:
+Token id tahmin etmez. Bir sonraki normalize DIL latentini tahmin eder ve aynı anda birden fazla gelecek horizon eğitebilir:
 
 ```text
-L0  SemanticDeltaMixer
-L1  SemanticDeltaMixer
-L2  SemanticDeltaMixer
-L3  SemanticGlobalAttention
+z_t -> z_(t+1), z_(t+2), z_(t+3)
+```
+
+Aktif objective:
+
+```text
+objective = semantic_dynamics_moe_mtp_v1
+```
+
+Prediction head semantic dynamics mixture head'dir:
+
+- horizon başına birden fazla semantic candidate
+- candidate router logits
+- mixture negative log likelihood
+- router responsibility loss
+- candidate usage balance
+- selected-latent MSE ve cosine metricleri
+
+Backbone tamamen Dilnaz'a ait native koddur. Ucuz semantic mixing ile periyodik full attention birlikte kullanılır:
+
+```text
+SemanticDeltaMixer
+SemanticDeltaMixer
+SemanticDeltaMixer
+SemanticGlobalAttention
 tekrar...
 ```
-
-Bu yapı iki farklı ihtiyacı birleştirir:
-
-- `SemanticDeltaMixer`: uzun semantic akışı ucuz ve recurrent state ile taşımak
-- `SemanticGlobalAttention`: belirli aralıklarla tüm bağlama doğrudan bakmak
 
 Backbone bileşenleri:
 
@@ -123,175 +131,249 @@ Backbone bileşenleri:
 - `PartialRotaryEmbedding`
 - `SemanticDeltaMixer`
 - `SemanticGlobalAttention`
-- `GatedFeedForward`
+- `SparseMoEFeedForward`
 - `NazBackboneCache`
 
-Bu tasarım token vocabulary veya LM head üzerine kurulmaz. NAZ'ın giriş ve çıkış dili semantic dağılımlardır.
+Generation semantic-loop şeklindedir. Prompt DIL ile bir kez encode edilir. Sonrasında generated surface text encoder'a geri sokulmaz:
 
-## Tokenizer
+```text
+prompt surface -> DIL encoder -> prompt latentleri
+NAZ -> sonraki latent
+NAZ -> sonraki latent
+DIL writer -> surface text
+```
 
-Dilnaz, hybrid surface tokenizer kullanır.
+## Hybrid Tokenizer
 
-Amaç, hem byte düzeyinde güvenli kapsama alanı sağlamak hem de sık görülen yüzey parçalarını daha verimli temsil etmektir.
+Dilnaz runtime tokenizer'ını `dilnaz/tokenization` altında kendisi taşır.
 
-Özellikler:
+Tokenizer şunları sağlar:
 
-- byte fallback ile OOV riskini azaltır
-- surface vocabulary ile sık parçaları kompakt tutar
-- her segment `max_word_bytes` genişliğinde modele verilir
-- boşluk ve noktalama ayrımları korunur
-- tokenizer vocab dosyası DIL checkpoint içine kopyalanır
+- byte fallback
+- sık yüzey biçimleri için compact surface pieces
+- boundary-aware decoding için leading-space varyantları
+- numeric, punctuation, common-word, contextual ve character parçaları
+- `max_word_bytes` ile fixed-width segment tensorları
+- Türkçe metin, digit, punctuation ve JSONL newline escape roundtrip testleri
 
-Varsayılan vocab kaynağı:
+Varsayılan vocabulary:
 
 ```text
 dilnaz/tokenization/hybrid_surface_vocab.json
 ```
 
-Bu tokenizer'ın görevi semantic hedefi belirlemek değildir. Tokenizer yalnızca yüzey metni modelin okuyabileceği parçalara böler. Semantic hizalama DIL encoder ve NLLB distillation ile öğrenilir.
+Tokenizer surface contract'tır. Semantic anlamı belirlemez. Semantic geometri DIL eğitimi ve NLLB teacher supervision ile öğrenilir.
 
-## NLLB Neden Kullanılıyor?
+## Veri Formatları
 
-NLLB, çok dilli semantic yakınlık için teacher olarak kullanılır.
+Text eğitim dosyaları plain text veya JSONL olabilir.
 
-Dilnaz'ın hedefi yalnızca Türkçe token dizilerini ezberlemek değildir. Aynı veya yakın anlamların farklı dillerde ve farklı yazım biçimlerinde semantic uzayda yakın durması istenir. NLLB encoder temsilleri bu amaç için güçlü bir başlangıç öğretmeni sağlar.
-
-DIL eğitiminde NLLB doğrudan decoder olarak kullanılmaz. NLLB'den alınan encoder layer temsilleri grouped geometry loss ile DIL latent uzayına aktarılır.
-
-Kullanılan teacher fikri:
+Plain text:
 
 ```text
-NLLB hidden layers -> grouped semantic geometry -> DIL layer vectors + mean
+Bir cumle.
+Baska bir cumle.
 ```
 
-Bu sayede DIL, yalnızca hedef kelimeyi geri yazmayı değil, kelimeler ve bağlam parçaları arasındaki semantic ilişki geometrisini de öğrenir.
+JSONL:
 
-## Diğer Yaklaşımlardan Farkı
+```json
+{"text": "Bir cumle."}
+{"text": "Baska bir cumle."}
+```
 
-Dilnaz'ın ana farkı, autoregressive hedefin discrete token değil continuous semantic distribution olmasıdır.
+NAZ supervised fine-tuning için `train_naz_finetune.py` prompt/answer satırlarını da destekler.
 
-Klasik akış:
+TSV prompt/answer formatı:
 
 ```text
-past tokens -> next token id
+15 + 4241 =	4256
 ```
 
-Dilnaz akışı:
+JSONL prompt/answer formatı:
 
-```text
-past meanings -> next meaning distribution -> renderer -> surface text
+```json
+{"prompt": "15 + 4241 =", "answer": "4256"}
 ```
 
-Bu ayrım birkaç önemli sonuç doğurur:
+`scripts/generate_math_sequence_data.py` math continuation ve prompt/answer datasetleri üretebilir.
 
-- aynı anlama gelen farklı yüzey biçimleri semantic olarak yakın temsil edilebilir
-- generation akışı yazım biçiminden önce anlam planına odaklanır
-- decoder/render aşaması semantic üretimden ayrıdır
-- ikinci model yüzey token ezberi yerine semantic geçişleri öğrenir
-- ileride çok dilli eğitimde diller arası semantic aktarım daha doğal hale gelebilir
+## Eğitim
 
-Bu proje, tokenizer-free veya yalnızca byte-level bir sistem değildir. Yüzey bilgisi korunur; ancak nihai autoregressive hedef anlam dağılımıdır.
+Dependency'leri project metadata'dan veya training requirements dosyasından kurduktan sonra repo root'tan ya da `dilnaz/train` altından çalıştırılabilir. Aşağıdaki örnekler PowerShell içindir.
 
-## Eğitim Akışı
-
-Önerilen sıra:
-
-1. DIL eğitilir.
-2. DIL frozen tutulur.
-3. NAZ, frozen DIL'in ürettiği `mean/log_std` hedefleriyle eğitilir.
-4. Interface sırasında prompt DIL ile encode edilir, NAZ semantic-loop üretir, DIL renderer final text üretir.
-
-### DIL Eğitimi
+### 1. DIL Eğitimi
 
 ```powershell
-cd D:\Projects\Dilnaz\dilnaz\train
+cd D:\Projects\Dilnaz
 
-python train_dil.py `
-  --train-file ../../TrainDatas/Test1.txt `
-  --output-dir ../../checkpoints/Dil `
-  --max-steps 50000 `
-  --batch-size 1024 `
+python .\dilnaz\train\train_dil.py `
+  --train-file .\TrainDatas\Test1.jsonl `
+  --eval-file .\TrainDatas\TestCümleler.jsonl `
+  --output-dir .\checkpoints\Dil `
+  --data-mode streaming `
+  --max-steps 30000 `
+  --batch-size 64 `
+  --eval-batch-size 64 `
   --log-every 50 `
+  --eval-every 500 `
   --checkpoint-every 5000 `
-  --data-mode resident
+  --compile-mode reduce-overhead `
+  --bf16
 ```
 
-### NAZ Eğitimi
+Makinede `torch.compile` için C compiler yoksa `--compile-mode off` kullan.
+
+### 2. Sadece DIL Writer Eğitimi
 
 ```powershell
-cd D:\Projects\Dilnaz\dilnaz\train
+cd D:\Projects\Dilnaz
 
-python train_naz.py `
-  --train-file ../../TrainDatas/Test1.txt `
-  --dil-checkpoint-dir ../../checkpoints/Dil `
-  --output-dir ../../checkpoints/Naz `
+python .\dilnaz\train\train_dil_writer.py `
+  --train-file .\TrainDatas\Test1.jsonl `
+  --eval-file .\TrainDatas\TestCümleler.jsonl `
+  --checkpoint .\checkpoints\Dil\checkpoint.pt `
+  --output-dir .\checkpoints\Dil `
+  --data-mode streaming `
+  --max-steps 30000 `
+  --batch-size 64 `
+  --eval-batch-size 64 `
+  --log-every 50 `
+  --eval-every 500 `
+  --checkpoint-every 5000 `
+  --compile-mode reduce-overhead `
+  --bf16
+```
+
+### 3. NAZ Eğitimi
+
+```powershell
+cd D:\Projects\Dilnaz
+
+python .\dilnaz\train\train_naz.py `
+  --train-file .\TrainDatas\Test1.jsonl `
+  --eval-file .\TrainDatas\TestCümleler.jsonl `
+  --dil-checkpoint-dir .\checkpoints\Dil `
+  --output-dir .\checkpoints\Naz `
+  --data-mode streaming `
   --max-steps 30000 `
   --batch-size 8 `
-  --sequence-length 256 `
+  --eval-batch-size 8 `
+  --sequence-length 258 `
   --log-every 50 `
-  --data-mode resident
+  --eval-every 500 `
+  --checkpoint-every 5000 `
+  --compile-mode reduce-overhead `
+  --bf16
 ```
 
-`resident` mode küçük ve orta ölçekli deneylerde hızlıdır. Büyük veride `streaming` mode kullanılabilir. Streaming modunda DIL encoder her batch için çalışır; resident modda frozen DIL semantic dağılımları başta cache'lenir.
+`resident` mode küçük deneylerde datayı/cache'i başta hazırlar. `streaming` varsayılandır ve büyük dosyalar için daha uygundur.
 
-## Interface
+### Tek Komut Pipeline
+
+```powershell
+cd D:\Projects\Dilnaz
+
+.\scripts\train_jsonl_pipeline.ps1 `
+  -TrainFile .\TrainDatas\Test1.jsonl `
+  -EvalFile .\TrainDatas\TestCümleler.jsonl `
+  -DataMode streaming `
+  -CompileMode reduce-overhead `
+  -Bf16
+```
+
+Pipeline sırayla DIL semantic training, DIL writer-only training ve NAZ training çalıştırır.
+
+## Supervised NAZ Fine-Tuning
+
+`train_naz_finetune.py`, prompt/answer satırlarında sadece answer targetlarına loss uygular.
+
+```powershell
+cd D:\Projects\Dilnaz
+
+python .\dilnaz\train\train_naz_finetune.py `
+  --train-file .\TrainDatas\Math_Add_1M_SFT.tsv `
+  --eval-file .\TrainDatas\Math_Add_Eval_100_SFT.tsv `
+  --dil-checkpoint-dir .\checkpoints\Dil `
+  --output-dir .\checkpoints\NazSft `
+  --max-steps 30000 `
+  --batch-size 8 `
+  --sequence-length 128 `
+  --eval-every 500 `
+  --eval-exact-every 500 `
+  --checkpoint-every 5000 `
+  --compile-mode reduce-overhead `
+  --bf16
+```
+
+Devam etmek için `--resume path\to\checkpoint.pt`, mevcut NAZ checkpointinden başlatmak için `--init-naz-checkpoint path\to\checkpoint.pt` kullanılır.
+
+## Inference ve İnceleme
 
 ### DIL İnceleme
 
 ```powershell
-cd D:\Projects\Dilnaz\dilnaz\train
+cd D:\Projects\Dilnaz
 
-python interface_dil.py `
-  --checkpoint-dir ../../checkpoints/Dil `
-  --text "Yahudi toplulukları ile olan irtibatlarının oldukça azalması."
+python .\dilnaz\train\interface_dil.py `
+  --checkpoint-dir .\checkpoints\Dil `
+  --text "Dişi aslanın dişi kırıldı."
 ```
 
-Bu arayüz DIL'in reconstruction kalitesini, similarity matrix çıktısını ve latent swap davranışını kontrol etmek için kullanılır.
+Bu araç tokenizer parçalarını, DIL semantic similarity çıktısını, NLLB teacher similarity çıktısını, writer decode sonucunu ve otomatik latent swap probe'unu basar.
 
 ### NAZ Üretim
 
 ```powershell
-cd D:\Projects\Dilnaz\dilnaz\train
+cd D:\Projects\Dilnaz
 
-python interface_naz.py `
-  --checkpoint-dir ../../checkpoints/Naz `
-  --max-new-tokens 512 `
-  --num-samples 8 `
-  --text "Yahudiler, dünyanın dört bir tarafına dağılmış topluluklardan"
+python .\dilnaz\train\interface_naz.py `
+  --checkpoint-dir .\checkpoints\Naz `
+  --text "15 + 4241 =" `
+  --max-new-tokens 8 `
+  --writer-microbatch-size 8 `
+  --compile-mode off
 ```
 
-NAZ interface semantic-loop kullanır. Generated tokenlar tekrar DIL encoder'a sokulmaz; DIL encoder yalnızca prompt için çalışır.
+`interface_naz.py`, pending semantic latentleri DIL writer'dan batch halinde geçirerek generated surface text'i stream eder. Writer boş/stop output verdiğinde veya `min_new_tokens` sonrası semantic repetition threshold aşılırsa durur.
 
-## Compile ve Performans
+## Checkpoint Kontratları
 
-Compile sistemi full model compile etmez. Yalnızca saf tensor core'lar compile edilir:
-
-- `DilEncoderCore`
-- `DilDecoderRenderer`
-- `NazStudentCore`
-
-Bu yaklaşım checkpoint, tokenizer, random sampling, cache objeleri ve loss bookkeeping gibi Python ağırlıklı parçaları compile grafiğinin dışında tutar.
-
-Varsayılan CUDA compile modu:
+Güncel checkpoint aileleri:
 
 ```text
+DIL format_version = 21
+NAZ format_version = 25
+NAZ objective = semantic_dynamics_moe_mtp_v1
+DIL writer-only objective = plain_text_writer_only
+semantic_space = dil_normalized_latent
+```
+
+Mimari aktif olarak değiştiği için geriye dönük checkpoint uyumluluğu taşınmaz. Eski checkpoint aileleri sessiz dönüştürülmez, doğrudan reddedilir.
+
+## Compile Stratejisi
+
+Compile opsiyoneldir ve `--compile-mode` ile kontrol edilir:
+
+```text
+off
+default
 reduce-overhead
+max-autotune
 ```
 
-CPU tarafında compile varsayılan olarak kapalıdır.
+Varsayılan davranış:
 
-## Checkpoint Kontratı
+- CUDA: `reduce-overhead`
+- CPU: `off`
 
-Dilnaz geriye dönük checkpoint uyumluluğu taşımaz. Mimari kontrat değiştiğinde checkpoint formatı kırılır ve modeller sıfırdan eğitilir.
+Sadece saf tensor forwardları compile edilir:
 
-Güncel kontrat:
+- `DilEncoderCore.forward`
+- `DilConditionalWriter.forward`
+- `NazStudentCore` / semantic backbone path
 
-```text
-DIL format_version = 7
-NAZ format_version = 10
-```
-
-Bu tercih bilinçlidir. Proje araştırma aşamasında olduğu için eski mimari dallarını canlı tutmak yerine aktif mimariyi temiz ve doğrudan tutmak önceliklidir.
+Tokenization, checkpointing, cache setup, random state handling ve log bookkeeping compile grafiğinin dışında kalır.
 
 ## Proje Yapısı
 
@@ -304,47 +386,54 @@ dilnaz/
     modeling_naz.py
     naz_backbone/
   tokenization/
+    hybrid_tokenizer.py
     hybrid_surface_vocab.json
   train/
     train_dil.py
+    train_dil_writer.py
+    train_parallel_dil.py
     train_naz.py
+    train_naz_finetune.py
     interface_dil.py
     interface_naz.py
     dil_data.py
     naz_data.py
+    parallel_dil_data.py
     byte_trainer_utils.py
+scripts/
+  train_jsonl_pipeline.ps1
+  generate_math_sequence_data.py
+  naz_attention_benchmark.py
+tests/
 ```
+
+## Doğrulama
+
+Aktif DIL/NAZ yüzeyi için odaklı lokal doğrulama:
+
+```powershell
+cd D:\Projects\Dilnaz
+
+python -m pytest -q tests\test_dil_modeling.py tests\test_hybrid_tokenizer.py tests\test_parallel_dil_training.py tests\test_parallel_tr_en_encoder_aligner.py
+```
+
+Bu README güncellemesi sırasında yukarıdaki odaklı suite geçiyor. Full `pytest` şu an `tests/test_subword_merge.py` yüzünden bloklanabilir; çünkü sibling `DataCreator` checkout'unda mevcut olmayabilecek bir sembol import ediyor.
 
 ## Geliştirme İlkeleri
 
-- semantic hedef token hedefinden ayrıdır
-- DIL ve NAZ görevleri ayrı tutulur
-- DIL semantic uzayı NLLB teacher geometry ile şekillenir
-- NAZ yalnızca frozen DIL semantic dağılımlarını öğrenir
-- generation sırasında semantic-loop korunur
-- eski mimari uyumluluk kodu taşınmaz
-- dış backbone wrapper kullanılmaz
+- Eski mimari için backward compatibility layer taşınmaz.
+- Semantic öğrenme surface writing'den ayrı tutulur.
+- DIL ve NAZ sorumlulukları ayrı kalır.
+- Generation sırasında generated surface text NAZ'a geri encode edilmez.
+- Checkpoint kullanılabilir sayılmadan önce tensor contract testleri doğrulanır.
+- Gizli fallback yerine explicit checkpoint/objective rejection tercih edilir.
 
-## Yol Haritası
+## Durum
 
-Kısa vadeli hedefler:
+Dilnaz deneysel bir araştırma kod tabanıdır. Güncel odak:
 
-- DIL reconstruction kalitesini daha büyük ve çeşitli veriyle güçlendirmek
-- NAZ semantic-loop repetition davranışını ölçmek
-- uzun context eğitimlerini daha büyük corpus üzerinde test etmek
-- multilingual prompt ve continuation testleri yapmak
-
-Orta vadeli hedefler:
-
-- daha güçlü semantic memory mekanizmaları eklemek
-- uzun contextte topic/anchor takibini geliştirmek
-- renderer hızını ve batch decode verimini artırmak
-- semantic uzayda daha kontrollü sampling stratejileri denemek
-
-Uzun vadeli hedef:
-
-```text
-surface language modeling -> semantic language modeling
-```
-
-Dilnaz'ın nihai amacı, modelin önce ne söylemek istediğinin anlamını öğrenmesi, ardından bu anlamı bağlama ve dile uygun şekilde yazıya dökmesidir.
+- daha güçlü DIL semantic geometry ve writer reconstruction
+- uzun contextte daha stabil NAZ semantic dynamics
+- semantic targetlar üzerinde prompt/answer fine-tuning
+- multilingual semantic alignment deneyleri
+- eğitim contract'ı ile eşleşen pratik generation interface'leri
