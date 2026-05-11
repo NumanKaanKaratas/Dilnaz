@@ -31,6 +31,13 @@ DIL_MODEL_DEFAULTS = {
     "writer_noise_mid_max_cos": 0.985,
     "writer_noise_hard_min_cos": 0.950,
     "writer_noise_hard_max_cos": 0.970,
+    "writer_refinement_steps": 1,
+    "writer_use_step_embedding": True,
+    "writer_max_position_age": 32,
+    "writer_use_zone_noise": True,
+    "writer_gradient_checkpointing": False,
+    "writer_commit_temperature": 1.0,
+    "writer_commit_threshold": 0.5,
 }
 
 

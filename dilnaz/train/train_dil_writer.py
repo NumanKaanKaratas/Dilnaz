@@ -45,6 +45,34 @@ from trainer_core import make_adamw_param_groups, make_scheduler  # noqa: E402
 
 CHECKPOINT_FORMAT_VERSION = 23
 WRITER_OBJECTIVE = "sliding_block_writer_online_encoder"
+WRITER_METRIC_KEYS = (
+    "loss",
+    "token_loss",
+    "active_token_loss",
+    "right_guard_token_loss",
+    "left_consistency_loss",
+    "commit_loss",
+    "byte_acc",
+    "token_exact",
+    "stop_acc",
+    "right_guard_byte_acc",
+    "right_guard_token_exact",
+    "right_guard_stop_acc",
+    "commit_precision",
+    "commit_recall",
+    "commit_f1",
+    "false_commit_rate",
+    "mean_commit_score",
+    "step0_byte_acc",
+    "step0_token_exact",
+    "step0_stop_acc",
+    "stepT_byte_acc",
+    "stepT_token_exact",
+    "stepT_stop_acc",
+    "self_conditioning_ratio",
+    "mean_mask_ratio",
+    "future_horizons",
+)
 
 
 class HybridDilSlidingWindowDataset(IterableDataset):
@@ -268,6 +296,17 @@ def synthetic_surface_state(
     return surface_state, surface_state_mask, frozen_mask
 
 
+def synthetic_position_age(config: DilConfig, labels: torch.Tensor, zone_ids: torch.Tensor, window_mask: torch.Tensor) -> torch.Tensor:
+    valid_words = labels.ne(-100).any(dim=-1) & window_mask
+    active = zone_ids.eq(1) & valid_words
+    left = zone_ids.eq(0) & valid_words
+    age = torch.zeros(zone_ids.shape, device=labels.device, dtype=torch.long)
+    random_age = torch.randint(config.writer_max_position_age + 1, zone_ids.shape, device=labels.device, dtype=torch.long)
+    age = torch.where(active, random_age, age)
+    age = torch.where(left, torch.full_like(age, config.writer_max_position_age), age)
+    return age
+
+
 @torch.no_grad()
 def self_conditioned_surface_state(
     model: Dil,
@@ -275,11 +314,13 @@ def self_conditioned_surface_state(
     labels: torch.Tensor,
     zone_ids: torch.Tensor,
     window_mask: torch.Tensor,
+    future_latents: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     output = model.writer_transition_outputs(
         semantic,
         zone_ids=zone_ids,
         window_mask=window_mask,
+        future_latents=future_latents,
     )
     valid = labels.ne(-100) & window_mask.unsqueeze(-1)
     left = zone_ids.eq(0).unsqueeze(-1) & valid
@@ -292,11 +333,28 @@ def self_conditioned_surface_state(
     return surface_state, surface_state_mask, frozen_mask
 
 
-def sliding_writer_forward(
+def sliding_future_latents(semantic: torch.Tensor, window_mask: torch.Tensor, horizons: int) -> torch.Tensor | None:
+    if horizons <= 0:
+        return None
+    batch_size, window_size, latent_size = semantic.shape
+    future = semantic.new_zeros((batch_size, window_size, horizons, latent_size))
+    for horizon_idx in range(horizons):
+        offset = horizon_idx + 1
+        if offset >= window_size:
+            break
+        future[:, :-offset, horizon_idx] = (
+            semantic[:, offset:] * window_mask[:, offset:].unsqueeze(-1).to(semantic.dtype)
+        )
+    return future
+
+
+def sliding_writer_metrics(
     model: Dil,
     batch: dict,
     training_step: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    use_future_latents: bool = True,
+    use_persistent_state: bool = True,
+) -> dict[str, torch.Tensor]:
     input_ids = batch["input_ids"]
     labels = batch["labels"].to(input_ids.device)
     word_masks = batch["word_masks"]
@@ -310,14 +368,27 @@ def sliding_writer_forward(
         ).float()
         semantic = flat_semantic.reshape(batch_size, window_size, -1)
 
+    future_latents = None
+    if use_future_latents:
+        future_latents = sliding_future_latents(
+            semantic,
+            window_mask,
+            min(model.config.writer_right_guard, max(window_size - 1, 0)),
+        )
     probability = self_conditioning_probability(model.config, training_step)
-    if model.training and torch.rand((), device=input_ids.device).item() < probability:
+    self_conditioned = (
+        use_persistent_state
+        and model.training
+        and torch.rand((), device=input_ids.device).item() < probability
+    )
+    if self_conditioned:
         surface_state, surface_state_mask, frozen_mask = self_conditioned_surface_state(
             model,
             semantic,
             labels,
             zone_ids,
             window_mask,
+            future_latents=future_latents,
         )
     else:
         surface_state, surface_state_mask, frozen_mask = synthetic_surface_state(
@@ -326,7 +397,12 @@ def sliding_writer_forward(
             zone_ids,
             window_mask,
         )
-    loss, _, _, byte_acc, token_exact, stop_acc = model.writer_transition_loss_and_metrics(
+        if not use_persistent_state:
+            surface_state = torch.full_like(labels, -100)
+            surface_state_mask = torch.zeros_like(labels)
+            frozen_mask = torch.zeros_like(labels, dtype=torch.bool)
+    position_age = synthetic_position_age(model.config, labels, zone_ids, window_mask)
+    metrics = model.writer_transition_loss_and_metrics(
         semantic.detach(),
         labels,
         surface_state,
@@ -334,18 +410,74 @@ def sliding_writer_forward(
         frozen_mask,
         zone_ids,
         window_mask,
+        future_latents=future_latents,
+        position_age=position_age,
+        training_step=training_step,
+        return_metrics=True,
     )
-    return loss, byte_acc, token_exact, stop_acc
+    valid = labels.ne(-100) & window_mask.unsqueeze(-1)
+    filled = surface_state_mask.gt(0) & valid
+    metrics["self_conditioning_ratio"] = metrics["loss"].new_tensor(float(self_conditioned))
+    metrics["mean_mask_ratio"] = 1.0 - filled.sum().to(metrics["loss"].dtype) / valid.sum().clamp_min(1).to(metrics["loss"].dtype)
+    metrics["future_horizons"] = metrics["loss"].new_tensor(0.0 if future_latents is None else float(future_latents.shape[2]))
+    return metrics
+
+
+def writer_only_metrics(
+    model: Dil,
+    batch: dict,
+    training_step: int | None = None,
+    use_future_latents: bool = True,
+    use_persistent_state: bool = True,
+) -> dict[str, torch.Tensor]:
+    if batch["input_ids"].dim() == 4:
+        return sliding_writer_metrics(
+            model,
+            batch,
+            training_step,
+            use_future_latents=use_future_latents,
+            use_persistent_state=use_persistent_state,
+        )
+    labels = batch["labels"].to(batch["input_ids"].device)
+    loss, token_loss, byte_acc, token_exact, stop_acc = model.writer_loss_and_metrics(
+        model.encode(batch["input_ids"], batch["word_masks"]).detach(),
+        labels,
+        training_step=training_step,
+    )
+    zero = loss.new_zeros(())
+    return {
+        "loss": loss,
+        "token_loss": token_loss,
+        "active_token_loss": token_loss,
+        "right_guard_token_loss": zero,
+        "left_consistency_loss": zero,
+        "commit_loss": zero,
+        "byte_acc": byte_acc,
+        "token_exact": token_exact,
+        "stop_acc": stop_acc,
+        "right_guard_byte_acc": zero,
+        "right_guard_token_exact": zero,
+        "right_guard_stop_acc": zero,
+        "commit_precision": zero,
+        "commit_recall": zero,
+        "commit_f1": zero,
+        "false_commit_rate": zero,
+        "mean_commit_score": zero,
+        "step0_byte_acc": byte_acc,
+        "step0_token_exact": token_exact,
+        "step0_stop_acc": stop_acc,
+        "stepT_byte_acc": byte_acc,
+        "stepT_token_exact": token_exact,
+        "stepT_stop_acc": stop_acc,
+        "self_conditioning_ratio": zero,
+        "mean_mask_ratio": zero,
+        "future_horizons": zero,
+    }
 
 
 def writer_only_forward(model: Dil, batch: dict, training_step: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if batch["input_ids"].dim() == 4:
-        return sliding_writer_forward(model, batch, training_step)
-    labels = batch["labels"].to(batch["input_ids"].device)
-    with torch.no_grad():
-        semantic = model.encode(batch["input_ids"], batch["word_masks"]).float()
-    loss, _, byte_acc, token_exact, stop_acc = model.writer_loss_and_metrics(semantic.detach(), labels, training_step)
-    return loss, byte_acc, token_exact, stop_acc
+    metrics = writer_only_metrics(model, batch, training_step)
+    return metrics["loss"], metrics["byte_acc"], metrics["token_exact"], metrics["stop_acc"]
 
 
 def materialize_writer_batches(dataset, device: torch.device, batch_size: int, seed: int):
@@ -405,6 +537,12 @@ def save_checkpoint(
         "writer_active_size": config.writer_active_size,
         "writer_right_guard": config.writer_right_guard,
         "writer_stride": config.writer_stride,
+        "writer_refinement_steps": config.writer_refinement_steps,
+        "writer_use_step_embedding": config.writer_use_step_embedding,
+        "writer_use_zone_noise": config.writer_use_zone_noise,
+        "writer_gradient_checkpointing": config.writer_gradient_checkpointing,
+        "writer_commit_temperature": config.writer_commit_temperature,
+        "writer_commit_threshold": config.writer_commit_threshold,
     }
     torch.save(
         {
@@ -433,18 +571,32 @@ def load_model_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[
 
 
 @torch.no_grad()
-def evaluate(model, eval_loader, device, compile_mode: str, autocast_enabled: bool, cuda_prefetch: bool, max_batches: int):
+def evaluate(
+    model,
+    eval_loader,
+    device,
+    compile_mode: str,
+    autocast_enabled: bool,
+    cuda_prefetch: bool,
+    max_batches: int,
+    use_future_latents: bool,
+    use_persistent_state: bool,
+):
     model.eval()
     model.encoder.eval()
-    total = {"loss": 0.0, "byte_acc": 0.0, "token_exact": 0.0, "stop_acc": 0.0, "batches": 0}
+    total = {key: 0.0 for key in WRITER_METRIC_KEYS}
+    total["batches"] = 0
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
         cudagraph_step_begin(device, compile_mode)
         with autocast_context(autocast_enabled):
-            loss, byte_acc, token_exact, stop_acc = writer_only_forward(model, batch)
-        total["loss"] += float(loss.detach().cpu())
-        total["byte_acc"] += float(byte_acc.detach().cpu())
-        total["token_exact"] += float(token_exact.detach().cpu())
-        total["stop_acc"] += float(stop_acc.detach().cpu())
+            metrics = writer_only_metrics(
+                model,
+                batch,
+                use_future_latents=use_future_latents,
+                use_persistent_state=use_persistent_state,
+            )
+        for key in WRITER_METRIC_KEYS:
+            total[key] += float(metrics[key].detach().cpu())
         total["batches"] += 1
         if batch_idx >= max_batches:
             break
@@ -458,9 +610,27 @@ def format_log(step: int, metrics: dict) -> str:
     fields = [
         f"step={step}",
         f"loss={metrics['loss']:.4f}",
+        f"tok={metrics['token_loss']:.4f}",
+        f"act={metrics['active_token_loss']:.4f}",
+        f"guard={metrics['right_guard_token_loss']:.4f}",
+        f"left={metrics['left_consistency_loss']:.4f}",
+        f"commit={metrics['commit_loss']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
         f"token_exact={metrics['token_exact']:.4f}",
         f"stop_acc={metrics['stop_acc']:.4f}",
+        f"guard_acc={metrics['right_guard_byte_acc']:.4f}",
+        f"commit_p={metrics['commit_precision']:.4f}",
+        f"commit_r={metrics['commit_recall']:.4f}",
+        f"commit_f1={metrics['commit_f1']:.4f}",
+        f"false_commit={metrics['false_commit_rate']:.4f}",
+        f"commit_score={metrics['mean_commit_score']:.4f}",
+        f"step0_acc={metrics['step0_byte_acc']:.4f}",
+        f"stepT_acc={metrics['stepT_byte_acc']:.4f}",
+        f"step0_exact={metrics['step0_token_exact']:.4f}",
+        f"stepT_exact={metrics['stepT_token_exact']:.4f}",
+        f"self_cond={metrics['self_conditioning_ratio']:.4f}",
+        f"mask={metrics['mean_mask_ratio']:.4f}",
+        f"future_h={metrics['future_horizons']:.1f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -513,6 +683,15 @@ def parse_args():
     parser.add_argument("--commit-loss-weight", type=float, default=0.25)
     parser.add_argument("--self-conditioning-start", type=float, default=0.2)
     parser.add_argument("--self-conditioning-final", type=float, default=0.6)
+    parser.add_argument("--writer-refinement-steps", type=int, default=None)
+    parser.add_argument("--writer-commit-temperature", type=float, default=1.0)
+    parser.add_argument("--writer-commit-threshold", type=float, default=0.5)
+    parser.add_argument("--writer-gradient-checkpointing", action="store_true")
+    parser.add_argument("--disable-refinement", action="store_true")
+    parser.add_argument("--disable-step-embedding", action="store_true")
+    parser.add_argument("--disable-future-latents", action="store_true")
+    parser.add_argument("--disable-zone-noise", action="store_true")
+    parser.add_argument("--disable-persistent-state", action="store_true")
     return parser.parse_args()
 
 
@@ -543,6 +722,19 @@ def validate_args(args):
         raise ValueError("writer loss weights must be >= 0")
     if not (0.0 <= args.self_conditioning_start <= 1.0 and 0.0 <= args.self_conditioning_final <= 1.0):
         raise ValueError("self-conditioning rates must be in [0, 1]")
+    if args.writer_refinement_steps is not None and args.writer_refinement_steps <= 0:
+        raise ValueError("--writer-refinement-steps must be > 0")
+    if args.writer_commit_temperature <= 0.0:
+        raise ValueError("--writer-commit-temperature must be > 0")
+    if not (0.0 <= args.writer_commit_threshold <= 1.0):
+        raise ValueError("--writer-commit-threshold must be in [0, 1]")
+
+
+def sync_writer_runtime_config(model: Dil, config: DilConfig) -> None:
+    model.writer.writer_refinement_steps = config.writer_refinement_steps
+    model.writer.use_step_embedding = config.writer_use_step_embedding
+    model.writer.gradient_checkpointing = config.writer_gradient_checkpointing
+    model.writer.commit_temperature = config.writer_commit_temperature
 
 
 def main():
@@ -573,12 +765,22 @@ def main():
     config.writer_commit_loss_weight = args.commit_loss_weight
     config.writer_self_conditioning_start = args.self_conditioning_start
     config.writer_self_conditioning_final = args.self_conditioning_final
+    config.writer_refinement_steps = 1 if args.disable_refinement else (
+        config.writer_refinement_steps if args.writer_refinement_steps is None else args.writer_refinement_steps
+    )
+    config.writer_use_step_embedding = not args.disable_step_embedding
+    config.writer_use_zone_noise = not args.disable_zone_noise
+    config.writer_gradient_checkpointing = bool(args.writer_gradient_checkpointing)
+    config.writer_commit_temperature = args.writer_commit_temperature
+    config.writer_commit_threshold = args.writer_commit_threshold
+    sync_writer_runtime_config(model, config)
     tokenizer_vocab_path = args.checkpoint.parent / config.tokenizer_vocab_file
     tokenizer = load_hybrid_tokenizer(tokenizer_vocab_path)
     freeze_for_writer_only(model)
     model.set_compiled_forwards(
         encoder_forward=compile_forward(model.encoder.forward, compile_mode, "DilEncoderCore"),
         writer_forward=compile_forward(model.writer.forward, compile_mode, "DilConditionalWriter"),
+        transition_forward=compile_forward(model.writer.transition, compile_mode, "DilConditionalWriterTransition"),
     )
     writer_named_parameters = [
         (name, param)
@@ -658,7 +860,11 @@ def main():
         f"device={device.type} bf16={int(autocast_enabled)} compile_mode={compile_mode} "
         f"data_mode={args.data_mode} objective={WRITER_OBJECTIVE} "
         f"vocab_size={config.vocab_size} latent_size={config.latent_size} hidden_size={config.hidden_size} "
-        f"window={args.window_size} zones={args.left_frozen}|{args.active_size}|{args.right_guard} stride={args.stride}",
+        f"window={args.window_size} zones={args.left_frozen}|{args.active_size}|{args.right_guard} stride={args.stride} "
+        f"refine_steps={config.writer_refinement_steps} step_embed={int(config.writer_use_step_embedding)} "
+        f"future_latents={int(not args.disable_future_latents)} zone_noise={int(config.writer_use_zone_noise)} "
+        f"persistent_state={int(not args.disable_persistent_state)} commit_temp={config.writer_commit_temperature:.3f} "
+        f"commit_threshold={config.writer_commit_threshold:.3f}",
         flush=True,
     )
 
@@ -669,7 +875,7 @@ def main():
     data_seconds = 0.0
     compute_seconds = 0.0
     source_lines_seen: set[int] = set()
-    metric_sums = {"loss": 0.0, "byte_acc": 0.0, "token_exact": 0.0, "stop_acc": 0.0}
+    metric_sums = {key: 0.0 for key in WRITER_METRIC_KEYS}
     last_metrics = {}
     completed_step = 0
 
@@ -697,7 +903,14 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             cudagraph_step_begin(device, compile_mode)
             with autocast_context(autocast_enabled):
-                loss, byte_acc, token_exact, stop_acc = writer_only_forward(model, batch, step)
+                metrics = writer_only_metrics(
+                    model,
+                    batch,
+                    step,
+                    use_future_latents=not args.disable_future_latents,
+                    use_persistent_state=not args.disable_persistent_state,
+                )
+                loss = metrics["loss"]
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.writer.parameters(), args.max_grad_norm)
             optimizer.step()
@@ -712,10 +925,8 @@ def main():
             log_steps += 1
             if "source_line_ids" in batch:
                 source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
-            metric_sums["loss"] += float(loss.detach().cpu())
-            metric_sums["byte_acc"] += float(byte_acc.detach().cpu())
-            metric_sums["token_exact"] += float(token_exact.detach().cpu())
-            metric_sums["stop_acc"] += float(stop_acc.detach().cpu())
+            for key in WRITER_METRIC_KEYS:
+                metric_sums[key] += float(metrics[key].detach().cpu())
 
             should_log = step % args.log_every == 0 or step == 1 or step == args.max_steps
             should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0
@@ -740,6 +951,8 @@ def main():
                             autocast_enabled,
                             cuda_prefetch,
                             args.max_eval_batches,
+                            not args.disable_future_latents,
+                            not args.disable_persistent_state,
                         )
                     )
                 print(format_log(step, averaged), flush=True)

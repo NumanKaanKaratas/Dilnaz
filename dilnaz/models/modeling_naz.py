@@ -750,6 +750,7 @@ class Naz(PreTrainedModel):
         max_new_tokens: int = 16,
         min_new_tokens: Optional[int] = None,
         repetition_cos_threshold: Optional[float] = None,
+        prompt_latents: Optional[torch.Tensor] = None,
     ):
         self.eval()
         if max_new_tokens <= 0:
@@ -761,9 +762,17 @@ class Naz(PreTrainedModel):
             raise ValueError("unit_mask must be shaped [batch, units]")
         if not bool(unit_mask.all().detach().cpu()):
             raise ValueError("Naz.generate_stream expects packed prompts without unit padding")
+        if prompt_latents is not None:
+            if prompt_latents.dim() != 3 or prompt_latents.shape[:2] != input_ids.shape[:2]:
+                raise ValueError("prompt_latents must be shaped [batch, units, latent_size]")
+            if prompt_latents.shape[-1] != self.config.latent_size:
+                raise ValueError("prompt_latents last dimension must equal config.latent_size")
+            semantic_states = prompt_latents
+        else:
+            semantic_states = self.encode_sequence_latents(input_ids, word_masks, unit_mask)
 
         yield from self._generate_stream_from_semantic_states(
-            semantic_states=self.encode_sequence_latents(input_ids, word_masks, unit_mask),
+            semantic_states=semantic_states,
             unit_mask=unit_mask,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,

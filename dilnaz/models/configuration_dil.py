@@ -52,6 +52,13 @@ class DilConfig(PretrainedConfig):
         writer_noise_mid_max_cos=0.985,
         writer_noise_hard_min_cos=0.950,
         writer_noise_hard_max_cos=0.970,
+        writer_refinement_steps=1,
+        writer_use_step_embedding=True,
+        writer_max_position_age=32,
+        writer_use_zone_noise=True,
+        writer_gradient_checkpointing=False,
+        writer_commit_temperature=1.0,
+        writer_commit_threshold=0.5,
         decoder_start_token_id=None,
         tokenizer_vocab_file="hybrid_surface_vocab.json",
         nllb_model_name="facebook/nllb-200-distilled-600M",
@@ -121,6 +128,14 @@ class DilConfig(PretrainedConfig):
         )
         if any(min_cos <= 0.0 or max_cos > 1.0 or min_cos > max_cos for min_cos, max_cos in cosine_ranges):
             raise ValueError("writer noise cosine ranges must satisfy 0 < min <= max <= 1")
+        if writer_refinement_steps <= 0:
+            raise ValueError("writer_refinement_steps must be > 0")
+        if writer_max_position_age <= 0:
+            raise ValueError("writer_max_position_age must be > 0")
+        if writer_commit_temperature <= 0.0:
+            raise ValueError("writer_commit_temperature must be > 0")
+        if not (0.0 <= writer_commit_threshold <= 1.0):
+            raise ValueError("writer_commit_threshold must be in [0, 1]")
         self.byte_vocab_size = byte_vocab_size
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
@@ -174,6 +189,13 @@ class DilConfig(PretrainedConfig):
         self.writer_noise_mid_max_cos = writer_noise_mid_max_cos
         self.writer_noise_hard_min_cos = writer_noise_hard_min_cos
         self.writer_noise_hard_max_cos = writer_noise_hard_max_cos
+        self.writer_refinement_steps = writer_refinement_steps
+        self.writer_use_step_embedding = bool(writer_use_step_embedding)
+        self.writer_max_position_age = writer_max_position_age
+        self.writer_use_zone_noise = bool(writer_use_zone_noise)
+        self.writer_gradient_checkpointing = bool(writer_gradient_checkpointing)
+        self.writer_commit_temperature = writer_commit_temperature
+        self.writer_commit_threshold = writer_commit_threshold
         self.decoder_start_token_id = eos_token_id if decoder_start_token_id is None else decoder_start_token_id
         self.tokenizer_vocab_file = tokenizer_vocab_file
         self.nllb_model_name = nllb_model_name

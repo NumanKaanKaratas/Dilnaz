@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from transformers.modeling_outputs import ModelOutput
 from transformers.modeling_utils import PreTrainedModel
 
@@ -350,6 +351,13 @@ class DilConditionalWriter(nn.Module):
         self.writer_state_vocab_size = config.writer_state_vocab_size
         self.writer_empty_token_id = config.writer_empty_token_id
         self.max_window_size = config.writer_max_window_size
+        self.hidden_size = config.hidden_size
+        self.refinement_step_scale = config.initializer_range
+        self.writer_refinement_steps = config.writer_refinement_steps
+        self.use_step_embedding = config.writer_use_step_embedding
+        self.max_position_age = config.writer_max_position_age
+        self.gradient_checkpointing = config.writer_gradient_checkpointing
+        self.commit_temperature = config.writer_commit_temperature
         self.semantic_proj = nn.Linear(config.latent_size, config.hidden_size)
         self.future_proj = nn.Linear(config.latent_size, config.hidden_size, bias=False)
         self.future_gate = nn.Linear(config.hidden_size * 2, config.hidden_size)
@@ -357,6 +365,7 @@ class DilConditionalWriter(nn.Module):
         self.state_kind_embeddings = nn.Embedding(3, config.hidden_size)
         self.frozen_embeddings = nn.Embedding(2, config.hidden_size)
         self.zone_embeddings = nn.Embedding(3, config.hidden_size)
+        self.position_age_embeddings = nn.Embedding(config.writer_max_position_age + 1, config.hidden_size)
         self.word_position_embeddings = nn.Embedding(config.writer_max_window_size, config.hidden_size)
         self.position_embeddings = nn.Embedding(config.writer_max_positions, config.hidden_size)
         self.word_mixers = nn.ModuleList(
@@ -449,6 +458,21 @@ class DilConditionalWriter(nn.Module):
             raise ValueError(f"window_mask must be shaped {(batch_size, window_size)}, got {tuple(window_mask.shape)}")
         return window_mask.to(device=device, dtype=torch.bool)
 
+    def _canonical_position_age(
+        self,
+        position_age: Optional[torch.Tensor],
+        batch_size: int,
+        window_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if position_age is None:
+            return torch.zeros((batch_size, window_size), dtype=torch.long, device=device)
+        if position_age.dim() == 1:
+            position_age = position_age.unsqueeze(0).expand(batch_size, -1)
+        if position_age.shape != (batch_size, window_size):
+            raise ValueError(f"position_age must be shaped {(batch_size, window_size)}, got {tuple(position_age.shape)}")
+        return position_age.to(device=device, dtype=torch.long).clamp(0, self.max_position_age)
+
     def _state_embeddings(
         self,
         surface_state: torch.Tensor,
@@ -477,6 +501,15 @@ class DilConditionalWriter(nn.Module):
         summary = (state_hidden * summary_weight).sum(dim=2) / summary_weight.sum(dim=2).clamp_min(1.0)
         return state_hidden, summary
 
+    def _refinement_step_embedding(self, refinement_step: int | torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        step = torch.as_tensor(refinement_step, device=device, dtype=torch.float32).reshape(())
+        frequencies = torch.arange(0, self.hidden_size, 2, device=device, dtype=torch.float32)
+        angles = step * torch.exp(-math.log(10000.0) * frequencies / max(self.hidden_size, 1))
+        embedding = torch.zeros((self.hidden_size,), device=device, dtype=torch.float32)
+        embedding[0::2] = torch.sin(angles)
+        embedding[1::2] = torch.cos(angles[: embedding[1::2].shape[0]])
+        return (embedding * self.refinement_step_scale).to(dtype=dtype)
+
     def transition(
         self,
         semantic: torch.Tensor,
@@ -486,6 +519,8 @@ class DilConditionalWriter(nn.Module):
         zone_ids: Optional[torch.Tensor] = None,
         window_mask: Optional[torch.Tensor] = None,
         future_latents: Optional[torch.Tensor] = None,
+        refinement_step: Optional[int | torch.Tensor] = None,
+        position_age: Optional[torch.Tensor] = None,
     ) -> DilWriterOutput:
         semantic_window, squeeze_window = self._canonical_semantic(semantic)
         batch_size, window_size, latent_size = semantic_window.shape
@@ -519,6 +554,7 @@ class DilConditionalWriter(nn.Module):
             )
         zone_ids = self._canonical_zone_ids(zone_ids, batch_size, window_size, device)
         window_mask = self._canonical_window_mask(window_mask, batch_size, window_size, device)
+        position_age = self._canonical_position_age(position_age, batch_size, window_size, device)
 
         state_hidden, state_summary = self._state_embeddings(surface_state, surface_state_mask, frozen_mask)
         word_positions = torch.arange(window_size, device=device)
@@ -530,6 +566,7 @@ class DilConditionalWriter(nn.Module):
             )
             + state_summary
             + self.zone_embeddings(zone_ids)
+            + self.position_age_embeddings(position_age)
             + self.word_position_embeddings(word_positions).unsqueeze(0)
         )
         if future_latents is not None:
@@ -540,10 +577,19 @@ class DilConditionalWriter(nn.Module):
             future_hidden = self.future_proj(future_latents).mean(dim=2)
             future_gate = torch.sigmoid(self.future_gate(torch.cat((word_hidden, future_hidden), dim=-1)))
             word_hidden = word_hidden + future_gate * future_hidden
+        if refinement_step is not None and self.use_step_embedding:
+            word_hidden = word_hidden + self._refinement_step_embedding(
+                refinement_step,
+                device,
+                word_hidden.dtype,
+            ).view(1, 1, -1)
 
         word_hidden = self.dropout(word_hidden)
         for mixer in self.word_mixers:
-            word_hidden = mixer(word_hidden, window_mask)
+            if self.gradient_checkpointing and self.training and word_hidden.requires_grad:
+                word_hidden = checkpoint(mixer, word_hidden, window_mask, use_reentrant=False)
+            else:
+                word_hidden = mixer(word_hidden, window_mask)
 
         positions = torch.arange(self.writer_max_positions, device=semantic.device)
         hidden_states = word_hidden.unsqueeze(2) + self.position_embeddings(positions).view(1, 1, -1, word_hidden.shape[-1])
@@ -555,7 +601,10 @@ class DilConditionalWriter(nn.Module):
             self.writer_max_positions,
         )
         for block in self.blocks:
-            hidden_states = block(hidden_states, byte_mask)
+            if self.gradient_checkpointing and self.training and hidden_states.requires_grad:
+                hidden_states = checkpoint(block, hidden_states, byte_mask, use_reentrant=False)
+            else:
+                hidden_states = block(hidden_states, byte_mask)
         hidden_states = self.final_norm(hidden_states)
         token_logits = self.token_head(hidden_states).reshape(
             batch_size,
@@ -582,6 +631,8 @@ class DilConditionalWriter(nn.Module):
         zone_ids: Optional[torch.Tensor] = None,
         window_mask: Optional[torch.Tensor] = None,
         future_latents: Optional[torch.Tensor] = None,
+        refinement_step: Optional[int | torch.Tensor] = None,
+        position_age: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.transition(
             semantic,
@@ -591,6 +642,8 @@ class DilConditionalWriter(nn.Module):
             zone_ids=zone_ids,
             window_mask=window_mask,
             future_latents=future_latents,
+            refinement_step=refinement_step,
+            position_age=position_age,
         ).token_logits
 
     @torch.no_grad()
@@ -623,6 +676,8 @@ class DilConditionalWriter(nn.Module):
         zone_ids: Optional[torch.Tensor] = None,
         window_mask: Optional[torch.Tensor] = None,
         future_latents: Optional[torch.Tensor] = None,
+        refinement_steps: Optional[int] = None,
+        position_age: Optional[torch.Tensor] = None,
     ) -> tuple[torch.LongTensor, torch.Tensor, torch.LongTensor, torch.Tensor]:
         output = self.transition(
             semantic,
@@ -632,10 +687,70 @@ class DilConditionalWriter(nn.Module):
             zone_ids=zone_ids,
             window_mask=window_mask,
             future_latents=future_latents,
+            position_age=position_age,
         )
+        steps = int(self.writer_refinement_steps if refinement_steps is None else refinement_steps)
+        if steps <= 0:
+            raise ValueError("refinement_steps must be > 0")
+        surface_state_base = surface_state
+        surface_state_mask_base = surface_state_mask
+        frozen_mask_base = frozen_mask
+        for step_idx in range(1, steps):
+            generated = output.token_logits.argmax(dim=-1)
+            next_state = generated
+            next_mask = torch.full_like(generated, self.STATE_DRAFT)
+            if surface_state_base is not None:
+                base_state = self._canonical_window_arg(
+                    surface_state_base,
+                    generated.shape[0],
+                    1 if generated.dim() == 2 else generated.shape[1],
+                    torch.long,
+                    generated.device,
+                    -100,
+                )
+                if frozen_mask_base is None:
+                    frozen = torch.zeros_like(generated, dtype=torch.bool)
+                else:
+                    frozen = self._canonical_window_arg(
+                        frozen_mask_base,
+                        generated.shape[0],
+                        1 if generated.dim() == 2 else generated.shape[1],
+                        torch.bool,
+                        generated.device,
+                        False,
+                    )
+                next_state = torch.where(frozen, base_state, next_state)
+                if surface_state_mask_base is not None:
+                    base_mask = self._canonical_window_arg(
+                        surface_state_mask_base,
+                        generated.shape[0],
+                        1 if generated.dim() == 2 else generated.shape[1],
+                        torch.long,
+                        generated.device,
+                        self.STATE_EMPTY,
+                    )
+                    next_mask = torch.where(frozen, base_mask, next_mask)
+                else:
+                    next_mask = torch.where(
+                        frozen,
+                        torch.full_like(next_mask, self.STATE_KNOWN),
+                        next_mask,
+                    )
+            output = self.transition(
+                semantic,
+                surface_state=next_state,
+                surface_state_mask=next_mask,
+                frozen_mask=frozen_mask,
+                zone_ids=zone_ids,
+                window_mask=window_mask,
+                future_latents=future_latents,
+                refinement_step=step_idx,
+                position_age=position_age,
+            )
         generated = output.token_logits.argmax(dim=-1)
         token_ids, token_mask, lengths = self._decode_generated(generated)
-        return token_ids, token_mask, lengths, torch.sigmoid(output.commit_logits)
+        commit_scores = torch.sigmoid(output.commit_logits.float() / float(self.commit_temperature))
+        return token_ids, token_mask, lengths, commit_scores
 
 
 class Dil(PreTrainedModel):
@@ -704,12 +819,92 @@ class Dil(PreTrainedModel):
             return compiled_forward(semantic)
         return self.writer(semantic, **writer_kwargs)
 
-    def writer_transition_outputs(self, semantic: torch.Tensor, **writer_kwargs) -> DilWriterOutput:
-        return self.writer.transition(semantic, **writer_kwargs)
+    def _transition_output(self, semantic: torch.Tensor, **writer_kwargs) -> DilWriterOutput:
+        compiled_forward = getattr(self, "_compiled_transition_forward", None)
+        if compiled_forward is not None:
+            output = compiled_forward(semantic, **writer_kwargs)
+        else:
+            output = self.writer.transition(semantic, **writer_kwargs)
+        if isinstance(output, DilWriterOutput):
+            return output
+        token_logits, commit_logits = output
+        return DilWriterOutput(token_logits=token_logits, commit_logits=commit_logits)
 
-    def set_compiled_forwards(self, encoder_forward=None, writer_forward=None):
+    def _refined_transition_outputs(
+        self,
+        semantic: torch.Tensor,
+        refinement_steps: int,
+        return_step0: bool = False,
+        **writer_kwargs,
+    ):
+        if refinement_steps <= 0:
+            raise ValueError("refinement_steps must be > 0")
+        output = self._transition_output(semantic, **writer_kwargs)
+        step0_output = output
+        if refinement_steps == 1:
+            return (output, step0_output) if return_step0 else output
+        surface_state = writer_kwargs.get("surface_state")
+        surface_state_mask = writer_kwargs.get("surface_state_mask")
+        frozen_mask = writer_kwargs.get("frozen_mask")
+        for step_idx in range(1, refinement_steps):
+            generated = output.token_logits.argmax(dim=-1)
+            next_state = generated
+            next_mask = torch.full_like(generated, self.writer.STATE_DRAFT)
+            if surface_state is not None:
+                base_state = self.writer._canonical_window_arg(
+                    surface_state,
+                    generated.shape[0],
+                    1 if generated.dim() == 2 else generated.shape[1],
+                    torch.long,
+                    generated.device,
+                    -100,
+                )
+                if frozen_mask is None:
+                    frozen = torch.zeros_like(generated, dtype=torch.bool)
+                else:
+                    frozen = self.writer._canonical_window_arg(
+                        frozen_mask,
+                        generated.shape[0],
+                        1 if generated.dim() == 2 else generated.shape[1],
+                        torch.bool,
+                        generated.device,
+                        False,
+                    )
+                next_state = torch.where(frozen, base_state, next_state)
+                if surface_state_mask is not None:
+                    base_mask = self.writer._canonical_window_arg(
+                        surface_state_mask,
+                        generated.shape[0],
+                        1 if generated.dim() == 2 else generated.shape[1],
+                        torch.long,
+                        generated.device,
+                        self.writer.STATE_EMPTY,
+                    )
+                    next_mask = torch.where(frozen, base_mask, next_mask)
+                else:
+                    next_mask = torch.where(
+                        frozen,
+                        torch.full_like(next_mask, self.writer.STATE_KNOWN),
+                        next_mask,
+                    )
+            writer_kwargs = {
+                **writer_kwargs,
+                "surface_state": next_state,
+                "surface_state_mask": next_mask,
+                "refinement_step": step_idx,
+            }
+            output = self._transition_output(semantic, **writer_kwargs)
+        return (output, step0_output) if return_step0 else output
+
+    def writer_transition_outputs(self, semantic: torch.Tensor, **writer_kwargs) -> DilWriterOutput:
+        return_step0 = bool(writer_kwargs.pop("return_step0", False))
+        refinement_steps = int(writer_kwargs.pop("refinement_steps", self.config.writer_refinement_steps))
+        return self._refined_transition_outputs(semantic, refinement_steps, return_step0=return_step0, **writer_kwargs)
+
+    def set_compiled_forwards(self, encoder_forward=None, writer_forward=None, transition_forward=None):
         object.__setattr__(self, "_compiled_encoder_forward", encoder_forward)
         object.__setattr__(self, "_compiled_writer_forward", writer_forward)
+        object.__setattr__(self, "_compiled_transition_forward", transition_forward)
 
     def geometry_loss(
         self,
@@ -748,13 +943,23 @@ class Dil(PreTrainedModel):
         token_exact = exact / row_valid.sum().clamp_min(1).float()
         return byte_acc, token_exact, stop_acc
 
-    def writer_training_semantic(self, semantic: torch.Tensor, training_step: int | None) -> torch.Tensor:
+    def writer_training_semantic(
+        self,
+        semantic: torch.Tensor,
+        training_step: int | None,
+        zone_ids: Optional[torch.Tensor] = None,
+        window_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if not self.training:
             return semantic
         if training_step is None or training_step <= self.config.writer_noise_warmup_steps:
             return semantic
 
         prefix_shape = semantic.shape[:-1]
+        if zone_ids is not None and zone_ids.shape != prefix_shape:
+            raise ValueError("zone_ids must match semantic prefix shape for writer noise")
+        if window_mask is not None and window_mask.shape != prefix_shape:
+            raise ValueError("window_mask must match semantic prefix shape for writer noise")
         ratio = semantic.new_tensor(
             [
                 self.config.writer_noise_clean_ratio,
@@ -766,9 +971,24 @@ class Dil(PreTrainedModel):
         )
         cumulative = (ratio / ratio.sum()).cumsum(dim=0)
         draw = torch.rand(prefix_shape, device=semantic.device)
-        easy = draw.ge(cumulative[0]) & draw.lt(cumulative[1])
-        mid = draw.ge(cumulative[1]) & draw.lt(cumulative[2])
-        hard = draw.ge(cumulative[2])
+        bucket = torch.zeros(prefix_shape, device=semantic.device, dtype=torch.long)
+        bucket = bucket.masked_fill(draw.ge(cumulative[0]) & draw.lt(cumulative[1]), 1)
+        bucket = bucket.masked_fill(draw.ge(cumulative[1]) & draw.lt(cumulative[2]), 2)
+        bucket = bucket.masked_fill(draw.ge(cumulative[2]), 3)
+        if zone_ids is not None and self.config.writer_use_zone_noise:
+            zone_ids = zone_ids.to(device=semantic.device, dtype=torch.long)
+            left = zone_ids.eq(DilConditionalWriter.ZONE_LEFT)
+            right = zone_ids.eq(DilConditionalWriter.ZONE_RIGHT)
+            bucket = torch.where(left, (bucket - 1).clamp_min(0), bucket)
+            bucket = torch.where(right, (bucket + 1).clamp_max(3), bucket)
+        easy = bucket.eq(1)
+        mid = bucket.eq(2)
+        hard = bucket.eq(3)
+        if window_mask is not None:
+            valid_noise = window_mask.to(device=semantic.device, dtype=torch.bool)
+            easy = easy & valid_noise
+            mid = mid & valid_noise
+            hard = hard & valid_noise
         noised = semantic.float().clone()
         ranges = (
             (easy, self.config.writer_noise_easy_min_cos, self.config.writer_noise_easy_max_cos),
@@ -808,7 +1028,10 @@ class Dil(PreTrainedModel):
         zone_ids: torch.LongTensor,
         window_mask: torch.Tensor,
         future_latents: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        position_age: Optional[torch.Tensor] = None,
+        training_step: int | None = None,
+        return_metrics: bool = False,
+    ):
         labels = labels.to(semantic.device)
         surface_state = surface_state.to(semantic.device)
         frozen_mask = frozen_mask.to(semantic.device, dtype=torch.bool)
@@ -818,6 +1041,14 @@ class Dil(PreTrainedModel):
             surface_state_mask = surface_state_mask.to(semantic.device, dtype=torch.long)
         if future_latents is not None:
             future_latents = future_latents.to(semantic.device)
+        if position_age is not None:
+            position_age = position_age.to(semantic.device, dtype=torch.long)
+        semantic = self.writer_training_semantic(
+            semantic,
+            training_step,
+            zone_ids=zone_ids,
+            window_mask=window_mask,
+        )
         output = self.writer_transition_outputs(
             semantic,
             surface_state=surface_state,
@@ -826,7 +1057,13 @@ class Dil(PreTrainedModel):
             zone_ids=zone_ids,
             window_mask=window_mask,
             future_latents=future_latents,
+            position_age=position_age,
+            return_step0=return_metrics,
         )
+        if return_metrics:
+            output, step0_output = output
+        else:
+            step0_output = None
         logits = output.token_logits
         commit_logits = output.commit_logits
         valid = labels.ne(-100) & window_mask.unsqueeze(-1)
@@ -841,6 +1078,10 @@ class Dil(PreTrainedModel):
             reduction="none",
         ).reshape_as(labels)
         token_loss = (per_token_loss * token_weights).sum() / token_weights.sum().clamp_min(1.0)
+        active_weights = active.to(logits.dtype)
+        right_weights = right.to(logits.dtype)
+        active_token_loss = (per_token_loss * active_weights).sum() / active_weights.sum().clamp_min(1.0)
+        right_guard_token_loss = (per_token_loss * right_weights).sum() / right_weights.sum().clamp_min(1.0)
         left_weights = left.to(logits.dtype)
         left_loss = (per_token_loss * left_weights).sum() / left_weights.sum().clamp_min(1.0)
 
@@ -860,6 +1101,51 @@ class Dil(PreTrainedModel):
         )
         metric_labels = labels.masked_fill(~active, -100)
         byte_acc, token_exact, stop_acc = self.writer_metrics(logits, metric_labels)
+        if return_metrics:
+            right_metric_labels = labels.masked_fill(~right, -100)
+            right_byte_acc, right_token_exact, right_stop_acc = self.writer_metrics(logits, right_metric_labels)
+            commit_scope = (left | active) & valid
+            commit_scores = torch.sigmoid(commit_logits.float() / float(self.config.writer_commit_temperature))
+            commit_pred = commit_scores.ge(float(self.config.writer_commit_threshold)) & commit_scope
+            commit_positive = commit_target & commit_scope
+            true_positive = (commit_pred & commit_positive).sum().float()
+            predicted_positive = commit_pred.sum().float()
+            actual_positive = commit_positive.sum().float()
+            commit_precision = true_positive / predicted_positive.clamp_min(1.0)
+            commit_recall = true_positive / actual_positive.clamp_min(1.0)
+            commit_f1 = 2.0 * commit_precision * commit_recall / (commit_precision + commit_recall).clamp_min(1e-6)
+            false_commit_rate = (commit_pred & ~commit_positive).sum().float() / predicted_positive.clamp_min(1.0)
+            mean_commit_score = (
+                (commit_scores * commit_scope.to(commit_scores.dtype)).sum()
+                / commit_scope.sum().clamp_min(1).to(commit_scores.dtype)
+            )
+            step0_labels = labels.masked_fill(~active, -100)
+            step0_byte_acc, step0_token_exact, step0_stop_acc = self.writer_metrics(step0_output.token_logits, step0_labels)
+            return {
+                "loss": loss,
+                "token_loss": token_loss,
+                "active_token_loss": active_token_loss,
+                "right_guard_token_loss": right_guard_token_loss,
+                "left_consistency_loss": left_loss,
+                "commit_loss": commit_loss,
+                "byte_acc": byte_acc,
+                "token_exact": token_exact,
+                "stop_acc": stop_acc,
+                "right_guard_byte_acc": right_byte_acc,
+                "right_guard_token_exact": right_token_exact,
+                "right_guard_stop_acc": right_stop_acc,
+                "commit_precision": commit_precision,
+                "commit_recall": commit_recall,
+                "commit_f1": commit_f1,
+                "false_commit_rate": false_commit_rate,
+                "mean_commit_score": mean_commit_score,
+                "step0_byte_acc": step0_byte_acc,
+                "step0_token_exact": step0_token_exact,
+                "step0_stop_acc": step0_stop_acc,
+                "stepT_byte_acc": byte_acc,
+                "stepT_token_exact": token_exact,
+                "stepT_stop_acc": stop_acc,
+            }
         return loss, token_loss, commit_loss, byte_acc, token_exact, stop_acc
 
     def forward(
@@ -933,4 +1219,8 @@ class Dil(PreTrainedModel):
 
     @torch.no_grad()
     def decode_semantic_window(self, semantic: torch.Tensor, **writer_kwargs):
-        return self.writer.generate_window(semantic, **writer_kwargs)
+        output = self.writer_transition_outputs(semantic, **writer_kwargs)
+        generated = output.token_logits.argmax(dim=-1)
+        token_ids, token_mask, lengths = self.writer._decode_generated(generated)
+        commit_scores = torch.sigmoid(output.commit_logits.float() / float(self.config.writer_commit_temperature))
+        return token_ids, token_mask, lengths, commit_scores
