@@ -264,9 +264,9 @@ def write_tiny_ready_parquet(path: Path, config: DilConfig) -> None:
             offset = context_idx * config.max_word_bytes
             input_ids[offset] = 2 + row_idx + context_idx
             word_masks[offset] = True
-        labels = [-100] * config.max_word_bytes
+        labels = [-100] * config.writer_max_positions
         labels[0] = 2 + row_idx
-        labels[1] = config.eos_token_id
+        labels[1] = config.writer_stop_token_id
         teacher_layers = torch.randn(len(NLLB_LAYER_GROUPS), 1024, generator=torch.Generator().manual_seed(row_idx))
         input_rows.append(input_ids)
         mask_rows.append(word_masks)
@@ -676,6 +676,6 @@ def test_dil_checkpoint_format_matches_encoder_only_family():
     config = tiny_parallel_config(tokenizer)
     model = Dil(config)
 
-    assert config.checkpoint_format_version == 22
+    assert config.checkpoint_format_version == 23
     assert hasattr(model, "writer")
     assert any(key.startswith("writer.") for key in model.state_dict())

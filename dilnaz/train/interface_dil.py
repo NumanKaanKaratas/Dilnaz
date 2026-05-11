@@ -17,7 +17,7 @@ from models.modeling_dil import Dil
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 22
+CHECKPOINT_FORMAT_VERSION = 23
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:

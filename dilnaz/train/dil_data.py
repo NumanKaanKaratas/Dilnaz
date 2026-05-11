@@ -534,6 +534,7 @@ class ReadyParquetDilBatchDataset(IterableDataset):
         self.parquet_path = parquet_path
         self.context_size = config.context_size
         self.max_word_bytes = config.max_word_bytes
+        self.writer_max_positions = config.writer_max_positions
         self.teacher_layer_count = len(NLLB_LAYER_GROUPS)
         self.teacher_dim = 1024
         self.batch_size = batch_size
@@ -566,7 +567,7 @@ class ReadyParquetDilBatchDataset(IterableDataset):
         )
         labels = np.asarray([row["labels"] for row in rows], dtype=np.int64).reshape(
             len(rows),
-            self.max_word_bytes,
+            self.writer_max_positions,
         )
         teacher_layers = np.asarray([row["teacher_layers"] for row in rows], dtype=np.float32).reshape(
             len(rows),

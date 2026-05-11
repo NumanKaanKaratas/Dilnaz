@@ -44,7 +44,7 @@ from tokenization import default_vocab_path
 from trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 22
+CHECKPOINT_FORMAT_VERSION = 23
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 

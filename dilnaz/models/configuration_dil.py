@@ -28,6 +28,19 @@ class DilConfig(PretrainedConfig):
         writer_conv_kernel_size=5,
         writer_conv_expansion=4,
         writer_dropout=0.1,
+        writer_max_window_size=32,
+        writer_word_mixer_layers=2,
+        writer_word_attention_heads=8,
+        writer_sliding_window_size=32,
+        writer_left_frozen=8,
+        writer_active_size=20,
+        writer_right_guard=4,
+        writer_stride=20,
+        writer_right_guard_loss_weight=0.2,
+        writer_left_consistency_weight=0.5,
+        writer_commit_loss_weight=0.25,
+        writer_self_conditioning_start=0.2,
+        writer_self_conditioning_final=0.6,
         writer_noise_warmup_steps=1000,
         writer_noise_clean_ratio=0.10,
         writer_noise_easy_ratio=0.70,
@@ -46,7 +59,7 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=22,
+        checkpoint_format_version=23,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:
@@ -61,6 +74,34 @@ class DilConfig(PretrainedConfig):
             raise ValueError("byte_conv_kernel_size must be a positive odd integer")
         if writer_conv_kernel_size <= 0 or writer_conv_kernel_size % 2 == 0:
             raise ValueError("writer_conv_kernel_size must be a positive odd integer")
+        if writer_max_window_size <= 0:
+            raise ValueError("writer_max_window_size must be > 0")
+        if writer_word_mixer_layers < 0:
+            raise ValueError("writer_word_mixer_layers must be >= 0")
+        if writer_word_attention_heads <= 0:
+            raise ValueError("writer_word_attention_heads must be > 0")
+        if hidden_size % writer_word_attention_heads != 0:
+            raise ValueError("hidden_size must be divisible by writer_word_attention_heads")
+        if writer_sliding_window_size <= 0:
+            raise ValueError("writer_sliding_window_size must be > 0")
+        if writer_left_frozen < 0 or writer_active_size <= 0 or writer_right_guard < 0:
+            raise ValueError("writer window zones must satisfy left >= 0, active > 0, right >= 0")
+        if writer_left_frozen + writer_active_size + writer_right_guard != writer_sliding_window_size:
+            raise ValueError("writer window zones must sum to writer_sliding_window_size")
+        if writer_stride <= 0 or writer_stride > writer_active_size:
+            raise ValueError("writer_stride must be in 1..writer_active_size")
+        if writer_sliding_window_size > writer_max_window_size:
+            raise ValueError("writer_sliding_window_size must be <= writer_max_window_size")
+        if writer_right_guard_loss_weight < 0.0:
+            raise ValueError("writer_right_guard_loss_weight must be >= 0")
+        if writer_left_consistency_weight < 0.0:
+            raise ValueError("writer_left_consistency_weight must be >= 0")
+        if writer_commit_loss_weight < 0.0:
+            raise ValueError("writer_commit_loss_weight must be >= 0")
+        if not (0.0 <= writer_self_conditioning_start <= 1.0):
+            raise ValueError("writer_self_conditioning_start must be in [0, 1]")
+        if not (0.0 <= writer_self_conditioning_final <= 1.0):
+            raise ValueError("writer_self_conditioning_final must be in [0, 1]")
         writer_noise_ratios = (
             writer_noise_clean_ratio,
             writer_noise_easy_ratio,
@@ -107,6 +148,21 @@ class DilConfig(PretrainedConfig):
         self.writer_vocab_size = vocab_size + 1
         self.writer_stop_token_id = vocab_size
         self.writer_max_positions = max_word_bytes + 1
+        self.writer_state_vocab_size = self.writer_vocab_size + 1
+        self.writer_empty_token_id = self.writer_vocab_size
+        self.writer_max_window_size = writer_max_window_size
+        self.writer_word_mixer_layers = writer_word_mixer_layers
+        self.writer_word_attention_heads = writer_word_attention_heads
+        self.writer_sliding_window_size = writer_sliding_window_size
+        self.writer_left_frozen = writer_left_frozen
+        self.writer_active_size = writer_active_size
+        self.writer_right_guard = writer_right_guard
+        self.writer_stride = writer_stride
+        self.writer_right_guard_loss_weight = writer_right_guard_loss_weight
+        self.writer_left_consistency_weight = writer_left_consistency_weight
+        self.writer_commit_loss_weight = writer_commit_loss_weight
+        self.writer_self_conditioning_start = writer_self_conditioning_start
+        self.writer_self_conditioning_final = writer_self_conditioning_final
         self.writer_noise_warmup_steps = writer_noise_warmup_steps
         self.writer_noise_clean_ratio = writer_noise_clean_ratio
         self.writer_noise_easy_ratio = writer_noise_easy_ratio

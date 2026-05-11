@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.optim import AdamW
+from torch.utils.data import IterableDataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -26,15 +27,196 @@ from byte_trainer_utils import (  # noqa: E402
     rng_state,
     validate_compile_environment,
 )
-from dil_data import HybridDilBatchDataset, ResidentDilBatcher, ResidentDilEvalLoader, load_hybrid_tokenizer, make_dil_batch_loader  # noqa: E402
+from dil_data import (  # noqa: E402
+    ResidentDilBatcher,
+    ResidentDilEvalLoader,
+    context_offsets,
+    load_hybrid_tokenizer,
+    make_dil_batch_loader,
+    segment_piece_ids,
+    stream_teacher_text_items,
+    trainable_segments,
+)
 from dilnaz_config import DIL_TRAIN_DEFAULTS  # noqa: E402
 from models.configuration_dil import DilConfig  # noqa: E402
 from models.modeling_dil import Dil  # noqa: E402
 from trainer_core import make_adamw_param_groups, make_scheduler  # noqa: E402
 
 
-CHECKPOINT_FORMAT_VERSION = 22
-WRITER_OBJECTIVE = "plain_text_writer_only"
+CHECKPOINT_FORMAT_VERSION = 23
+WRITER_OBJECTIVE = "sliding_block_writer_online_encoder"
+
+
+class HybridDilSlidingWindowDataset(IterableDataset):
+    def __init__(
+        self,
+        train_file: Path,
+        config: DilConfig,
+        tokenizer,
+        batch_size: int,
+        read_chars: int,
+        repeat: bool = True,
+        max_samples: int = 0,
+        window_size: int | None = None,
+        left_frozen: int | None = None,
+        active_size: int | None = None,
+        right_guard: int | None = None,
+        stride: int | None = None,
+    ):
+        super().__init__()
+        self.train_file = train_file
+        self.config = config
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size
+        self.read_chars = read_chars
+        self.repeat = repeat
+        self.max_samples = max_samples
+        self.window_size = config.writer_sliding_window_size if window_size is None else window_size
+        self.left_frozen = config.writer_left_frozen if left_frozen is None else left_frozen
+        self.active_size = config.writer_active_size if active_size is None else active_size
+        self.right_guard = config.writer_right_guard if right_guard is None else right_guard
+        self.stride = config.writer_stride if stride is None else stride
+        if self.left_frozen + self.active_size + self.right_guard != self.window_size:
+            raise ValueError("writer window zones must sum to window_size")
+        if self.stride <= 0 or self.stride > self.active_size:
+            raise ValueError("stride must be in 1..active_size")
+        self.zone_template = torch.full((self.window_size,), 1, dtype=torch.long)
+        self.zone_template[: self.left_frozen] = 0
+        self.zone_template[self.left_frozen + self.active_size :] = 2
+        self._carry_texts: list[str] = []
+        self._carry_line_ids: list[int] = []
+        self._carry_segments = []
+        self._carry_refs: list[tuple[int, int]] = []
+        self._produced = 0
+
+    def write_segment(self, target: np.ndarray, mask: np.ndarray, context_idx: int, segment):
+        piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
+        width = piece_ids.shape[0]
+        if width <= 0 or width > self.config.max_word_bytes:
+            return
+        target[context_idx, :width] = piece_ids
+        mask[context_idx, :width] = True
+
+    def make_batch(self, texts: list[str], line_ids: list[int], segments_by_text: list, refs: list[tuple[int, int]]):
+        batch_size = len(refs)
+        input_ids = np.full(
+            (batch_size, self.window_size, self.config.context_size, self.config.max_word_bytes),
+            self.config.pad_token_id,
+            dtype=np.int64,
+        )
+        word_masks = np.zeros(
+            (batch_size, self.window_size, self.config.context_size, self.config.max_word_bytes),
+            dtype=np.bool_,
+        )
+        labels = np.full(
+            (batch_size, self.window_size, self.config.writer_max_positions),
+            -100,
+            dtype=np.int64,
+        )
+        window_mask = np.zeros((batch_size, self.window_size), dtype=np.bool_)
+        source_line_ids = np.zeros((batch_size,), dtype=np.int64)
+
+        for batch_idx, (text_idx, active_start) in enumerate(refs):
+            segments = segments_by_text[text_idx]
+            source_line_ids[batch_idx] = line_ids[text_idx]
+            window_start = active_start - self.left_frozen
+            for window_idx in range(self.window_size):
+                token_idx = window_start + window_idx
+                if token_idx < 0 or token_idx >= len(segments):
+                    continue
+                window_mask[batch_idx, window_idx] = True
+                segment = segments[token_idx]
+                for context_idx, offset in enumerate(context_offsets(self.config.context_radius)):
+                    source_idx = token_idx + offset
+                    if 0 <= source_idx < len(segments):
+                        self.write_segment(
+                            input_ids[batch_idx, window_idx],
+                            word_masks[batch_idx, window_idx],
+                            context_idx,
+                            segments[source_idx],
+                        )
+                piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
+                labels[batch_idx, window_idx, : piece_ids.shape[0]] = piece_ids
+                labels[batch_idx, window_idx, piece_ids.shape[0]] = self.config.writer_stop_token_id
+
+        return {
+            "input_ids": torch.from_numpy(input_ids),
+            "word_masks": torch.from_numpy(word_masks),
+            "labels": torch.from_numpy(labels),
+            "zone_ids": self.zone_template.unsqueeze(0).expand(batch_size, -1).clone(),
+            "window_mask": torch.from_numpy(window_mask),
+            "source_line_ids": torch.from_numpy(source_line_ids),
+        }
+
+    def carry_batch(self):
+        if not self._carry_refs:
+            return None
+        batch = self.make_batch(self._carry_texts, self._carry_line_ids, self._carry_segments, self._carry_refs)
+        self._carry_texts = []
+        self._carry_line_ids = []
+        self._carry_segments = []
+        self._carry_refs = []
+        return batch
+
+    def iter_once(self, worker_id: int, worker_count: int):
+        texts = self._carry_texts
+        line_ids = self._carry_line_ids
+        segments_by_text = self._carry_segments
+        refs = self._carry_refs
+        self._carry_texts = []
+        self._carry_line_ids = []
+        self._carry_segments = []
+        self._carry_refs = []
+
+        for text_idx, (source_line_id, text) in enumerate(stream_teacher_text_items(self.train_file, self.read_chars)):
+            if text_idx % worker_count != worker_id:
+                continue
+            segments = trainable_segments(self.tokenizer, text, self.config.max_word_bytes)
+            if not segments:
+                continue
+            local_text_idx = len(texts)
+            texts.append(text)
+            line_ids.append(source_line_id)
+            segments_by_text.append(segments)
+            for active_start in range(0, len(segments), self.stride):
+                refs.append((local_text_idx, active_start))
+                self._produced += 1
+                if len(refs) == self.batch_size:
+                    yield self.make_batch(texts, line_ids, segments_by_text, refs)
+                    texts, line_ids, segments_by_text, refs = [], [], [], []
+                    if active_start + self.stride < len(segments):
+                        local_text_idx = 0
+                        texts.append(text)
+                        line_ids.append(source_line_id)
+                        segments_by_text.append(segments)
+                if self.max_samples > 0 and self._produced >= self.max_samples:
+                    if refs:
+                        yield self.make_batch(texts, line_ids, segments_by_text, refs)
+                    return
+
+        if refs and not self.repeat:
+            yield self.make_batch(texts, line_ids, segments_by_text, refs)
+        elif refs:
+            self._carry_texts = texts
+            self._carry_line_ids = line_ids
+            self._carry_segments = segments_by_text
+            self._carry_refs = refs
+
+    def __iter__(self):
+        from torch.utils.data import get_worker_info
+
+        worker = get_worker_info()
+        worker_id = 0 if worker is None else worker.id
+        worker_count = 1 if worker is None else worker.num_workers
+        while True:
+            yielded = False
+            for batch in self.iter_once(worker_id, worker_count):
+                yielded = True
+                yield batch
+            if not yielded and not self._carry_refs:
+                raise ValueError(f"{self.train_file} produced no sliding writer windows")
+            if not self.repeat:
+                return
 
 
 def freeze_for_writer_only(model: Dil):
@@ -46,7 +228,119 @@ def freeze_for_writer_only(model: Dil):
     model.writer.train()
 
 
+def self_conditioning_probability(config: DilConfig, training_step: int | None) -> float:
+    if training_step is None:
+        return 0.0
+    start = float(config.writer_self_conditioning_start)
+    final = float(config.writer_self_conditioning_final)
+    if training_step <= 1000:
+        return start
+    if training_step >= 10000:
+        return final
+    ratio = (training_step - 1000) / 9000.0
+    return start + ratio * (final - start)
+
+
+def synthetic_surface_state(
+    config: DilConfig,
+    labels: torch.Tensor,
+    zone_ids: torch.Tensor,
+    window_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = labels.device
+    valid = labels.ne(-100) & window_mask.unsqueeze(-1)
+    left = zone_ids.eq(0).unsqueeze(-1) & valid
+    surface_state = torch.full_like(labels, -100)
+    surface_state_mask = torch.zeros_like(labels)
+    frozen_mask = torch.zeros_like(labels, dtype=torch.bool)
+
+    draw = torch.rand(labels.shape, device=device)
+    draft = valid & draw.lt(0.55)
+    known = valid & draw.ge(0.55) & draw.lt(0.75)
+    corrupt = draft & torch.rand(labels.shape, device=device).lt(0.30)
+    random_tokens = torch.randint(config.writer_vocab_size, labels.shape, device=device, dtype=torch.long)
+    surface_state[draft | known] = labels[draft | known]
+    surface_state[corrupt] = random_tokens[corrupt]
+    surface_state[left] = labels[left]
+    surface_state_mask[draft] = 1
+    surface_state_mask[known | left] = 2
+    frozen_mask[known | left] = True
+    return surface_state, surface_state_mask, frozen_mask
+
+
+@torch.no_grad()
+def self_conditioned_surface_state(
+    model: Dil,
+    semantic: torch.Tensor,
+    labels: torch.Tensor,
+    zone_ids: torch.Tensor,
+    window_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    output = model.writer_transition_outputs(
+        semantic,
+        zone_ids=zone_ids,
+        window_mask=window_mask,
+    )
+    valid = labels.ne(-100) & window_mask.unsqueeze(-1)
+    left = zone_ids.eq(0).unsqueeze(-1) & valid
+    surface_state = output.token_logits.argmax(dim=-1).masked_fill(~valid, -100)
+    surface_state[left] = labels[left]
+    surface_state_mask = torch.where(valid, torch.ones_like(labels), torch.zeros_like(labels))
+    surface_state_mask[left] = 2
+    frozen_mask = torch.zeros_like(labels, dtype=torch.bool)
+    frozen_mask[left] = True
+    return surface_state, surface_state_mask, frozen_mask
+
+
+def sliding_writer_forward(
+    model: Dil,
+    batch: dict,
+    training_step: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_ids = batch["input_ids"]
+    labels = batch["labels"].to(input_ids.device)
+    word_masks = batch["word_masks"]
+    zone_ids = batch["zone_ids"].to(input_ids.device)
+    window_mask = batch["window_mask"].to(input_ids.device, dtype=torch.bool)
+    batch_size, window_size, context_size, byte_width = input_ids.shape
+    with torch.no_grad():
+        flat_semantic = model.encode(
+            input_ids.reshape(batch_size * window_size, context_size, byte_width),
+            word_masks.reshape(batch_size * window_size, context_size, byte_width),
+        ).float()
+        semantic = flat_semantic.reshape(batch_size, window_size, -1)
+
+    probability = self_conditioning_probability(model.config, training_step)
+    if model.training and torch.rand((), device=input_ids.device).item() < probability:
+        surface_state, surface_state_mask, frozen_mask = self_conditioned_surface_state(
+            model,
+            semantic,
+            labels,
+            zone_ids,
+            window_mask,
+        )
+    else:
+        surface_state, surface_state_mask, frozen_mask = synthetic_surface_state(
+            model.config,
+            labels,
+            zone_ids,
+            window_mask,
+        )
+    loss, _, _, byte_acc, token_exact, stop_acc = model.writer_transition_loss_and_metrics(
+        semantic.detach(),
+        labels,
+        surface_state,
+        surface_state_mask,
+        frozen_mask,
+        zone_ids,
+        window_mask,
+    )
+    return loss, byte_acc, token_exact, stop_acc
+
+
 def writer_only_forward(model: Dil, batch: dict, training_step: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if batch["input_ids"].dim() == 4:
+        return sliding_writer_forward(model, batch, training_step)
     labels = batch["labels"].to(batch["input_ids"].device)
     with torch.no_grad():
         semantic = model.encode(batch["input_ids"], batch["word_masks"]).float()
@@ -54,27 +348,22 @@ def writer_only_forward(model: Dil, batch: dict, training_step: int | None = Non
     return loss, byte_acc, token_exact, stop_acc
 
 
-def materialize_writer_batches(dataset: HybridDilBatchDataset, device: torch.device, batch_size: int, seed: int):
+def materialize_writer_batches(dataset, device: torch.device, batch_size: int, seed: int):
     batches = [
         {
             key: value.detach().cpu()
             for key, value in batch.items()
-            if key in ("input_ids", "word_masks", "labels", "source_line_ids")
+            if key in ("input_ids", "word_masks", "labels", "source_line_ids", "zone_ids", "window_mask")
         }
         for batch in dataset.iter_once(worker_id=0, worker_count=1)
     ]
-    if dataset._carry_refs:
-        batch = dataset.make_batch(
-            dataset._carry_texts,
-            dataset._carry_line_ids,
-            dataset._carry_segments_by_text,
-            dataset._carry_refs,
-        )
+    carry_batch = dataset.carry_batch() if hasattr(dataset, "carry_batch") else None
+    if carry_batch is not None:
         batches.append(
             {
                 key: value.detach().cpu()
-                for key, value in batch.items()
-                if key in ("input_ids", "word_masks", "labels", "source_line_ids")
+                for key, value in carry_batch.items()
+                if key in ("input_ids", "word_masks", "labels", "source_line_ids", "zone_ids", "window_mask")
             }
         )
     return ResidentDilBatcher(batches, batch_size=batch_size, device=device, seed=seed)
@@ -111,6 +400,11 @@ def save_checkpoint(
         "context_radius": config.context_radius,
         "target_index": config.target_index,
         "latent_size": config.latent_size,
+        "writer_window_size": config.writer_sliding_window_size,
+        "writer_left_frozen": config.writer_left_frozen,
+        "writer_active_size": config.writer_active_size,
+        "writer_right_guard": config.writer_right_guard,
+        "writer_stride": config.writer_stride,
     }
     torch.save(
         {
@@ -209,6 +503,16 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=DIL_TRAIN_DEFAULTS["seed"])
     parser.add_argument("--max-samples", type=int, default=DIL_TRAIN_DEFAULTS["max_samples"])
     parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--window-size", type=int, default=32)
+    parser.add_argument("--left-frozen", type=int, default=8)
+    parser.add_argument("--active-size", type=int, default=20)
+    parser.add_argument("--right-guard", type=int, default=4)
+    parser.add_argument("--stride", type=int, default=20)
+    parser.add_argument("--right-guard-loss-weight", type=float, default=0.2)
+    parser.add_argument("--left-consistency-weight", type=float, default=0.5)
+    parser.add_argument("--commit-loss-weight", type=float, default=0.25)
+    parser.add_argument("--self-conditioning-start", type=float, default=0.2)
+    parser.add_argument("--self-conditioning-final", type=float, default=0.6)
     return parser.parse_args()
 
 
@@ -231,6 +535,14 @@ def validate_args(args):
         raise ValueError("--num-workers must be >= 0")
     if args.data_mode == "resident" and args.max_samples > 0:
         raise ValueError("--max-samples is not supported with --data-mode resident")
+    if args.left_frozen + args.active_size + args.right_guard != args.window_size:
+        raise ValueError("--left-frozen + --active-size + --right-guard must equal --window-size")
+    if args.stride <= 0 or args.stride > args.active_size:
+        raise ValueError("--stride must be in 1..--active-size")
+    if min(args.right_guard_loss_weight, args.left_consistency_weight, args.commit_loss_weight) < 0.0:
+        raise ValueError("writer loss weights must be >= 0")
+    if not (0.0 <= args.self_conditioning_start <= 1.0 and 0.0 <= args.self_conditioning_final <= 1.0):
+        raise ValueError("self-conditioning rates must be in [0, 1]")
 
 
 def main():
@@ -249,6 +561,18 @@ def main():
     cuda_prefetch = bool(device.type == "cuda" and not args.no_cuda_prefetch)
 
     model, config, checkpoint = load_model_checkpoint(args.checkpoint, device)
+    if args.window_size > config.writer_max_window_size:
+        raise ValueError("--window-size must be <= config.writer_max_window_size")
+    config.writer_sliding_window_size = args.window_size
+    config.writer_left_frozen = args.left_frozen
+    config.writer_active_size = args.active_size
+    config.writer_right_guard = args.right_guard
+    config.writer_stride = args.stride
+    config.writer_right_guard_loss_weight = args.right_guard_loss_weight
+    config.writer_left_consistency_weight = args.left_consistency_weight
+    config.writer_commit_loss_weight = args.commit_loss_weight
+    config.writer_self_conditioning_start = args.self_conditioning_start
+    config.writer_self_conditioning_final = args.self_conditioning_final
     tokenizer_vocab_path = args.checkpoint.parent / config.tokenizer_vocab_file
     tokenizer = load_hybrid_tokenizer(tokenizer_vocab_path)
     freeze_for_writer_only(model)
@@ -272,7 +596,7 @@ def main():
         scheduler.load_state_dict(checkpoint["writer_scheduler_state_dict"])
         restore_rng_state(checkpoint["rng_state"])
 
-    train_dataset = HybridDilBatchDataset(
+    train_dataset = HybridDilSlidingWindowDataset(
         args.train_file,
         config,
         tokenizer,
@@ -280,16 +604,26 @@ def main():
         read_chars=args.text_read_chars,
         repeat=True,
         max_samples=args.max_samples,
+        window_size=args.window_size,
+        left_frozen=args.left_frozen,
+        active_size=args.active_size,
+        right_guard=args.right_guard,
+        stride=args.stride,
     )
     eval_dataset = None
     if args.eval_every > 0:
-        eval_dataset = HybridDilBatchDataset(
+        eval_dataset = HybridDilSlidingWindowDataset(
             args.eval_file,
             config,
             tokenizer,
             batch_size=args.eval_batch_size,
             read_chars=args.text_read_chars,
             repeat=False,
+            window_size=args.window_size,
+            left_frozen=args.left_frozen,
+            active_size=args.active_size,
+            right_guard=args.right_guard,
+            stride=args.stride,
         )
 
     if args.data_mode == "resident":
@@ -323,7 +657,8 @@ def main():
     print(
         f"device={device.type} bf16={int(autocast_enabled)} compile_mode={compile_mode} "
         f"data_mode={args.data_mode} objective={WRITER_OBJECTIVE} "
-        f"vocab_size={config.vocab_size} latent_size={config.latent_size} hidden_size={config.hidden_size}",
+        f"vocab_size={config.vocab_size} latent_size={config.latent_size} hidden_size={config.hidden_size} "
+        f"window={args.window_size} zones={args.left_frozen}|{args.active_size}|{args.right_guard} stride={args.stride}",
         flush=True,
     )
 

@@ -63,6 +63,17 @@ class FakeGeneratedDil:
         self.decoded_steps = decoded_steps
         self.calls = 0
         self.cursor = 0
+        self.config = DilConfig(
+            vocab_size=tokenizer.vocab_size,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            hidden_size=8,
+            intermediate_size=16,
+            num_encoder_layers=2,
+            latent_size=1,
+            max_word_bytes=max_word_bytes,
+            context_radius=1,
+        )
 
     def decode_semantic(self, latent: torch.Tensor):
         self.calls += 1
@@ -82,6 +93,29 @@ class FakeGeneratedDil:
             lengths[row_idx] = ids.numel()
         return token_ids, token_masks, lengths
 
+    def decode_semantic_window(self, semantic: torch.Tensor, **writer_kwargs):
+        del writer_kwargs
+        self.calls += 1
+        batch_size, window_size = semantic.shape[:2]
+        token_ids = torch.full((batch_size, window_size, self.max_word_bytes), self.tokenizer.pad_token_id, dtype=torch.long)
+        token_masks = torch.zeros_like(token_ids, dtype=torch.bool)
+        lengths = torch.zeros((batch_size, window_size), dtype=torch.long)
+        commit_scores = torch.ones((batch_size, window_size, self.config.writer_max_positions), dtype=torch.float32)
+        for row_idx in range(batch_size):
+            for slot_idx in range(self.config.writer_left_frozen, window_size):
+                if self.cursor >= len(self.decoded_steps):
+                    break
+                value = self.decoded_steps[self.cursor]
+                self.cursor += 1
+                if value is None:
+                    continue
+                segment = next(segment for segment in self.tokenizer.encode_segments(value) if segment.piece_len > 0)
+                ids = torch.tensor(segment.token_ids, dtype=torch.long)
+                token_ids[row_idx, slot_idx, : ids.numel()] = ids
+                token_masks[row_idx, slot_idx, : ids.numel()] = True
+                lengths[row_idx, slot_idx] = ids.numel()
+        return token_ids, token_masks, lengths, commit_scores
+
 
 class FakeGeneratedNaz:
     def __init__(self, tokenizer, max_word_bytes: int, decoded_steps: list[str | None]):
@@ -98,6 +132,7 @@ class FakeGeneratedNaz:
         for _ in range(max_new_tokens):
             yield SimpleNamespace(
                 latent=torch.zeros((batch_size, 1), dtype=torch.float32),
+                future_latents=torch.zeros((batch_size, 2, 1), dtype=torch.float32),
                 should_stop=torch.zeros((batch_size,), dtype=torch.bool),
             )
 
@@ -335,7 +370,7 @@ def test_dil_config_uses_left_context_contract():
     assert config.context_size == 5
     assert config.target_index == 2
     assert list(context_offsets(2)) == [-2, -1, 0, 1, 2]
-    assert config.checkpoint_format_version == 22
+    assert config.checkpoint_format_version == 23
     assert config.writer_max_positions == config.max_word_bytes + 1
     assert config.writer_stop_token_id == config.vocab_size
     assert config.writer_vocab_size == config.vocab_size + 1
@@ -349,7 +384,7 @@ def test_dil_rejects_pre_parallel_writer_checkpoint_family():
     try:
         Dil(config)
     except ValueError as error:
-        assert "checkpoint_format_version=22" in str(error)
+        assert "checkpoint_format_version=23" in str(error)
     else:
         raise AssertionError("Dil accepted stale checkpoint_format_version")
 
@@ -472,6 +507,37 @@ def test_dil_parallel_writer_outputs_surface_stop_logits():
     assert token_ids.shape == (3, config.max_word_bytes)
     assert token_masks.shape == (3, config.max_word_bytes)
     assert lengths.shape == (3,)
+
+
+def test_dil_sliding_writer_outputs_token_and_commit_logits():
+    config = tiny_config()
+    model = Dil(config)
+    semantic = torch.randn(2, config.writer_sliding_window_size, config.latent_size)
+    surface_state = torch.full(
+        (2, config.writer_sliding_window_size, config.writer_max_positions),
+        -100,
+        dtype=torch.long,
+    )
+    frozen_mask = torch.zeros_like(surface_state, dtype=torch.bool)
+    zone_ids = torch.full((2, config.writer_sliding_window_size), 1, dtype=torch.long)
+    zone_ids[:, : config.writer_left_frozen] = 0
+    zone_ids[:, config.writer_left_frozen + config.writer_active_size :] = 2
+    output = model.writer_transition_outputs(
+        semantic,
+        surface_state=surface_state,
+        frozen_mask=frozen_mask,
+        zone_ids=zone_ids,
+    )
+
+    assert output.token_logits.shape == (
+        2,
+        config.writer_sliding_window_size,
+        config.writer_max_positions,
+        config.writer_vocab_size,
+    )
+    assert output.commit_logits.shape == (2, config.writer_sliding_window_size, config.writer_max_positions)
+    assert config.writer_empty_token_id != config.writer_stop_token_id
+    assert config.writer_state_vocab_size == config.writer_vocab_size + 1
 
 
 def test_dil_forward_keeps_target_latent_shape():
@@ -634,6 +700,47 @@ def test_dil_writer_only_step_freezes_encoder():
     assert grad_abs_sum(model.encoder.hidden_to_semantic.weight) == 0.0
     assert not hasattr(model, "semantic_normalizer")
     assert model.writer.token_head.weight.grad is not None
+
+
+def test_sliding_writer_only_step_keeps_online_encoder_frozen():
+    config = tiny_config()
+    model = Dil(config)
+    freeze_for_writer_only(model)
+    batch_size = 1
+    window_size = config.writer_sliding_window_size
+    input_ids = torch.full(
+        (batch_size, window_size, config.context_size, config.max_word_bytes),
+        config.pad_token_id,
+        dtype=torch.long,
+    )
+    input_ids[:, :, config.target_index, 0] = 2
+    word_masks = input_ids.ne(config.pad_token_id)
+    labels = torch.full((batch_size, window_size, config.writer_max_positions), -100, dtype=torch.long)
+    labels[:, :, 0] = 2
+    labels[:, :, 1] = config.writer_stop_token_id
+    zone_ids = torch.full((batch_size, window_size), 1, dtype=torch.long)
+    zone_ids[:, : config.writer_left_frozen] = 0
+    zone_ids[:, config.writer_left_frozen + config.writer_active_size :] = 2
+    window_mask = torch.ones((batch_size, window_size), dtype=torch.bool)
+    batch = {
+        "input_ids": input_ids,
+        "word_masks": word_masks,
+        "labels": labels,
+        "zone_ids": zone_ids,
+        "window_mask": window_mask,
+    }
+
+    loss, byte_acc, token_exact, stop_acc = writer_only_forward(model, batch, training_step=1)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(byte_acc)
+    assert torch.isfinite(token_exact)
+    assert torch.isfinite(stop_acc)
+    assert grad_abs_sum(model.encoder.embed_tokens.weight) == 0.0
+    assert grad_abs_sum(model.encoder.hidden_to_semantic.weight) == 0.0
+    assert model.writer.token_head.weight.grad is not None
+    assert model.writer.commit_head.weight.grad is not None
 
 
 def test_naz_encodes_active_dil_latents(tmp_path):
@@ -1231,6 +1338,7 @@ def test_naz_generate_stream_yields_latent_steps(tmp_path):
     assert len(steps) == 3
     for step in steps:
         assert step.latent.shape == (1, dil_config.latent_size)
+        assert step.future_latents.shape == (1, model.config.mtp_horizons - 1, dil_config.latent_size)
         assert step.latent_cos_to_previous.shape == (1,)
         assert step.should_stop.shape == (1,)
 

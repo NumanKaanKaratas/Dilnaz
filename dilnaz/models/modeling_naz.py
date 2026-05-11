@@ -49,6 +49,7 @@ class NazGenerationOutput(ModelOutput):
 @dataclass
 class NazGenerationStep(ModelOutput):
     latent: Optional[torch.FloatTensor] = None
+    future_latents: Optional[torch.FloatTensor] = None
     latent_cos_to_previous: Optional[torch.FloatTensor] = None
     should_stop: Optional[torch.Tensor] = None
     candidate_index: Optional[torch.LongTensor] = None
@@ -723,11 +724,13 @@ class Naz(PreTrainedModel):
             past_key_values = outputs.past_key_values
             dynamics = self.semantic_head(outputs.last_hidden_state[:, -1:])
             model_latent = dynamics.selected_latents[:, 0, 0].float()
+            future_latents = dynamics.selected_latents[:, 0, 1:].float()
             candidate_index = dynamics.selected_indices[:, 0, 0]
             repeated = F.cosine_similarity(previous_model_latent.float(), model_latent.float(), dim=-1).ge(repetition_cos_threshold)
             should_stop = repeated & torch.full_like(repeated, generated_idx + 1 >= min_new_tokens)
             yield NazGenerationStep(
                 latent=model_latent,
+                future_latents=future_latents,
                 latent_cos_to_previous=F.cosine_similarity(previous_model_latent.float(), model_latent.float(), dim=-1),
                 should_stop=should_stop,
                 candidate_index=candidate_index,
