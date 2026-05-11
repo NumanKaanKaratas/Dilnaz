@@ -38,6 +38,18 @@ DIL_MODEL_DEFAULTS = {
     "writer_gradient_checkpointing": False,
     "writer_commit_temperature": 1.0,
     "writer_commit_threshold": 0.5,
+    "writer_commit_min_precision": 0.98,
+    "writer_diffusion_steps": 4,
+    "writer_diffusion_min_mask_ratio": 0.05,
+    "writer_diffusion_max_mask_ratio": 0.95,
+    "writer_state_corruption_max_ratio": 0.35,
+    "writer_future_noise_min_cos": 0.970,
+    "writer_future_noise_max_cos": 0.995,
+    "writer_future_noised_start_step": 2000,
+    "writer_future_predicted_start_step": 10000,
+    "writer_future_mixed_start_step": 14000,
+    "writer_future_mix_ratio": 0.50,
+    "writer_future_latent_mode": "curriculum",
 }
 
 

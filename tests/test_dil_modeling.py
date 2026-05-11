@@ -36,7 +36,14 @@ from train_naz import (
     parse_args as parse_naz_args,
     validate_args as validate_naz_args,
 )
-from train_dil_writer import freeze_for_writer_only, writer_only_forward
+from train_dil_writer import (
+    build_future_latents,
+    calibrate_emit_logits,
+    freeze_for_writer_only,
+    resolve_future_mode,
+    sample_diffusion_step,
+    writer_only_forward,
+)
 from interface_naz import SlidingWriterBuffer, stream_text as stream_naz_text
 
 
@@ -408,7 +415,7 @@ def test_dil_config_uses_left_context_contract():
     assert config.context_size == 5
     assert config.target_index == 2
     assert list(context_offsets(2)) == [-2, -1, 0, 1, 2]
-    assert config.checkpoint_format_version == 23
+    assert config.checkpoint_format_version == 24
     assert config.writer_max_positions == config.max_word_bytes + 1
     assert config.writer_stop_token_id == config.vocab_size
     assert config.writer_vocab_size == config.vocab_size + 1
@@ -422,7 +429,7 @@ def test_dil_rejects_pre_parallel_writer_checkpoint_family():
     try:
         Dil(config)
     except ValueError as error:
-        assert "checkpoint_format_version=23" in str(error)
+        assert "checkpoint_format_version=24" in str(error)
     else:
         raise AssertionError("Dil accepted stale checkpoint_format_version")
 
@@ -569,7 +576,7 @@ def test_dil_parallel_writer_outputs_surface_stop_logits():
     assert lengths.shape == (3,)
 
 
-def test_dil_sliding_writer_outputs_token_and_commit_logits():
+def test_dil_sliding_writer_outputs_token_state_and_emit_logits():
     config = tiny_config()
     model = Dil(config)
     semantic = torch.randn(2, config.writer_sliding_window_size, config.latent_size)
@@ -595,12 +602,13 @@ def test_dil_sliding_writer_outputs_token_and_commit_logits():
         config.writer_max_positions,
         config.writer_vocab_size,
     )
-    assert output.commit_logits.shape == (2, config.writer_sliding_window_size, config.writer_max_positions)
+    assert output.state_valid_logits.shape == (2, config.writer_sliding_window_size, config.writer_max_positions)
+    assert output.emit_logits.shape == (2, config.writer_sliding_window_size, config.writer_max_positions)
     assert config.writer_empty_token_id != config.writer_stop_token_id
     assert config.writer_state_vocab_size == config.writer_vocab_size + 1
 
 
-def test_dil_refinement_steps_default_backward_compatible():
+def test_dil_refinement_steps_default_matches_single_step():
     config = tiny_config()
     model = Dil(config).eval()
     semantic = torch.randn(2, config.writer_sliding_window_size, config.latent_size)
@@ -877,7 +885,77 @@ def test_sliding_writer_only_step_keeps_online_encoder_frozen():
     assert grad_abs_sum(model.encoder.embed_tokens.weight) == 0.0
     assert grad_abs_sum(model.encoder.hidden_to_semantic.weight) == 0.0
     assert model.writer.token_head.weight.grad is not None
-    assert model.writer.commit_head.weight.grad is not None
+    assert model.writer.state_valid_head.weight.grad is not None
+    assert model.writer.emit_head.weight.grad is not None
+
+
+def test_writer_eval_diffusion_step_uses_low_noise_endpoint():
+    config = tiny_config()
+    config.writer_diffusion_steps = 4
+    config.writer_diffusion_min_mask_ratio = 0.05
+    config.writer_diffusion_max_mask_ratio = 0.95
+    step, mask_ratio = sample_diffusion_step(config, torch.device("cpu"), training_step=None)
+
+    assert step == 3
+    assert abs(mask_ratio - 0.05) < 1e-6
+
+
+def test_emit_calibration_prefers_precision_constrained_threshold():
+    logits = torch.tensor([4.0, 3.0, -1.0, -2.0])
+    targets = torch.tensor([1.0, 1.0, 0.0, 0.0])
+
+    calibration = calibrate_emit_logits(logits, targets, min_precision=0.95)
+
+    assert calibration["precision"] >= 0.95
+    assert calibration["recall"] >= 0.99
+    assert 0.0 <= calibration["threshold"] <= 1.0
+    assert calibration["temperature"] > 0.0
+
+
+def test_predicted_future_curriculum_pads_short_naz_horizons():
+    class ShortHorizonPredictor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+        def predict_semantic_dynamics(self, semantic_states, unit_mask, attention_mask=None):
+            batch_size, window_size, latent_size = semantic_states.shape
+            selected = torch.ones((batch_size, window_size, 2, latent_size), device=semantic_states.device)
+            return SimpleNamespace(selected_latents=selected)
+
+    config = tiny_config()
+    config.writer_future_mix_ratio = 1.0
+    true_future = torch.full((1, 3, 4, config.latent_size), 7.0)
+    semantic = torch.zeros((1, 3, config.latent_size))
+    window_mask = torch.ones((1, 3), dtype=torch.bool)
+
+    future_latents, mode_id = build_future_latents(
+        config,
+        true_future,
+        semantic,
+        window_mask,
+        ShortHorizonPredictor(),
+        "mixed",
+    )
+
+    assert mode_id == 4.0
+    assert future_latents.shape == true_future.shape
+    assert torch.allclose(future_latents[:, :, :2], torch.ones_like(future_latents[:, :, :2]))
+    assert torch.allclose(future_latents[:, :, 2:], torch.zeros_like(future_latents[:, :, 2:]))
+
+
+def test_future_curriculum_has_true_noised_predicted_mixed_phases():
+    config = tiny_config()
+    config.writer_future_noised_start_step = 2
+    config.writer_future_predicted_start_step = 4
+    config.writer_future_mixed_start_step = 6
+    predictor = object()
+
+    assert resolve_future_mode(config, 1, predictor, "curriculum") == "true"
+    assert resolve_future_mode(config, 2, predictor, "curriculum") == "noised"
+    assert resolve_future_mode(config, 4, predictor, "curriculum") == "predicted"
+    assert resolve_future_mode(config, 6, predictor, "curriculum") == "mixed"
+    assert resolve_future_mode(config, 6, None, "curriculum") == "noised"
 
 
 def test_naz_encodes_active_dil_latents(tmp_path):

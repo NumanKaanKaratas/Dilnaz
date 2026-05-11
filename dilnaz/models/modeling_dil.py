@@ -30,7 +30,8 @@ class DilOutput(ModelOutput):
 @dataclass
 class DilWriterOutput(ModelOutput):
     token_logits: Optional[torch.FloatTensor] = None
-    commit_logits: Optional[torch.FloatTensor] = None
+    state_valid_logits: Optional[torch.FloatTensor] = None
+    emit_logits: Optional[torch.FloatTensor] = None
 
 
 def semantic_unit_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -396,7 +397,8 @@ class DilConditionalWriter(nn.Module):
         )
         self.final_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.token_head = nn.Linear(config.hidden_size, config.writer_vocab_size, bias=False)
-        self.commit_head = nn.Linear(config.hidden_size, 1, bias=True)
+        self.state_valid_head = nn.Linear(config.hidden_size, 1, bias=True)
+        self.emit_head = nn.Linear(config.hidden_size, 1, bias=True)
         self.dropout = nn.Dropout(config.writer_dropout)
 
     def _canonical_semantic(self, semantic: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -612,15 +614,25 @@ class DilConditionalWriter(nn.Module):
             self.writer_max_positions,
             self.writer_vocab_size,
         )
-        commit_logits = self.commit_head(hidden_states).squeeze(-1).reshape(
+        state_valid_logits = self.state_valid_head(hidden_states).squeeze(-1).reshape(
+            batch_size,
+            window_size,
+            self.writer_max_positions,
+        )
+        emit_logits = self.emit_head(hidden_states).squeeze(-1).reshape(
             batch_size,
             window_size,
             self.writer_max_positions,
         )
         if squeeze_window:
             token_logits = token_logits.squeeze(1)
-            commit_logits = commit_logits.squeeze(1)
-        return DilWriterOutput(token_logits=token_logits, commit_logits=commit_logits)
+            state_valid_logits = state_valid_logits.squeeze(1)
+            emit_logits = emit_logits.squeeze(1)
+        return DilWriterOutput(
+            token_logits=token_logits,
+            state_valid_logits=state_valid_logits,
+            emit_logits=emit_logits,
+        )
 
     def forward(
         self,
@@ -749,7 +761,7 @@ class DilConditionalWriter(nn.Module):
             )
         generated = output.token_logits.argmax(dim=-1)
         token_ids, token_mask, lengths = self._decode_generated(generated)
-        commit_scores = torch.sigmoid(output.commit_logits.float() / float(self.commit_temperature))
+        commit_scores = torch.sigmoid(output.emit_logits.float() / float(self.commit_temperature))
         return token_ids, token_mask, lengths, commit_scores
 
 
@@ -758,8 +770,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 23:
-            raise ValueError("DIL sliding block writer checkpoints require checkpoint_format_version=23")
+        if config.checkpoint_format_version != 24:
+            raise ValueError("DIL block diffusion writer checkpoints require checkpoint_format_version=24")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
@@ -827,8 +839,12 @@ class Dil(PreTrainedModel):
             output = self.writer.transition(semantic, **writer_kwargs)
         if isinstance(output, DilWriterOutput):
             return output
-        token_logits, commit_logits = output
-        return DilWriterOutput(token_logits=token_logits, commit_logits=commit_logits)
+        token_logits, state_valid_logits, emit_logits = output
+        return DilWriterOutput(
+            token_logits=token_logits,
+            state_valid_logits=state_valid_logits,
+            emit_logits=emit_logits,
+        )
 
     def _refined_transition_outputs(
         self,
@@ -1029,6 +1045,7 @@ class Dil(PreTrainedModel):
         window_mask: torch.Tensor,
         future_latents: Optional[torch.Tensor] = None,
         position_age: Optional[torch.Tensor] = None,
+        training_refinement_step: Optional[int] = None,
         training_step: int | None = None,
         return_metrics: bool = False,
     ):
@@ -1058,6 +1075,8 @@ class Dil(PreTrainedModel):
             window_mask=window_mask,
             future_latents=future_latents,
             position_age=position_age,
+            refinement_step=training_refinement_step,
+            refinement_steps=1 if training_refinement_step is not None else self.config.writer_refinement_steps,
             return_step0=return_metrics,
         )
         if return_metrics:
@@ -1065,7 +1084,8 @@ class Dil(PreTrainedModel):
         else:
             step0_output = None
         logits = output.token_logits
-        commit_logits = output.commit_logits
+        state_valid_logits = output.state_valid_logits
+        emit_logits = output.emit_logits
         valid = labels.ne(-100) & window_mask.unsqueeze(-1)
         left = zone_ids.eq(DilConditionalWriter.ZONE_LEFT).unsqueeze(-1) & valid
         active = zone_ids.eq(DilConditionalWriter.ZONE_ACTIVE).unsqueeze(-1) & valid
@@ -1086,14 +1106,29 @@ class Dil(PreTrainedModel):
         left_loss = (per_token_loss * left_weights).sum() / left_weights.sum().clamp_min(1.0)
 
         state_matches = surface_state.eq(labels) & valid
-        commit_target = state_matches & (left | active)
-        commit_weights = ((left | active).to(logits.dtype) + right.to(logits.dtype) * 0.0) * valid.to(logits.dtype)
-        commit_per_pos = F.binary_cross_entropy_with_logits(
-            commit_logits.float(),
-            commit_target.to(dtype=torch.float32),
+        state_present = surface_state_mask.gt(0) if surface_state_mask is not None else surface_state.ge(0)
+        state_valid_scope = (left | active) & valid & state_present
+        state_valid_target = state_matches & state_valid_scope
+        state_valid_weights = state_valid_scope.to(logits.dtype)
+        state_valid_per_pos = F.binary_cross_entropy_with_logits(
+            state_valid_logits.float(),
+            state_valid_target.to(dtype=torch.float32),
             reduction="none",
         ).to(logits.dtype)
-        commit_loss = (commit_per_pos * commit_weights).sum() / commit_weights.sum().clamp_min(1.0)
+        state_valid_loss = (state_valid_per_pos * state_valid_weights).sum() / state_valid_weights.sum().clamp_min(1.0)
+
+        predictions = logits.argmax(dim=-1)
+        output_matches = predictions.eq(labels) & valid
+        emit_scope = (left | active) & valid
+        emit_target = output_matches & emit_scope
+        emit_weights = emit_scope.to(logits.dtype)
+        emit_per_pos = F.binary_cross_entropy_with_logits(
+            emit_logits.float(),
+            emit_target.to(dtype=torch.float32),
+            reduction="none",
+        ).to(logits.dtype)
+        emit_loss = (emit_per_pos * emit_weights).sum() / emit_weights.sum().clamp_min(1.0)
+        commit_loss = state_valid_loss + emit_loss
         loss = (
             token_loss
             + left_loss * self.config.writer_left_consistency_weight
@@ -1104,10 +1139,10 @@ class Dil(PreTrainedModel):
         if return_metrics:
             right_metric_labels = labels.masked_fill(~right, -100)
             right_byte_acc, right_token_exact, right_stop_acc = self.writer_metrics(logits, right_metric_labels)
-            commit_scope = (left | active) & valid
-            commit_scores = torch.sigmoid(commit_logits.float() / float(self.config.writer_commit_temperature))
+            commit_scope = emit_scope
+            commit_scores = torch.sigmoid(emit_logits.float() / float(self.config.writer_commit_temperature))
             commit_pred = commit_scores.ge(float(self.config.writer_commit_threshold)) & commit_scope
-            commit_positive = commit_target & commit_scope
+            commit_positive = emit_target & commit_scope
             true_positive = (commit_pred & commit_positive).sum().float()
             predicted_positive = commit_pred.sum().float()
             actual_positive = commit_positive.sum().float()
@@ -1128,6 +1163,8 @@ class Dil(PreTrainedModel):
                 "right_guard_token_loss": right_guard_token_loss,
                 "left_consistency_loss": left_loss,
                 "commit_loss": commit_loss,
+                "state_valid_loss": state_valid_loss,
+                "emit_loss": emit_loss,
                 "byte_acc": byte_acc,
                 "token_exact": token_exact,
                 "stop_acc": stop_acc,
@@ -1145,6 +1182,8 @@ class Dil(PreTrainedModel):
                 "stepT_byte_acc": byte_acc,
                 "stepT_token_exact": token_exact,
                 "stepT_stop_acc": stop_acc,
+                "emit_calibration_logits": emit_logits.detach().float()[commit_scope],
+                "emit_calibration_targets": commit_positive.detach()[commit_scope].float(),
             }
         return loss, token_loss, commit_loss, byte_acc, token_exact, stop_acc
 
@@ -1222,5 +1261,5 @@ class Dil(PreTrainedModel):
         output = self.writer_transition_outputs(semantic, **writer_kwargs)
         generated = output.token_logits.argmax(dim=-1)
         token_ids, token_mask, lengths = self.writer._decode_generated(generated)
-        commit_scores = torch.sigmoid(output.commit_logits.float() / float(self.config.writer_commit_temperature))
+        commit_scores = torch.sigmoid(output.emit_logits.float() / float(self.config.writer_commit_temperature))
         return token_ids, token_mask, lengths, commit_scores

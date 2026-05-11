@@ -59,6 +59,18 @@ class DilConfig(PretrainedConfig):
         writer_gradient_checkpointing=False,
         writer_commit_temperature=1.0,
         writer_commit_threshold=0.5,
+        writer_commit_min_precision=0.98,
+        writer_diffusion_steps=4,
+        writer_diffusion_min_mask_ratio=0.05,
+        writer_diffusion_max_mask_ratio=0.95,
+        writer_state_corruption_max_ratio=0.35,
+        writer_future_noise_min_cos=0.970,
+        writer_future_noise_max_cos=0.995,
+        writer_future_noised_start_step=2000,
+        writer_future_predicted_start_step=10000,
+        writer_future_mixed_start_step=14000,
+        writer_future_mix_ratio=0.50,
+        writer_future_latent_mode="curriculum",
         decoder_start_token_id=None,
         tokenizer_vocab_file="hybrid_surface_vocab.json",
         nllb_model_name="facebook/nllb-200-distilled-600M",
@@ -66,7 +78,7 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=23,
+        checkpoint_format_version=24,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:
@@ -136,6 +148,24 @@ class DilConfig(PretrainedConfig):
             raise ValueError("writer_commit_temperature must be > 0")
         if not (0.0 <= writer_commit_threshold <= 1.0):
             raise ValueError("writer_commit_threshold must be in [0, 1]")
+        if not (0.0 < writer_commit_min_precision <= 1.0):
+            raise ValueError("writer_commit_min_precision must be in (0, 1]")
+        if writer_diffusion_steps <= 0:
+            raise ValueError("writer_diffusion_steps must be > 0")
+        if not (0.0 <= writer_diffusion_min_mask_ratio <= writer_diffusion_max_mask_ratio <= 1.0):
+            raise ValueError("writer diffusion mask ratio bounds must satisfy 0 <= min <= max <= 1")
+        if not (0.0 <= writer_state_corruption_max_ratio <= 1.0):
+            raise ValueError("writer_state_corruption_max_ratio must be in [0, 1]")
+        if writer_future_noise_min_cos <= 0.0 or writer_future_noise_max_cos > 1.0 or writer_future_noise_min_cos > writer_future_noise_max_cos:
+            raise ValueError("writer future noise cosine range must satisfy 0 < min <= max <= 1")
+        if writer_future_noised_start_step < 0 or writer_future_predicted_start_step < 0 or writer_future_mixed_start_step < 0:
+            raise ValueError("writer future curriculum start steps must be >= 0")
+        if writer_future_predicted_start_step > writer_future_mixed_start_step:
+            raise ValueError("writer_future_predicted_start_step must be <= writer_future_mixed_start_step")
+        if not (0.0 <= writer_future_mix_ratio <= 1.0):
+            raise ValueError("writer_future_mix_ratio must be in [0, 1]")
+        if writer_future_latent_mode not in {"curriculum", "true", "noised", "predicted", "mixed"}:
+            raise ValueError("writer_future_latent_mode must be one of curriculum,true,noised,predicted,mixed")
         self.byte_vocab_size = byte_vocab_size
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
@@ -196,6 +226,18 @@ class DilConfig(PretrainedConfig):
         self.writer_gradient_checkpointing = bool(writer_gradient_checkpointing)
         self.writer_commit_temperature = writer_commit_temperature
         self.writer_commit_threshold = writer_commit_threshold
+        self.writer_commit_min_precision = writer_commit_min_precision
+        self.writer_diffusion_steps = writer_diffusion_steps
+        self.writer_diffusion_min_mask_ratio = writer_diffusion_min_mask_ratio
+        self.writer_diffusion_max_mask_ratio = writer_diffusion_max_mask_ratio
+        self.writer_state_corruption_max_ratio = writer_state_corruption_max_ratio
+        self.writer_future_noise_min_cos = writer_future_noise_min_cos
+        self.writer_future_noise_max_cos = writer_future_noise_max_cos
+        self.writer_future_noised_start_step = writer_future_noised_start_step
+        self.writer_future_predicted_start_step = writer_future_predicted_start_step
+        self.writer_future_mixed_start_step = writer_future_mixed_start_step
+        self.writer_future_mix_ratio = writer_future_mix_ratio
+        self.writer_future_latent_mode = writer_future_latent_mode
         self.decoder_start_token_id = eos_token_id if decoder_start_token_id is None else decoder_start_token_id
         self.tokenizer_vocab_file = tokenizer_vocab_file
         self.nllb_model_name = nllb_model_name
