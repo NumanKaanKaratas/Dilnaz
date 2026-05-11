@@ -44,7 +44,7 @@ from tokenization import default_vocab_path
 from trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 21
+CHECKPOINT_FORMAT_VERSION = 22
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -230,10 +230,6 @@ def empty_metric_sums() -> dict:
         "distill": 0.0,
         "writer": 0.0,
         "writer_token": 0.0,
-        "geom_l1": 0.0,
-        "geom_l2": 0.0,
-        "geom_l3": 0.0,
-        "geom_l4": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
         "byte_acc": 0.0,
@@ -249,9 +245,6 @@ def accumulate_output_metrics(total: dict, outputs, batch: dict) -> None:
     total["distill"] += float(outputs.distill_loss.detach().cpu())
     total["writer"] += float(outputs.writer_loss.detach().cpu())
     total["writer_token"] += float(outputs.writer_token_loss.detach().cpu())
-    layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
-    for idx in range(4):
-        total[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
     total["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     total["var"] += float(outputs.variance_loss.detach().cpu())
     total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
@@ -281,10 +274,6 @@ def format_log(step, metrics):
         f"distill={metrics['distill']:.4f}",
         f"writer={metrics['writer']:.4f}",
         f"writer_tok={metrics['writer_token']:.4f}",
-        f"geom_l1={metrics['geom_l1']:.4f}",
-        f"geom_l2={metrics['geom_l2']:.4f}",
-        f"geom_l3={metrics['geom_l3']:.4f}",
-        f"geom_l4={metrics['geom_l4']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
@@ -325,6 +314,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--text-read-chars", type=int, default=DIL_TRAIN_DEFAULTS["text_read_chars"])
     parser.add_argument("--prefetch-factor", type=int, default=DIL_TRAIN_DEFAULTS["prefetch_factor"])
     parser.add_argument("--no-cuda-prefetch", action="store_true")
+    parser.add_argument("--sync-timing", action="store_true")
     parser.add_argument("--learning-rate", type=float, default=DIL_TRAIN_DEFAULTS["learning_rate"])
     parser.add_argument("--weight-decay", type=float, default=DIL_TRAIN_DEFAULTS["weight_decay"])
     parser.add_argument("--adam-beta1", type=float, default=DIL_TRAIN_DEFAULTS["adam_beta1"])
@@ -350,7 +340,6 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--byte-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_expansion"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
-    parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
     parser.add_argument("--writer-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["writer_loss_weight"])
@@ -427,7 +416,6 @@ def build_config(args, tokenizer):
         byte_conv_expansion=args.byte_conv_expansion,
         dil_dropout=args.dil_dropout,
         distillation_weight=args.distillation_weight,
-        layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
         writer_loss_weight=args.writer_loss_weight,
@@ -465,12 +453,11 @@ class DilBaseTrainer(BaseTrainer):
         self.model = Dil(self.config).to(self.device)
         self.model.train()
         self.optimizer = AdamW(
-            self.model.parameters(),
+            self.optimizer_param_groups(args.weight_decay),
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
-            weight_decay=args.weight_decay,
         )
-        self.scheduler = make_scheduler(self.optimizer, args.learning_rate, args.warmup_steps)
+        self.scheduler = make_scheduler(self.optimizer, args.learning_rate, args.warmup_steps, args.max_steps)
         self.teacher = self.build_teacher()
         if args.resume is not None:
             self.start_step, self.last_metrics = restore_checkpoint(

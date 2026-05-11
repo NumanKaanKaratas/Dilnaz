@@ -30,6 +30,8 @@ from models.configuration_dil import DilConfig  # noqa: E402
 from models.configuration_naz import NazConfig  # noqa: E402
 from models.modeling_naz import Naz  # noqa: E402
 from naz_data import (  # noqa: E402
+    MemmapNazSemanticBatcher,
+    MemmapNazSemanticEvalLoader,
     ResidentNazBatcher,
     ResidentNazSemanticBatcher,
     ResidentNazSemanticEvalLoader,
@@ -41,9 +43,10 @@ from tokenization import HybridTokenizer  # noqa: E402
 from trainer_core import BaseTrainer, StepResult, make_scheduler  # noqa: E402
 
 
-CHECKPOINT_FORMAT_VERSION = 25
+CHECKPOINT_FORMAT_VERSION = 26
 OBJECTIVE = "semantic_dynamics_moe_mtp_v1"
 DATALOADER_WORKER_EXIT = "DataLoader worker"
+SEMANTIC_CACHE_FORMAT_VERSION = 1
 STAGES = ("pretrain", "finetune")
 RUNTIME_STATE_FIELDS = (
     "data_mode",
@@ -61,6 +64,7 @@ RUNTIME_STATE_FIELDS = (
     "eval_every",
     "max_eval_batches",
     "text_read_chars",
+    "semantic_cache_chunk_tokens",
     "num_workers",
     "prefetch_factor",
     "seed",
@@ -312,7 +316,7 @@ def build_resident_semantic_cache(
     token_count = surface_batcher.token_count
     positions = surface_batcher.positions.reshape(1, 1, surface_batcher.max_word_bytes)
     context_radius = model.dil_config.context_radius
-    means = []
+    latent_chunks = []
     for start in range(0, token_count, chunk_tokens):
         end = min(start + chunk_tokens, token_count)
         context_start = max(0, start - context_radius)
@@ -322,14 +326,89 @@ def build_resident_semantic_cache(
         masks = positions < token_lengths
         unit_mask = torch.ones(ids.shape[:2], dtype=torch.bool, device=ids.device)
         with autocast_context(autocast_enabled):
-            mean, _ = model.latent_distribution(ids, masks, unit_mask)
+            active_latents = model.encode_active_dil_latents(ids, masks, unit_mask)
         local_start = start - context_start
         local_end = local_start + end - start
-        mean = mean.reshape(1, context_end - context_start, -1)[:, local_start:local_end]
-        means.append(mean.squeeze(0).float())
-    semantic_states = torch.cat(means, dim=0)
+        latents = active_latents.reshape(1, context_end - context_start, -1)[:, local_start:local_end]
+        latent_chunks.append(latents.squeeze(0).float())
+    semantic_states = torch.cat(latent_chunks, dim=0)
     model.train()
     return semantic_states, semantic_states, surface_batcher.byte_ids, surface_batcher.lengths
+
+
+def semantic_cache_paths(cache_dir: Path, ids_path: Path, checksum: str) -> tuple[Path, Path]:
+    key = f"{ids_path.stem}.{checksum[:24]}.semantic"
+    return cache_dir / f"{key}.latents.npy", cache_dir / f"{key}.json"
+
+
+@torch.no_grad()
+def build_memmap_semantic_cache(
+    model: Naz,
+    ids_path: Path,
+    lengths_path: Path,
+    token_count: int,
+    chunk_tokens: int,
+    autocast_enabled: bool,
+    cache_dir: Path,
+    checksum: str,
+) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    latents_path, meta_path = semantic_cache_paths(cache_dir, ids_path, checksum)
+    expected_meta = {
+        "format_version": SEMANTIC_CACHE_FORMAT_VERSION,
+        "token_count": token_count,
+        "latent_size": model.config.latent_size,
+        "max_word_bytes": model.config.max_word_bytes,
+        "dil_checksum": checksum,
+        "ids_path": str(ids_path.resolve()),
+        "lengths_path": str(lengths_path.resolve()),
+    }
+    if latents_path.exists() and meta_path.exists():
+        with meta_path.open("r", encoding="utf-8") as handle:
+            meta = json.load(handle)
+        if all(meta.get(key) == value for key, value in expected_meta.items()):
+            return latents_path
+
+    byte_ids = np.load(ids_path, mmap_mode="r")
+    lengths = np.load(lengths_path, mmap_mode="r")
+    semantic = np.lib.format.open_memmap(
+        latents_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(token_count, model.config.latent_size),
+    )
+
+    was_training = model.training
+    model.eval()
+    device = next(model.parameters()).device
+    positions = torch.arange(model.config.max_word_bytes, device=device).reshape(1, 1, model.config.max_word_bytes)
+    context_radius = model.dil_config.context_radius
+    for start in range(0, token_count, chunk_tokens):
+        end = min(start + chunk_tokens, token_count)
+        context_start = max(0, start - context_radius)
+        context_end = min(token_count, end + context_radius)
+        ids = torch.from_numpy(np.asarray(byte_ids[context_start:context_end], dtype=np.int64)).to(
+            device,
+            non_blocking=True,
+        ).unsqueeze(0)
+        token_lengths = torch.from_numpy(np.asarray(lengths[context_start:context_end], dtype=np.int64)).to(
+            device,
+            non_blocking=True,
+        ).reshape(1, -1, 1)
+        masks = positions < token_lengths
+        unit_mask = torch.ones(ids.shape[:2], dtype=torch.bool, device=device)
+        with autocast_context(autocast_enabled):
+            active_latents = model.encode_active_dil_latents(ids, masks, unit_mask)
+        local_start = start - context_start
+        local_end = local_start + end - start
+        chunk_latents = active_latents.reshape(1, context_end - context_start, -1)[:, local_start:local_end]
+        semantic[start:end] = chunk_latents.squeeze(0).float().cpu().numpy()
+    semantic.flush()
+    with meta_path.open("w", encoding="utf-8") as handle:
+        json.dump(expected_meta, handle, indent=2)
+    if was_training:
+        model.train()
+    return latents_path
 
 
 def run_naz_batch(model: Naz, batch: dict, training_step: int | None = None):
@@ -353,7 +432,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--compile-mode", choices=COMPILE_MODE_CHOICES, default=None)
-    parser.add_argument("--data-mode", choices=("streaming", "resident"), default=None)
+    parser.add_argument("--data-mode", choices=("streaming", "resident", "cached"), default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--eval-batch-size", type=int, default=None)
@@ -369,10 +448,12 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--eval-every", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument("--text-read-chars", type=int, default=None)
+    parser.add_argument("--semantic-cache-chunk-tokens", type=int, default=None)
     parser.add_argument("--token-cache-dir", type=Path, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--prefetch-factor", type=int, default=None)
     parser.add_argument("--no-cuda-prefetch", action="store_true")
+    parser.add_argument("--sync-timing", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--hidden-size", type=int, default=NAZ_MODEL_DEFAULTS["hidden_size"])
@@ -436,6 +517,8 @@ def validate_common_args(args) -> None:
         raise ValueError("--sequence-length must be > 0")
     if args.text_read_chars <= 0:
         raise ValueError("--text-read-chars must be > 0")
+    if args.semantic_cache_chunk_tokens <= 0:
+        raise ValueError("--semantic-cache-chunk-tokens must be > 0")
     if args.max_eval_batches <= 0:
         raise ValueError("--max-eval-batches must be > 0")
     if args.num_workers < 0:
@@ -593,12 +676,11 @@ class NazBaseTrainer(BaseTrainer):
         self.model = Naz(self.config).to(self.device)
         self.model.train()
         self.optimizer = AdamW(
-            self.trainable_parameters(),
+            self.optimizer_param_groups(args.weight_decay),
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
-            weight_decay=args.weight_decay,
         )
-        self.scheduler = make_scheduler(self.optimizer, args.learning_rate, args.warmup_steps)
+        self.scheduler = make_scheduler(self.optimizer, args.learning_rate, args.warmup_steps, args.max_steps)
         self.initial_dil_checksum = dil_checksum(self.model)
         self.restore_or_initialize()
         self.model.dil_model.set_compiled_forwards(
@@ -639,6 +721,8 @@ class NazBaseTrainer(BaseTrainer):
     def prepare_data_sources(self) -> None:
         if self.args.data_mode == "resident":
             self.prepare_resident_sources()
+        elif self.args.data_mode == "cached":
+            self.prepare_cached_sources()
         else:
             self.prepare_streaming_sources()
 
@@ -667,7 +751,7 @@ class NazBaseTrainer(BaseTrainer):
             *build_resident_semantic_cache(
                 self.model,
                 train_surface,
-                chunk_tokens=4096,
+                chunk_tokens=self.args.semantic_cache_chunk_tokens,
                 autocast_enabled=self.autocast_enabled,
             ),
             sequence_length=self.args.sequence_length,
@@ -700,12 +784,75 @@ class NazBaseTrainer(BaseTrainer):
                     *build_resident_semantic_cache(
                         self.model,
                         eval_surface,
-                        chunk_tokens=4096,
+                        chunk_tokens=self.args.semantic_cache_chunk_tokens,
                         autocast_enabled=self.autocast_enabled,
                     ),
                     sequence_length=self.args.sequence_length,
                     batch_size=self.args.eval_batch_size,
                     seed=self.args.seed + 1,
+                    horizons=self.config.mtp_horizons,
+                ),
+                batch_size=self.args.eval_batch_size,
+            )
+
+    def prepare_cached_sources(self) -> None:
+        token_cache_dir = self.args.token_cache_dir or self.args.output_dir / "naz_token_cache"
+        train_ids_path, train_lengths_path, train_token_count = build_token_cache(
+            self.args.train_file,
+            self.tokenizer,
+            self.dil_config.max_word_bytes,
+            self.dil_config.pad_token_id,
+            self.args.text_read_chars,
+            token_cache_dir,
+        )
+        train_semantic_path = build_memmap_semantic_cache(
+            self.model,
+            train_ids_path,
+            train_lengths_path,
+            train_token_count,
+            chunk_tokens=self.args.semantic_cache_chunk_tokens,
+            autocast_enabled=self.autocast_enabled,
+            cache_dir=token_cache_dir,
+            checksum=self.initial_dil_checksum,
+        )
+        self.train_iterator = MemmapNazSemanticBatcher(
+            train_semantic_path,
+            token_count=train_token_count,
+            latent_size=self.config.latent_size,
+            sequence_length=self.args.sequence_length,
+            batch_size=self.args.batch_size,
+            seed=self.args.seed + self.start_step,
+            device=self.device,
+            horizons=self.config.mtp_horizons,
+        )
+        if self.args.eval_every > 0:
+            eval_ids_path, eval_lengths_path, eval_token_count = build_token_cache(
+                self.args.eval_file,
+                self.tokenizer,
+                self.dil_config.max_word_bytes,
+                self.dil_config.pad_token_id,
+                self.args.text_read_chars,
+                token_cache_dir,
+            )
+            eval_semantic_path = build_memmap_semantic_cache(
+                self.model,
+                eval_ids_path,
+                eval_lengths_path,
+                eval_token_count,
+                chunk_tokens=self.args.semantic_cache_chunk_tokens,
+                autocast_enabled=self.autocast_enabled,
+                cache_dir=token_cache_dir,
+                checksum=self.initial_dil_checksum,
+            )
+            self.eval_loader = MemmapNazSemanticEvalLoader(
+                MemmapNazSemanticBatcher(
+                    eval_semantic_path,
+                    token_count=eval_token_count,
+                    latent_size=self.config.latent_size,
+                    sequence_length=self.args.sequence_length,
+                    batch_size=self.args.eval_batch_size,
+                    seed=self.args.seed + 1,
+                    device=self.device,
                     horizons=self.config.mtp_horizons,
                 ),
                 batch_size=self.args.eval_batch_size,
@@ -749,7 +896,7 @@ class NazBaseTrainer(BaseTrainer):
     def build_eval_iterator(self):
         if self.eval_loader is None:
             return None
-        if self.args.data_mode == "resident":
+        if self.args.data_mode in {"resident", "cached"}:
             return iter(self.eval_loader)
         return DeviceBatchPrefetcher(self.eval_loader, self.device, self.cuda_prefetch)
 

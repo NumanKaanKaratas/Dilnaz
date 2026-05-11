@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -141,8 +142,6 @@ class NazStudentCore(nn.Module):
         )
         self.backbone = NazSemanticBackbone(config)
         self.semantic_head = SemanticDynamicsMixtureHead(config)
-        self.last_moe_balance_loss = torch.zeros(())
-        self.last_moe_usage = torch.empty(0)
 
     def embed_semantic_states(self, semantic_states: torch.Tensor) -> torch.Tensor:
         return self.semantic_embed_proj(semantic_states)
@@ -154,7 +153,7 @@ class NazStudentCore(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[NazBackboneCache] = None,
         use_cache: bool = False,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         inputs_embeds = self.embed_semantic_states(semantic_states)
         output = self.backbone(
             inputs_embeds=inputs_embeds,
@@ -162,9 +161,7 @@ class NazStudentCore(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
         )
-        self.last_moe_balance_loss = output.moe_balance_loss
-        self.last_moe_usage = output.moe_usage
-        return output.last_hidden_state
+        return output.last_hidden_state, output.moe_balance_loss, output.moe_usage
 
 
 class Naz(PreTrainedModel):
@@ -181,14 +178,20 @@ class Naz(PreTrainedModel):
         self.reconstruction_loss_weight = config.reconstruction_loss_weight
         self.repetition_cos_threshold = config.repetition_cos_threshold
         self.min_new_tokens = config.min_new_tokens
-        self.mixture_sigma = config.mixture_sigma
-        self.usage_balance_weight = config.usage_balance_weight
-        self.router_responsibility_weight = config.router_responsibility_weight
-        self.moe_balance_weight = config.moe_balance_weight
         if config.mtp_horizons <= 0:
             raise ValueError("NazConfig.mtp_horizons must be > 0")
         if len(config.mtp_loss_weights) != config.mtp_horizons:
             raise ValueError("NazConfig.mtp_loss_weights length must equal mtp_horizons")
+        self.mixture_sigma_min = float(config.mixture_sigma_min)
+        self.mixture_sigma_max = float(config.mixture_sigma_max)
+        sigma_ratio = (float(config.mixture_sigma) - self.mixture_sigma_min) / (
+            self.mixture_sigma_max - self.mixture_sigma_min
+        )
+        sigma_logit = math.log(sigma_ratio / (1.0 - sigma_ratio))
+        self.mixture_sigma_logit = nn.Parameter(torch.full((config.mtp_horizons,), sigma_logit))
+        self.usage_balance_weight = config.usage_balance_weight
+        self.router_responsibility_weight = config.router_responsibility_weight
+        self.moe_balance_weight = config.moe_balance_weight
 
         self.dil_config = DilConfig.from_pretrained(config.dil_path)
         self._validate_dil_config(config, self.dil_config)
@@ -206,6 +209,12 @@ class Naz(PreTrainedModel):
     @property
     def semantic_head(self):
         return self.student_core.semantic_head
+
+    @property
+    def mixture_sigma(self) -> torch.Tensor:
+        return self.mixture_sigma_min + (
+            self.mixture_sigma_max - self.mixture_sigma_min
+        ) * torch.sigmoid(self.mixture_sigma_logit)
 
     def _validate_dil_config(self, config: NazConfig, dil_config: DilConfig):
         if config.latent_size != dil_config.latent_size:
@@ -312,43 +321,16 @@ class Naz(PreTrainedModel):
         )
 
     @torch.no_grad()
-    def latent_distribution(
+    def encode_active_dil_latents(
         self,
         input_ids: torch.LongTensor,
         word_masks: torch.Tensor,
         unit_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        context_ids, context_masks, _ = self.dil_context_inputs(input_ids, word_masks, unit_mask)
-        latent_states = self.dil_model.encode(input_ids=context_ids, word_masks=context_masks)
-        mean = latent_states.float().clone()
-        log_std = torch.zeros_like(mean)
-        return mean, log_std
-
-    target_distribution = latent_distribution
-
-    def target_horizon_distribution(
-        self,
-        target_input_ids: torch.LongTensor,
-        target_word_masks: torch.Tensor,
-        target_mask: torch.Tensor,
     ) -> torch.Tensor:
-        if target_input_ids.dim() != 4:
-            raise ValueError("target_input_ids must be shaped [batch, sequence, horizons, bytes]")
-        if target_word_masks.shape != target_input_ids.shape:
-            raise ValueError("target_word_masks must match target_input_ids")
-        if target_mask.shape != target_input_ids.shape[:3]:
-            raise ValueError("target_mask must be shaped [batch, sequence, horizons]")
-        horizon_latents = [
-            self.semantic_states(
-                target_input_ids[:, :, horizon_idx],
-                target_word_masks[:, :, horizon_idx],
-                target_mask[:, :, horizon_idx],
-            )
-            for horizon_idx in range(target_input_ids.shape[2])
-        ]
-        return torch.stack(horizon_latents, dim=2)
+        context_ids, context_masks, _ = self.dil_context_inputs(input_ids, word_masks, unit_mask)
+        return self.dil_model.encode(input_ids=context_ids, word_masks=context_masks).float()
 
-    def live_batch_latents(
+    def encode_training_batch_latents(
         self,
         input_ids: torch.LongTensor,
         word_masks: torch.Tensor,
@@ -392,23 +374,23 @@ class Naz(PreTrainedModel):
             input_ids=torch.cat((source_context_ids, target_context_ids), dim=0),
             word_masks=torch.cat((source_context_masks, target_context_masks), dim=0),
         ).float()
-        source_mean = encoded[:source_count]
-        target_mean = encoded[source_count:]
+        source_latents = encoded[:source_count]
+        target_latents = encoded[source_count:]
 
         source_semantic = torch.zeros(
             (batch_size * sequence_length, self.config.latent_size),
-            dtype=source_mean.dtype,
-            device=source_mean.device,
+            dtype=source_latents.dtype,
+            device=source_latents.device,
         )
-        source_semantic[source_active] = source_mean
+        source_semantic[source_active] = source_latents
         source_semantic = source_semantic.reshape(batch_size, sequence_length, self.config.latent_size)
 
         extended_semantic = torch.zeros(
             (batch_size * (sequence_length + horizons), self.config.latent_size),
-            dtype=target_mean.dtype,
-            device=target_mean.device,
+            dtype=target_latents.dtype,
+            device=target_latents.device,
         )
-        extended_semantic[target_active] = target_mean
+        extended_semantic[target_active] = target_latents
         extended_semantic = extended_semantic.reshape(batch_size, sequence_length + horizons, self.config.latent_size)
 
         horizon_positions = (
@@ -425,39 +407,39 @@ class Naz(PreTrainedModel):
         ).reshape(batch_size, sequence_length, horizons, self.config.latent_size)
         return source_semantic, target_latents
 
-    def semantic_states(
+    def encode_sequence_latents(
         self,
         input_ids: torch.LongTensor,
         word_masks: torch.Tensor,
         unit_mask: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, sequence_length = self.validate_byte_inputs(input_ids)
-        mean, _ = self.latent_distribution(input_ids, word_masks, unit_mask)
+        active_latents = self.encode_active_dil_latents(input_ids, word_masks, unit_mask)
         active = unit_mask.reshape(-1)
         semantic_states = torch.zeros(
             (batch_size * sequence_length, self.config.latent_size),
-            dtype=mean.dtype,
-            device=mean.device,
+            dtype=active_latents.dtype,
+            device=active_latents.device,
         )
-        semantic_states[active] = mean
+        semantic_states[active] = active_latents
         return semantic_states.reshape(batch_size, sequence_length, -1)
 
-    def semantic_embeddings(
+    def embed_sequence_latents(
         self,
         input_ids: torch.LongTensor,
         word_masks: torch.Tensor,
         unit_mask: torch.Tensor,
     ) -> torch.Tensor:
         return self.student_core.embed_semantic_states(
-            self.semantic_states(input_ids, word_masks, unit_mask)
+            self.encode_sequence_latents(input_ids, word_masks, unit_mask)
         )
 
-    def _student_hidden(
+    def _student_output(
         self,
         semantic_states: torch.Tensor,
         unit_mask: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         compiled_forward = getattr(self, "_student_core_forward", None)
         if compiled_forward is not None:
             return compiled_forward(semantic_states, unit_mask, attention_mask)
@@ -469,7 +451,7 @@ class Naz(PreTrainedModel):
         unit_mask: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self._student_hidden(semantic_states, unit_mask, attention_mask=attention_mask)
+        hidden_states, _, _ = self._student_output(semantic_states, unit_mask, attention_mask=attention_mask)
         return self.semantic_head(hidden_states).selected_latents[:, :, 0].float()
 
     def predict_semantic_dynamics(
@@ -478,10 +460,10 @@ class Naz(PreTrainedModel):
         unit_mask: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> NazDynamicsOutput:
-        hidden_states = self._student_hidden(semantic_states, unit_mask, attention_mask=attention_mask)
+        hidden_states, _, _ = self._student_output(semantic_states, unit_mask, attention_mask=attention_mask)
         return self.semantic_head(hidden_states)
 
-    def training_semantic_states(self, semantic_states: torch.Tensor, unit_mask: torch.Tensor) -> torch.Tensor:
+    def jitter_semantic_states_for_training(self, semantic_states: torch.Tensor, unit_mask: torch.Tensor) -> torch.Tensor:
         if not self.training or self.config.naz_input_jitter_prob <= 0.0:
             return semantic_states
         jitter_mask = unit_mask.bool() & torch.rand(unit_mask.shape, device=semantic_states.device).lt(
@@ -505,14 +487,14 @@ class Naz(PreTrainedModel):
         noised[jitter_mask] = angular_noise_like(noised[jitter_mask], min_cos, max_cos)
         return noised.to(semantic_states.dtype)
 
-    def predict_latents(
+    def predict_next_latents_from_surface(
         self,
         input_ids: torch.LongTensor,
         word_masks: torch.Tensor,
         unit_mask: torch.Tensor,
     ) -> torch.Tensor:
         return self.predict_semantic_latents(
-            self.semantic_states(input_ids, word_masks, unit_mask),
+            self.encode_sequence_latents(input_ids, word_masks, unit_mask),
             unit_mask,
         )
 
@@ -538,9 +520,11 @@ class Naz(PreTrainedModel):
         normalizer = weighted_mask.sum().clamp_min(1.0)
 
         sq_dist = (candidates - target.unsqueeze(3)).square().sum(dim=-1)
-        log_prob = -0.5 * sq_dist / (self.mixture_sigma * self.mixture_sigma)
+        sigma = self.mixture_sigma.to(device=target.device, dtype=target.dtype).view(1, 1, -1, 1)
+        sigma_sq = sigma.square()
+        log_prob = -0.5 * sq_dist / sigma_sq
         log_prob = log_prob - 0.5 * self.config.latent_size * torch.log(
-            target.new_tensor(2.0 * torch.pi * self.mixture_sigma * self.mixture_sigma)
+            target.new_tensor(2.0 * torch.pi) * sigma_sq
         )
         log_pi = F.log_softmax(logits, dim=-1)
         nll_per_target = -torch.logsumexp(log_pi + log_prob, dim=-1)
@@ -588,11 +572,12 @@ class Naz(PreTrainedModel):
         attention_mask=_DEFAULT_ATTENTION_MASK,
     ) -> NazOutput:
         student_attention_mask = unit_mask if attention_mask is _DEFAULT_ATTENTION_MASK else attention_mask
-        dynamics = self.predict_semantic_dynamics(
-            self.training_semantic_states(semantic_states, unit_mask),
+        hidden_states, moe_balance_loss, moe_usage = self._student_output(
+            self.jitter_semantic_states_for_training(semantic_states, unit_mask),
             unit_mask,
             attention_mask=student_attention_mask,
         )
+        dynamics = self.semantic_head(hidden_states)
         if target_mask is None:
             target_mask = unit_mask.unsqueeze(-1).expand(
                 *unit_mask.shape,
@@ -602,48 +587,22 @@ class Naz(PreTrainedModel):
             raise ValueError("target_latents must be shaped [batch, sequence, horizons, latent_size]")
         if target_mask.shape != target_latents.shape[:3]:
             raise ValueError("target_mask must be shaped [batch, sequence, horizons]")
-        active_count = target_mask.sum()
-
-        if int(active_count.detach().cpu()) == 0:
-            zero = dynamics.selected_latents.new_zeros(())
-            return NazOutput(
-                loss=zero,
-                reconstruction_loss=zero,
-                mse_loss=zero,
-                mse_mean=zero,
-                mixture_nll=zero,
-                responsibility_loss=zero,
-                usage_balance_loss=zero,
-                moe_balance_loss=zero,
-                min_mse=zero,
-                chosen_mse=zero,
-                router_entropy=zero,
-                candidate_usage=dynamics.router_logits.new_zeros(
-                    self.config.mtp_horizons,
-                    self.config.num_semantic_candidates,
-                ),
-                moe_usage=self.student_core.last_moe_usage.to(dynamics.router_logits.device),
-                cosine_loss=zero,
-                latent_cos=zero,
-                latent_predictions=dynamics.selected_latents[:, :, 0],
-                predicted_latents=dynamics.selected_latents[target_mask],
-                target_latents=target_latents[target_mask],
-                num_targets=torch.zeros((), dtype=torch.long, device=dynamics.router_logits.device),
-            )
 
         losses = self.semantic_mixture_losses(dynamics, target_latents, target_mask)
         mixture_nll = losses["mixture_nll"]
         responsibility_loss = losses["responsibility_loss"]
         usage_balance_loss = losses["usage_balance_loss"]
-        moe_balance_loss = self.student_core.last_moe_balance_loss.to(mixture_nll.device)
+        moe_balance_loss = moe_balance_loss.to(mixture_nll.device)
         reconstruction_loss = mixture_nll
         mse_loss = losses["chosen_mse"] * losses["normalizer"]
         mse_mean = losses["chosen_mse"]
         active_predicted = dynamics.selected_latents[target_mask]
         active_target = target_latents[target_mask]
-        cosine = F.cosine_similarity(active_predicted.float(), active_target.float(), dim=-1)
-        latent_cos = cosine.mean()
-        cosine_loss = (1.0 - cosine).mean()
+        cosine = F.cosine_similarity(dynamics.selected_latents.float(), target_latents.float(), dim=-1)
+        weighted_mask = losses["weighted_mask"]
+        normalizer = losses["normalizer"]
+        latent_cos = (cosine * weighted_mask).sum() / normalizer
+        cosine_loss = ((1.0 - cosine) * weighted_mask).sum() / normalizer
         loss = self.reconstruction_loss_weight * (
             mixture_nll
             + self.router_responsibility_weight * responsibility_loss
@@ -663,13 +622,13 @@ class Naz(PreTrainedModel):
             chosen_mse=losses["chosen_mse"],
             router_entropy=losses["router_entropy"],
             candidate_usage=losses["candidate_usage"],
-            moe_usage=self.student_core.last_moe_usage.to(mixture_nll.device),
+            moe_usage=moe_usage.to(mixture_nll.device),
             cosine_loss=cosine_loss,
             latent_cos=latent_cos,
             latent_predictions=dynamics.selected_latents[:, :, 0],
             predicted_latents=active_predicted,
             target_latents=active_target,
-            num_targets=torch.tensor(active_target.shape[0], dtype=torch.long, device=dynamics.router_logits.device),
+            num_targets=target_mask.to(dtype=torch.long).sum(),
         )
 
     def forward(
@@ -684,7 +643,7 @@ class Naz(PreTrainedModel):
         training_step: Optional[int] = None,
     ) -> NazOutput:
         del training_step
-        semantic_states, target_latents = self.live_batch_latents(
+        semantic_states, target_latents = self.encode_training_batch_latents(
             input_ids,
             word_masks,
             target_input_ids,
@@ -710,7 +669,7 @@ class Naz(PreTrainedModel):
         min_new_tokens: Optional[int] = None,
         repetition_cos_threshold: Optional[float] = None,
     ) -> NazGenerationOutput:
-        prompt_model_latents = self.semantic_states(
+        prompt_model_latents = self.encode_sequence_latents(
             input_ids,
             word_masks,
             unit_mask if unit_mask is not None else word_masks.any(dim=-1),
@@ -801,7 +760,7 @@ class Naz(PreTrainedModel):
             raise ValueError("Naz.generate_stream expects packed prompts without unit padding")
 
         yield from self._generate_stream_from_semantic_states(
-            semantic_states=self.semantic_states(input_ids, word_masks, unit_mask),
+            semantic_states=self.encode_sequence_latents(input_ids, word_masks, unit_mask),
             unit_mask=unit_mask,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,

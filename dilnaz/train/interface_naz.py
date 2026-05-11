@@ -14,7 +14,7 @@ from models.modeling_naz import Naz
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 25
+CHECKPOINT_FORMAT_VERSION = 26
 OBJECTIVE = "semantic_dynamics_moe_mtp_v1"
 
 
@@ -84,6 +84,7 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
     model.load_trainable_state_dict(checkpoint["model_state_dict"])
     model.dil_model.set_compiled_forwards(
         encoder_forward=compile_forward(model.dil_model.encoder.forward, compile_mode, "DilEncoderCore"),
+        writer_forward=compile_forward(model.dil_model.writer.forward, compile_mode, "DilConditionalWriter"),
     )
     model.eval()
     dil_config = DilConfig.from_pretrained(dil_path)
@@ -120,9 +121,12 @@ def stream_text(
             return False
         latents = torch.cat(pending_latents, dim=0)
         token_ids, token_masks, lengths = model.dil_model.decode_semantic(latents)
+        token_ids = token_ids.detach().cpu()
+        token_masks = token_masks.detach().cpu()
+        length_values = lengths.detach().cpu().tolist()
         stop_after_flush = False
         for row_idx, should_stop in enumerate(pending_should_stop):
-            if int(lengths[row_idx].detach().cpu()) == 0:
+            if int(length_values[row_idx]) == 0:
                 stop_after_flush = True
                 break
             token = decode_token_ids(tokenizer, token_ids[row_idx], token_masks[row_idx])

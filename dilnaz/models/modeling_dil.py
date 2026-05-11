@@ -18,7 +18,6 @@ class DilOutput(ModelOutput):
     distill_loss: Optional[torch.FloatTensor] = None
     writer_loss: Optional[torch.FloatTensor] = None
     writer_token_loss: Optional[torch.FloatTensor] = None
-    layer_geometry_losses: Optional[torch.FloatTensor] = None
     mean_geometry_loss: Optional[torch.FloatTensor] = None
     variance_loss: Optional[torch.FloatTensor] = None
     byte_acc: Optional[torch.FloatTensor] = None
@@ -53,7 +52,7 @@ def angular_noise_like(latents: torch.Tensor, min_cos: torch.Tensor, max_cos: to
 class DilRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -61,7 +60,7 @@ class DilRMSNorm(nn.Module):
         hidden_states = hidden_states.float()
         variance = hidden_states.pow(2).mean(dim=-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        return self.weight * hidden_states.to(input_dtype)
+        return (hidden_states * (1.0 + self.weight.float())).to(input_dtype)
 
 
 class DilGatedMLP(nn.Module):
@@ -256,10 +255,11 @@ class DilEncoderCore(nn.Module):
         hidden_states = hidden_states * word_masks.unsqueeze(-1).to(hidden_states.dtype)
         hidden_states = self.byte_stem(hidden_states, word_masks)
 
-        layer_vectors = []
+        layer_vectors = [] if output_hidden_states else None
         for layer_idx in range(self.num_stage_layers):
             hidden_states = self.encoder_layers[layer_idx](hidden_states)
-            layer_vectors.append(self.pooled_target_vector(hidden_states, word_masks))
+            if output_hidden_states:
+                layer_vectors.append(self.pooled_target_vector(hidden_states, word_masks))
 
         token_states = self.pool_token_states(hidden_states, word_masks)
         offsets = torch.arange(context_size, device=token_states.device)
@@ -270,7 +270,8 @@ class DilEncoderCore(nn.Module):
         for layer_idx in range(self.num_stage_layers):
             encoder_idx = self.num_stage_layers + layer_idx
             hidden_states = self.encoder_layers[encoder_idx](hidden_states)
-            layer_vectors.append(hidden_states)
+            if output_hidden_states:
+                layer_vectors.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         semantic = self.hidden_to_semantic(hidden_states)
@@ -342,8 +343,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 21:
-            raise ValueError("DIL parallel-stop Writer checkpoints require checkpoint_format_version=21")
+        if config.checkpoint_format_version != 22:
+            raise ValueError("DIL zero-centered RMSNorm checkpoints require checkpoint_format_version=22")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
@@ -359,7 +360,6 @@ class Dil(PreTrainedModel):
         self.writer = DilConditionalWriter(config)
         self.dil_dropout = config.dil_dropout
         self.distillation_weight = config.distillation_weight
-        self.layer_geometry_weight = config.layer_geometry_weight
         self.mean_geometry_weight = config.mean_geometry_weight
         self.variance_weight = config.variance_weight
         self.writer_loss_weight = config.writer_loss_weight
@@ -509,11 +509,10 @@ class Dil(PreTrainedModel):
             keep = torch.rand_like(word_masks.float()) >= self.dil_dropout
             encoder_masks = word_masks * keep.to(word_masks.dtype)
 
-        semantic, layer_vectors = self.encode(input_ids=input_ids, word_masks=encoder_masks, output_hidden_states=True)
+        semantic = self.encode(input_ids=input_ids, word_masks=encoder_masks)
         semantic = semantic.float()
         loss = semantic.new_zeros(())
         distill_loss = semantic.new_zeros(())
-        layer_geometry_losses = semantic.new_zeros((0,))
         mean_geometry_loss = semantic.new_zeros(())
         variance_loss = semantic.new_zeros(())
 
@@ -523,19 +522,10 @@ class Dil(PreTrainedModel):
                 teacher_mask = torch.ones(teacher_layers.shape[0], dtype=torch.bool, device=semantic.device)
             else:
                 teacher_mask = teacher_mask.to(semantic.device, dtype=torch.bool)
-            layer_count = min(len(layer_vectors), teacher_layers.shape[1])
-            losses = [
-                self.geometry_loss(layer_vectors[idx].float(), teacher_layers[:, idx], teacher_mask)
-                for idx in range(layer_count)
-            ]
-            layer_geometry_losses = torch.stack(losses) if losses else semantic.new_zeros((0,))
-            mean_geometry_loss = self.geometry_loss(semantic, teacher_layers[:, layer_count - 1], teacher_mask)
-            variance_terms = [self.variance_regularizer(semantic, teacher_mask)]
-            variance_terms.extend(self.variance_regularizer(layer_vectors[idx].float(), teacher_mask) for idx in range(layer_count))
-            variance_loss = torch.stack(variance_terms).mean()
+            mean_geometry_loss = self.geometry_loss(semantic, teacher_layers[:, -1], teacher_mask)
+            variance_loss = self.variance_regularizer(semantic, teacher_mask)
             distill_loss = (
-                layer_geometry_losses.mean() * self.layer_geometry_weight
-                + mean_geometry_loss * self.mean_geometry_weight
+                mean_geometry_loss * self.mean_geometry_weight
                 + variance_loss * self.variance_weight
             )
             loss = loss + distill_loss * self.distillation_weight
@@ -561,7 +551,6 @@ class Dil(PreTrainedModel):
             distill_loss=distill_loss,
             writer_loss=writer_loss,
             writer_token_loss=writer_token_loss,
-            layer_geometry_losses=layer_geometry_losses,
             mean_geometry_loss=mean_geometry_loss,
             variance_loss=variance_loss,
             byte_acc=byte_acc,

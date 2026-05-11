@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -36,15 +37,36 @@ class BatchTimingSource:
         return batch
 
 
-def make_scheduler(optimizer, learning_rate: float, warmup_steps: int):
+def make_scheduler(optimizer, learning_rate: float, warmup_steps: int, max_steps: int | None = None):
     def lr_lambda(step):
-        if warmup_steps <= 0:
+        if warmup_steps > 0 and step < warmup_steps:
+            return min(1.0, float(step + 1) / float(warmup_steps))
+        if max_steps is None or max_steps <= warmup_steps:
             return 1.0
-        return min(1.0, float(step + 1) / float(warmup_steps))
+        progress = min(1.0, float(step - warmup_steps) / float(max_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     for group in optimizer.param_groups:
         group["lr"] = learning_rate
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def make_adamw_param_groups(named_parameters, weight_decay: float):
+    decay_params = []
+    no_decay_params = []
+    for _, param in named_parameters:
+        if not param.requires_grad:
+            continue
+        if param.dim() >= 2:
+            decay_params.append(param)
+        else:
+            no_decay_params.append(param)
+    groups = []
+    if decay_params:
+        groups.append({"params": decay_params, "weight_decay": weight_decay})
+    if no_decay_params:
+        groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    return groups
 
 
 class BaseTrainer:
@@ -53,9 +75,21 @@ class BaseTrainer:
         self.start_step = 0
         self.completed_step = 0
         self.last_metrics: dict[str, float] = {}
+        self._trainable_param_list = None
 
     def trainable_parameters(self):
-        return (param for param in self.model.parameters() if param.requires_grad)
+        if self._trainable_param_list is None:
+            self._trainable_param_list = [param for param in self.model.parameters() if param.requires_grad]
+        return self._trainable_param_list
+
+    def optimizer_param_groups(self, weight_decay: float):
+        named_parameters = [
+            (name, param)
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        ]
+        self._trainable_param_list = [param for _, param in named_parameters]
+        return make_adamw_param_groups(named_parameters, weight_decay)
 
     def build_train_iterator(self):
         raise NotImplementedError
@@ -136,7 +170,9 @@ class BaseTrainer:
                 data_seconds += train_iterator.last_data_seconds
                 transfer_seconds += train_iterator.last_transfer_seconds
 
-                cuda_sync(self.device)
+                sync_timing = bool(getattr(self.args, "sync_timing", False))
+                if sync_timing:
+                    cuda_sync(self.device)
                 compute_start = time.perf_counter()
                 self.optimizer.zero_grad(set_to_none=True)
                 cudagraph_step_begin(self.device, self.compile_mode)
@@ -147,7 +183,8 @@ class BaseTrainer:
                 torch.nn.utils.clip_grad_norm_(self.trainable_parameters(), self.args.max_grad_norm)
                 self.optimizer.step()
                 self.scheduler.step()
-                cuda_sync(self.device)
+                if sync_timing:
+                    cuda_sync(self.device)
                 compute_seconds += time.perf_counter() - compute_start
                 self.completed_step = step
 

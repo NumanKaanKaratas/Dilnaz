@@ -10,13 +10,14 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from byte_trainer_utils import COMPILE_MODE_CHOICES, compile_forward, validate_compile_environment
 from dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add, context_offsets
 from models.configuration_dil import DilConfig
 from models.modeling_dil import Dil
 from tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 21
+CHECKPOINT_FORMAT_VERSION = 22
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -115,7 +116,7 @@ def build_auto_mapping(tokens: list[str], similarities: list[list[float]]) -> di
     }
 
 
-def load_model(checkpoint_dir: Path, device: torch.device):
+def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
     config = DilConfig.from_pretrained(checkpoint_dir)
     tokenizer = HybridTokenizer.from_file(checkpoint_dir / config.tokenizer_vocab_file)
     model = Dil(config).to(device)
@@ -127,6 +128,10 @@ def load_model(checkpoint_dir: Path, device: torch.device):
     if checkpoint["format_version"] != CHECKPOINT_FORMAT_VERSION:
         raise ValueError(f"unsupported checkpoint format_version={checkpoint.get('format_version')}")
     model.load_state_dict(checkpoint["model_state_dict"])
+    model.set_compiled_forwards(
+        encoder_forward=compile_forward(model.encoder.forward, compile_mode, "DilEncoderCore"),
+        writer_forward=compile_forward(model.writer.forward, compile_mode, "DilConditionalWriter"),
+    )
     model.eval()
     return model, config, tokenizer, checkpoint["training_state"]["step"]
 
@@ -221,6 +226,7 @@ def parse_args():
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--text", type=str, default="Dişi aslanın dişi kırıldı.")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--compile-mode", choices=COMPILE_MODE_CHOICES, default="off")
     return parser.parse_args()
 
 
@@ -232,8 +238,9 @@ def main():
     )
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
+    validate_compile_environment(args.compile_mode)
 
-    model, config, tokenizer, _ = load_model(args.checkpoint_dir, device)
+    model, config, tokenizer, _ = load_model(args.checkpoint_dir, device, args.compile_mode)
     segments = tokenize_text(args.text, tokenizer)
     tokens = [segment.text for segment in segments]
     decoded_tokens = [tokenizer.decode(segment.token_ids) for segment in segments]

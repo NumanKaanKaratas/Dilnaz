@@ -17,7 +17,9 @@ class NazConfig(PretrainedConfig):
         num_semantic_candidates=4,
         mtp_horizons=3,
         mtp_loss_weights=(1.0, 0.3, 0.15),
-        mixture_sigma=0.55,
+        mixture_sigma=1.1,
+        mixture_sigma_min=0.35,
+        mixture_sigma_max=2.0,
         usage_balance_weight=0.05,
         router_responsibility_weight=1.0,
         moe_num_experts=8,
@@ -67,7 +69,13 @@ class NazConfig(PretrainedConfig):
         self.num_semantic_candidates = num_semantic_candidates
         self.mtp_horizons = mtp_horizons
         self.mtp_loss_weights = tuple(float(weight) for weight in mtp_loss_weights)
+        if mixture_sigma_min <= 0.0 or mixture_sigma_max <= mixture_sigma_min:
+            raise ValueError("mixture sigma bounds must satisfy 0 < min < max")
+        if mixture_sigma <= mixture_sigma_min or mixture_sigma >= mixture_sigma_max:
+            raise ValueError("mixture_sigma must be inside (mixture_sigma_min, mixture_sigma_max)")
         self.mixture_sigma = mixture_sigma
+        self.mixture_sigma_min = mixture_sigma_min
+        self.mixture_sigma_max = mixture_sigma_max
         self.usage_balance_weight = usage_balance_weight
         self.router_responsibility_weight = router_responsibility_weight
         self.moe_num_experts = moe_num_experts

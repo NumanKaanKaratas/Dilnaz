@@ -11,9 +11,8 @@ DIL_MODEL_DEFAULTS = {
     "byte_conv_layers": 2,
     "byte_conv_kernel_size": 5,
     "byte_conv_expansion": 2,
-    "dil_dropout": 0.15,
+    "dil_dropout": 0.10,
     "distillation_weight": 8.0,
-    "layer_geometry_weight": 2.0,
     "mean_geometry_weight": 4.0,
     "variance_weight": 0.05,
     "writer_loss_weight": 1.0,
@@ -78,7 +77,7 @@ NAZ_MODEL_DEFAULTS = {
     "num_semantic_candidates": 4,
     "mtp_horizons": 3,
     "mtp_loss_weights": (1.0, 0.3, 0.15),
-    "mixture_sigma": 0.55,
+    "mixture_sigma": 1.1,
     "usage_balance_weight": 0.05,
     "router_responsibility_weight": 1.0,
     "moe_num_experts": 8,
@@ -94,7 +93,7 @@ NAZ_MODEL_DEFAULTS = {
 
 
 NAZ_TRAIN_DEFAULTS = {
-    "data_mode": "streaming",
+    "data_mode": "cached",
     "max_steps": 30000,
     "batch_size": 8,
     "eval_batch_size": 8,
@@ -110,6 +109,7 @@ NAZ_TRAIN_DEFAULTS = {
     "eval_every": 0,
     "max_eval_batches": 16,
     "text_read_chars": 1048576,
+    "semantic_cache_chunk_tokens": 4096,
     "num_workers": 4,
     "prefetch_factor": 4,
     "seed": 1,
@@ -117,7 +117,7 @@ NAZ_TRAIN_DEFAULTS = {
 
 
 NAZ_FINETUNE_DEFAULTS = {
-    "data_mode": "streaming",
+    "data_mode": "cached",
     "max_steps": 5000,
     "batch_size": 8,
     "eval_batch_size": 8,
@@ -133,6 +133,7 @@ NAZ_FINETUNE_DEFAULTS = {
     "eval_every": 250,
     "max_eval_batches": 16,
     "text_read_chars": 1048576,
+    "semantic_cache_chunk_tokens": 4096,
     "num_workers": 4,
     "prefetch_factor": 4,
     "seed": 1,

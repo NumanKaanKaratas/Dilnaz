@@ -39,26 +39,6 @@ def stream_jsonl_texts(path: Path):
         raise ValueError(f"{path} produced no JSONL text records")
 
 
-def stream_jsonl_prompt_answer_rows(path: Path):
-    emitted = False
-    with path.open("r", encoding="utf-8") as handle:
-        for line_idx, line in enumerate(handle):
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{path}:{line_idx + 1} is not valid JSONL") from exc
-            prompt = payload.get("prompt")
-            answer = payload.get("answer")
-            if not isinstance(prompt, str) or not isinstance(answer, str) or not prompt or not answer:
-                raise ValueError(f"{path}:{line_idx + 1} must contain non-empty prompt and answer strings")
-            emitted = True
-            yield prompt, answer
-    if not emitted:
-        raise ValueError(f"{path} produced no JSONL prompt/answer records")
-
-
 def last_whitespace_end(text: str) -> int:
     boundary = -1
     for match in WHITESPACE_PATTERN.finditer(text):
@@ -126,22 +106,6 @@ def stream_text_lines(path: Path, read_chars: int):
         yield carry
     if not emitted:
         raise ValueError(f"{path} produced no text blocks")
-
-
-def stream_prompt_answer_rows(path: Path, read_chars: int):
-    if is_jsonl_path(path):
-        yield from stream_jsonl_prompt_answer_rows(path)
-        return
-
-    for line_idx, line in enumerate(stream_text_lines(path, read_chars)):
-        text = line.rstrip("\r\n")
-        parts = text.split("\t")
-        if len(parts) != 2:
-            raise ValueError(f"{path}:{line_idx + 1} must be a tab-separated prompt/answer row")
-        prompt, answer = parts
-        if not prompt or not answer:
-            raise ValueError(f"{path}:{line_idx + 1} prompt and answer must be non-empty")
-        yield prompt, answer
 
 
 def stream_token_pieces(path: Path, tokenizer: HybridTokenizer, max_word_bytes: int, read_chars: int):
@@ -428,124 +392,6 @@ class StreamingTextNazDataset(IterableDataset):
                 return
 
 
-class PromptAnswerNazDataset(IterableDataset):
-    def __init__(
-        self,
-        train_file: Path,
-        tokenizer: HybridTokenizer,
-        config: DilConfig,
-        sequence_length: int,
-        batch_size: int,
-        read_chars: int,
-        repeat: bool,
-    ):
-        super().__init__()
-        self.train_file = train_file
-        self.tokenizer = tokenizer
-        self.max_word_bytes = config.max_word_bytes
-        self.pad_token_id = config.pad_token_id
-        self.sequence_length = sequence_length
-        self.horizons = getattr(config, "mtp_horizons", 3)
-        self.batch_size = batch_size
-        self.read_chars = read_chars
-        self.repeat = repeat
-        self.positions = torch.arange(self.max_word_bytes).reshape(1, 1, self.max_word_bytes)
-
-    def encode_row(self, prompt: str, answer: str) -> tuple[list[list[int]], list[bool]]:
-        prompt_segments = [
-            segment.token_ids
-            for segment in self.tokenizer.encode_segments(prompt)
-            if 0 < segment.piece_len <= self.max_word_bytes
-        ]
-        answer_segments = [
-            segment.token_ids
-            for segment in self.tokenizer.encode_segments(" " + answer, add_eos=True)
-            if 0 < segment.piece_len <= self.max_word_bytes
-        ]
-        tokens = prompt_segments + answer_segments
-        token_answer_mask = [False] * len(prompt_segments) + [True] * len(answer_segments)
-        if len(tokens) <= 1:
-            raise ValueError("prompt-answer row produced no trainable token transitions")
-        return tokens, token_answer_mask
-
-    def make_batch(self, rows: list[tuple[list[list[int]], list[bool]]]) -> dict:
-        batch_size = len(rows)
-        input_ids = torch.full(
-            (batch_size, self.sequence_length, self.max_word_bytes),
-            self.pad_token_id,
-            dtype=torch.long,
-        )
-        target_input_ids = torch.full(
-            (batch_size, self.sequence_length, self.horizons, self.max_word_bytes),
-            self.pad_token_id,
-            dtype=torch.long,
-        )
-        source_lengths = torch.zeros((batch_size, self.sequence_length), dtype=torch.long)
-        target_lengths = torch.zeros((batch_size, self.sequence_length, self.horizons), dtype=torch.long)
-        unit_mask = torch.zeros((batch_size, self.sequence_length), dtype=torch.bool)
-        loss_mask = torch.zeros((batch_size, self.sequence_length, self.horizons), dtype=torch.bool)
-        for row_idx, (tokens, token_answer_mask) in enumerate(rows):
-            source_width = len(tokens) - 1
-            if source_width > self.sequence_length:
-                raise ValueError(
-                    f"prompt-answer row has {source_width} transitions, sequence_length={self.sequence_length}"
-                )
-            for token_idx in range(source_width):
-                source_ids = tokens[token_idx]
-                input_ids[row_idx, token_idx, : len(source_ids)] = torch.tensor(source_ids, dtype=torch.long)
-                source_lengths[row_idx, token_idx] = len(source_ids)
-                unit_mask[row_idx, token_idx] = True
-                for horizon_idx in range(self.horizons):
-                    target_idx = token_idx + horizon_idx + 1
-                    if target_idx >= len(tokens):
-                        continue
-                    target_ids = tokens[target_idx]
-                    target_input_ids[row_idx, token_idx, horizon_idx, : len(target_ids)] = torch.tensor(
-                        target_ids,
-                        dtype=torch.long,
-                    )
-                    target_lengths[row_idx, token_idx, horizon_idx] = len(target_ids)
-                    loss_mask[row_idx, token_idx, horizon_idx] = token_answer_mask[target_idx]
-        word_masks = (self.positions < source_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
-        target_mask = target_lengths.gt(0) & unit_mask.unsqueeze(-1)
-        target_word_masks = (self.positions.unsqueeze(2) < target_lengths.unsqueeze(-1)) & target_mask.unsqueeze(-1)
-        return {
-            "input_ids": input_ids,
-            "word_masks": word_masks,
-            "target_input_ids": target_input_ids,
-            "target_word_masks": target_word_masks,
-            "unit_mask": unit_mask,
-            "target_mask": target_mask,
-            "loss_mask": loss_mask,
-        }
-
-    def iter_rows_once(self, worker_id: int, worker_count: int):
-        for row_idx, (prompt, answer) in enumerate(stream_prompt_answer_rows(self.train_file, self.read_chars)):
-            if row_idx % worker_count != worker_id:
-                continue
-            yield self.encode_row(prompt, answer)
-
-    def __iter__(self):
-        worker = get_worker_info()
-        worker_id = 0 if worker is None else worker.id
-        worker_count = 1 if worker is None else worker.num_workers
-        while True:
-            emitted = False
-            batch: list[tuple[list[list[int]], list[bool]]] = []
-            for row in self.iter_rows_once(worker_id, worker_count):
-                emitted = True
-                batch.append(row)
-                if len(batch) == self.batch_size:
-                    yield self.make_batch(batch)
-                    batch = []
-            if batch:
-                yield self.make_batch(batch)
-            if not emitted:
-                raise ValueError(f"{self.train_file} produced no prompt-answer rows")
-            if not self.repeat:
-                return
-
-
 def make_naz_loader(dataset, num_workers: int, pin_memory: bool, prefetch_factor: int):
     loader_kwargs = {"batch_size": None, "num_workers": num_workers, "pin_memory": pin_memory}
     if num_workers > 0:
@@ -730,4 +576,83 @@ class ResidentNazSemanticEvalLoader:
         max_start = max(self.batcher.token_count - self.batcher.sequence_length - self.batcher.horizons, 0)
         starts = torch.arange(max_start + 1, device=self.batcher.device)
         for offset in range(0, starts.numel(), self.batch_size):
+            yield self.batcher.make_batch(starts[offset : offset + self.batch_size].reshape(-1, 1))
+
+
+class MemmapNazSemanticBatcher:
+    def __init__(
+        self,
+        semantic_path: Path,
+        token_count: int,
+        latent_size: int,
+        sequence_length: int,
+        batch_size: int,
+        seed: int,
+        device: torch.device,
+        horizons: int = 3,
+    ):
+        self.semantic_states = np.load(semantic_path, mmap_mode="r")
+        expected_shape = (token_count, latent_size)
+        if self.semantic_states.shape != expected_shape:
+            raise ValueError(f"semantic cache shape must be {expected_shape}, got {self.semantic_states.shape}")
+        self.token_count = token_count
+        self.latent_size = latent_size
+        self.sequence_length = sequence_length
+        self.horizons = horizons
+        self.batch_size = batch_size
+        self.device = device
+        self.rng = np.random.default_rng(seed)
+        self.offsets = np.arange(sequence_length, dtype=np.int64).reshape(1, sequence_length)
+        self.horizon_offsets = np.arange(1, horizons + 1, dtype=np.int64).reshape(1, 1, horizons)
+        if self.token_count <= horizons:
+            raise ValueError("memmap semantic Naz data needs more tokens than MTP horizons")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        max_start = max(self.token_count - self.sequence_length - self.horizons, 0)
+        starts = self.rng.integers(
+            0,
+            max_start + 1,
+            size=(self.batch_size, 1),
+            dtype=np.int64,
+        )
+        return self.make_batch(starts)
+
+    def make_batch(self, starts: np.ndarray):
+        source_idx = starts + self.offsets
+        unit_mask_np = source_idx < self.token_count
+        source_idx = np.minimum(source_idx, self.token_count - 1)
+        target_idx = source_idx[:, :, None] + self.horizon_offsets
+        target_mask_np = target_idx < self.token_count
+        target_idx = np.minimum(target_idx, self.token_count - 1)
+        batch_size = starts.shape[0]
+
+        semantic_states = np.asarray(
+            self.semantic_states[source_idx.reshape(-1)],
+            dtype=np.float32,
+        ).reshape(batch_size, self.sequence_length, self.latent_size)
+        target_latents = np.asarray(
+            self.semantic_states[target_idx.reshape(-1)],
+            dtype=np.float32,
+        ).reshape(batch_size, self.sequence_length, self.horizons, self.latent_size)
+
+        return {
+            "semantic_states": torch.from_numpy(semantic_states).to(self.device, non_blocking=True),
+            "target_latents": torch.from_numpy(target_latents).to(self.device, non_blocking=True),
+            "unit_mask": torch.from_numpy(unit_mask_np).to(self.device, non_blocking=True),
+            "target_mask": torch.from_numpy(target_mask_np).to(self.device, non_blocking=True),
+        }
+
+
+class MemmapNazSemanticEvalLoader:
+    def __init__(self, batcher: MemmapNazSemanticBatcher, batch_size: int):
+        self.batcher = batcher
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        max_start = max(self.batcher.token_count - self.batcher.sequence_length - self.batcher.horizons, 0)
+        starts = np.arange(max_start + 1, dtype=np.int64)
+        for offset in range(0, starts.size, self.batch_size):
             yield self.batcher.make_batch(starts[offset : offset + self.batch_size].reshape(-1, 1))

@@ -19,9 +19,8 @@ class DilConfig(PretrainedConfig):
         byte_conv_layers=2,
         byte_conv_kernel_size=5,
         byte_conv_expansion=2,
-        dil_dropout=0.15,
+        dil_dropout=0.10,
         distillation_weight=16.0,
-        layer_geometry_weight=4.0,
         mean_geometry_weight=8.0,
         variance_weight=0.05,
         writer_loss_weight=1.0,
@@ -47,7 +46,7 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=21,
+        checkpoint_format_version=22,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:
@@ -98,7 +97,6 @@ class DilConfig(PretrainedConfig):
         self.byte_conv_expansion = byte_conv_expansion
         self.dil_dropout = dil_dropout
         self.distillation_weight = distillation_weight
-        self.layer_geometry_weight = layer_geometry_weight
         self.mean_geometry_weight = mean_geometry_weight
         self.variance_weight = variance_weight
         self.writer_loss_weight = writer_loss_weight

@@ -128,7 +128,6 @@ def parse_args():
     parser.add_argument("--byte-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_expansion"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
-    parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
     parser.add_argument("--writer-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["writer_loss_weight"])
@@ -202,7 +201,6 @@ def build_config(args, tokenizer):
         byte_conv_expansion=args.byte_conv_expansion,
         dil_dropout=args.dil_dropout,
         distillation_weight=args.distillation_weight,
-        layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
         writer_loss_weight=args.writer_loss_weight,
@@ -231,10 +229,6 @@ def format_parallel_log(step: int, metrics: dict) -> str:
         f"parallel_w={metrics['parallel_weighted']:.4f}",
         f"distill={metrics['distill']:.4f}",
         f"writer={metrics['writer']:.4f}",
-        f"geom_l1={metrics['geom_l1']:.4f}",
-        f"geom_l2={metrics['geom_l2']:.4f}",
-        f"geom_l3={metrics['geom_l3']:.4f}",
-        f"geom_l4={metrics['geom_l4']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
@@ -262,10 +256,6 @@ def empty_metric_sums() -> dict[str, float]:
         "parallel_weighted": 0.0,
         "distill": 0.0,
         "writer": 0.0,
-        "geom_l1": 0.0,
-        "geom_l2": 0.0,
-        "geom_l3": 0.0,
-        "geom_l4": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
         "byte_acc": 0.0,
@@ -282,9 +272,6 @@ def accumulate_metrics(metric_sums: dict[str, float], loss, outputs, parallel_lo
     metric_sums["parallel_weighted"] += float((parallel_loss * weight).detach().cpu())
     metric_sums["distill"] += float(outputs.distill_loss.detach().cpu())
     metric_sums["writer"] += float(outputs.writer_loss.detach().cpu())
-    layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
-    for idx in range(4):
-        metric_sums[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
     metric_sums["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
     metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())

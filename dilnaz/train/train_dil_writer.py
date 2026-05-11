@@ -30,21 +30,11 @@ from dil_data import HybridDilBatchDataset, ResidentDilBatcher, ResidentDilEvalL
 from dilnaz_config import DIL_TRAIN_DEFAULTS  # noqa: E402
 from models.configuration_dil import DilConfig  # noqa: E402
 from models.modeling_dil import Dil  # noqa: E402
+from trainer_core import make_adamw_param_groups, make_scheduler  # noqa: E402
 
 
-CHECKPOINT_FORMAT_VERSION = 21
+CHECKPOINT_FORMAT_VERSION = 22
 WRITER_OBJECTIVE = "plain_text_writer_only"
-
-
-def make_scheduler(optimizer, learning_rate: float, warmup_steps: int):
-    def lr_lambda(step):
-        if warmup_steps <= 0:
-            return 1.0
-        return min(1.0, float(step + 1) / float(warmup_steps))
-
-    for group in optimizer.param_groups:
-        group["lr"] = learning_rate
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 def freeze_for_writer_only(model: Dil):
@@ -266,13 +256,17 @@ def main():
         encoder_forward=compile_forward(model.encoder.forward, compile_mode, "DilEncoderCore"),
         writer_forward=compile_forward(model.writer.forward, compile_mode, "DilConditionalWriter"),
     )
+    writer_named_parameters = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if param.requires_grad and name.startswith("writer.")
+    ]
     optimizer = AdamW(
-        model.writer.parameters(),
+        make_adamw_param_groups(writer_named_parameters, args.weight_decay),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.weight_decay,
     )
-    scheduler = make_scheduler(optimizer, args.learning_rate, args.warmup_steps)
+    scheduler = make_scheduler(optimizer, args.learning_rate, args.warmup_steps, args.max_steps)
     if checkpoint.get("training_state", {}).get("objective") == WRITER_OBJECTIVE:
         optimizer.load_state_dict(checkpoint["writer_optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["writer_scheduler_state_dict"])
