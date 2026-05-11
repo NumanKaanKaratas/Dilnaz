@@ -1,4 +1,5 @@
 import sys
+import shutil
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -22,7 +23,14 @@ from models.modeling_dil import (
 from models.modeling_naz import Naz
 from models.naz_backbone import SemanticDeltaMixer, SemanticGlobalAttention, SparseMoEFeedForward, ZeroCenteredRMSNorm
 from naz_data import PromptAnswerNazDataset, ResidentNazBatcher, ResidentNazSemanticBatcher, StreamingTextNazDataset
-from train_naz import build_resident_semantic_cache
+from train_naz import (
+    NazFinetuneTrainer,
+    NazPretrainTrainer,
+    build_resident_semantic_cache,
+    make_trainer,
+    parse_args as parse_naz_args,
+    validate_args as validate_naz_args,
+)
 from train_dil_writer import freeze_for_writer_only, writer_only_forward
 from interface_naz import stream_text as stream_naz_text
 from train_naz_finetune import exact_answer_accuracy, masked_sft_forward
@@ -38,6 +46,10 @@ def fixture_tokenizer():
     return __import__("tokenization").HybridTokenizer.from_file(
         Path(__file__).resolve().parents[1] / "dilnaz" / "tokenization" / "hybrid_surface_vocab.json"
     )
+
+
+def fixture_tokenizer_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "dilnaz" / "tokenization" / "hybrid_surface_vocab.json"
 
 
 class FakeGeneratedDil:
@@ -122,6 +134,193 @@ def tiny_naz_config(tmp_path, dil_config: DilConfig) -> NazConfig:
         linear_num_value_heads=4,
         linear_conv_kernel_size=4,
         reconstruction_loss_weight=1.0,
+    )
+
+
+def save_tiny_trainer_dil_checkpoint(checkpoint_dir: Path) -> DilConfig:
+    tokenizer = fixture_tokenizer()
+    config = DilConfig(
+        vocab_size=tokenizer.vocab_size,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        hidden_size=16,
+        intermediate_size=32,
+        num_encoder_layers=2,
+        latent_size=8,
+        max_word_bytes=8,
+        context_radius=1,
+        byte_conv_layers=1,
+        dil_dropout=0.0,
+        writer_num_layers=1,
+        writer_dropout=0.0,
+    )
+    model = Dil(config)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    config.save_pretrained(checkpoint_dir)
+    shutil.copyfile(fixture_tokenizer_path(), checkpoint_dir / config.tokenizer_vocab_file)
+    torch.save(
+        {
+            "format_version": config.checkpoint_format_version,
+            "model_state_dict": model.state_dict(),
+        },
+        checkpoint_dir / "checkpoint.pt",
+    )
+    return config
+
+
+def tiny_pretrain_args(tmp_path: Path, train_file: Path, dil_dir: Path, output_name: str = "naz_pretrain"):
+    return parse_naz_args(
+        [
+            "--stage",
+            "pretrain",
+            "--train-file",
+            str(train_file),
+            "--dil-checkpoint-dir",
+            str(dil_dir),
+            "--output-dir",
+            str(tmp_path / output_name),
+            "--compile-mode",
+            "off",
+            "--data-mode",
+            "streaming",
+            "--max-steps",
+            "1",
+            "--batch-size",
+            "1",
+            "--eval-batch-size",
+            "1",
+            "--sequence-length",
+            "2",
+            "--learning-rate",
+            "1e-4",
+            "--weight-decay",
+            "0.0",
+            "--warmup-steps",
+            "0",
+            "--max-grad-norm",
+            "1.0",
+            "--log-every",
+            "1",
+            "--checkpoint-every",
+            "0",
+            "--eval-every",
+            "0",
+            "--max-eval-batches",
+            "1",
+            "--text-read-chars",
+            "256",
+            "--num-workers",
+            "0",
+            "--prefetch-factor",
+            "1",
+            "--seed",
+            "1",
+            "--hidden-size",
+            "32",
+            "--intermediate-size",
+            "64",
+            "--num-hidden-layers",
+            "1",
+            "--num-attention-heads",
+            "4",
+            "--num-key-value-heads",
+            "2",
+            "--head-dim",
+            "8",
+            "--full-attention-interval",
+            "1",
+            "--linear-key-head-dim",
+            "8",
+            "--linear-value-head-dim",
+            "8",
+            "--linear-num-key-heads",
+            "4",
+            "--linear-num-value-heads",
+            "4",
+            "--linear-conv-kernel-size",
+            "4",
+            "--num-semantic-candidates",
+            "2",
+            "--mtp-horizons",
+            "2",
+            "--mtp-loss-weights",
+            "1.0",
+            "0.3",
+            "--mixture-sigma",
+            "0.55",
+            "--usage-balance-weight",
+            "0.05",
+            "--router-responsibility-weight",
+            "1.0",
+            "--moe-num-experts",
+            "2",
+            "--moe-top-k",
+            "1",
+            "--moe-layers",
+            "1",
+            "--moe-balance-weight",
+            "0.01",
+            "--naz-input-jitter-prob",
+            "0.0",
+        ]
+    )
+
+
+def tiny_finetune_args(tmp_path: Path, train_file: Path, init_checkpoint: Path):
+    return parse_naz_args(
+        [
+            "--stage",
+            "finetune",
+            "--train-file",
+            str(train_file),
+            "--init-naz-checkpoint",
+            str(init_checkpoint),
+            "--output-dir",
+            str(tmp_path / "naz_finetune"),
+            "--compile-mode",
+            "off",
+            "--data-mode",
+            "streaming",
+            "--max-steps",
+            "1",
+            "--batch-size",
+            "1",
+            "--eval-batch-size",
+            "1",
+            "--sequence-length",
+            "2",
+            "--learning-rate",
+            "3e-5",
+            "--weight-decay",
+            "0.0",
+            "--warmup-steps",
+            "0",
+            "--max-grad-norm",
+            "1.0",
+            "--log-every",
+            "1",
+            "--checkpoint-every",
+            "0",
+            "--eval-every",
+            "0",
+            "--max-eval-batches",
+            "1",
+            "--text-read-chars",
+            "256",
+            "--num-workers",
+            "0",
+            "--prefetch-factor",
+            "1",
+            "--seed",
+            "1",
+        ]
+    )
+
+
+def write_naz_trainer_text(path: Path) -> None:
+    path.write_text(
+        "2 + 2 = 4\n3 + 1 = 4\n5 + 5 = 10\n7 + 8 = 15\n",
+        encoding="utf-8",
     )
 
 
@@ -1246,6 +1445,144 @@ def test_streaming_text_naz_dataset_reads_plain_text_without_cache(tmp_path):
     assert batch["unit_mask"].all()
     assert batch["attention_mask"] is None
     assert not any(tmp_path.glob("*.npy"))
+
+
+def test_naz_pretrain_trainer_runs_one_small_step(tmp_path):
+    data_file = tmp_path / "trainer.txt"
+    write_naz_trainer_text(data_file)
+    dil_dir = tmp_path / "Dil"
+    save_tiny_trainer_dil_checkpoint(dil_dir)
+
+    trainer = NazPretrainTrainer(tiny_pretrain_args(tmp_path, data_file, dil_dir))
+    batch = next(trainer.build_train_iterator())
+    result = trainer.train_step(batch, 1)
+    result.loss.backward()
+
+    assert trainer.stage == "pretrain"
+    assert torch.isfinite(result.loss)
+    assert result.token_count > 0
+    assert grad_abs_sum(next(trainer.model.student_core.parameters())) > 0.0
+
+
+def test_naz_finetune_trainer_initializes_from_pretrain_checkpoint_and_runs_step(tmp_path):
+    data_file = tmp_path / "trainer.txt"
+    write_naz_trainer_text(data_file)
+    dil_dir = tmp_path / "Dil"
+    save_tiny_trainer_dil_checkpoint(dil_dir)
+    pretrain_trainer = NazPretrainTrainer(tiny_pretrain_args(tmp_path, data_file, dil_dir))
+    checkpoint_dir = pretrain_trainer.save_checkpoint("checkpoint-1", 1, {"loss": 1.0})
+    init_checkpoint = checkpoint_dir / "checkpoint.pt"
+
+    trainer = NazFinetuneTrainer(tiny_finetune_args(tmp_path, data_file, init_checkpoint))
+    batch = next(trainer.build_train_iterator())
+    result = trainer.train_step(batch, 1)
+
+    assert trainer.stage == "finetune"
+    assert trainer.config.hidden_size == pretrain_trainer.config.hidden_size
+    assert trainer.config.mtp_horizons == pretrain_trainer.config.mtp_horizons
+    assert trainer.scheduler.get_last_lr()[0] == 3e-5
+    assert torch.isfinite(result.loss)
+    assert result.token_count > 0
+
+
+def test_naz_finetune_rejects_architecture_override(tmp_path):
+    args = parse_naz_args(
+        [
+            "--stage",
+            "finetune",
+            "--train-file",
+            str(tmp_path / "trainer.txt"),
+            "--init-naz-checkpoint",
+            str(tmp_path / "checkpoint.pt"),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--hidden-size",
+            "64",
+        ]
+    )
+
+    try:
+        validate_naz_args(args)
+    except ValueError as error:
+        assert "model architecture/objective overrides" in str(error)
+        assert "--hidden-size" in str(error)
+    else:
+        raise AssertionError("Naz finetune accepted architecture override")
+
+
+def test_naz_resume_uses_checkpoint_stage_and_locked_runtime(tmp_path):
+    data_file = tmp_path / "trainer.txt"
+    write_naz_trainer_text(data_file)
+    dil_dir = tmp_path / "Dil"
+    save_tiny_trainer_dil_checkpoint(dil_dir)
+    pretrain_trainer = NazPretrainTrainer(tiny_pretrain_args(tmp_path, data_file, dil_dir))
+    checkpoint_dir = pretrain_trainer.save_checkpoint("checkpoint-1", 1, {"loss": 1.0})
+
+    args = parse_naz_args(
+        [
+            "--train-file",
+            str(data_file),
+            "--resume",
+            str(checkpoint_dir / "checkpoint.pt"),
+            "--output-dir",
+            str(tmp_path / "resumed"),
+            "--compile-mode",
+            "off",
+            "--max-steps",
+            "2",
+            "--batch-size",
+            "1",
+            "--eval-batch-size",
+            "1",
+            "--log-every",
+            "1",
+            "--checkpoint-every",
+            "0",
+            "--eval-every",
+            "0",
+            "--max-eval-batches",
+            "1",
+            "--text-read-chars",
+            "256",
+            "--num-workers",
+            "0",
+            "--prefetch-factor",
+            "1",
+        ]
+    )
+    trainer = make_trainer(args)
+
+    assert isinstance(trainer, NazPretrainTrainer)
+    assert trainer.stage == "pretrain"
+    assert trainer.start_step == 1
+    assert trainer.args.sequence_length == 2
+    assert trainer.args.data_mode == "streaming"
+
+
+def test_naz_trainer_detects_frozen_dil_checksum_change(tmp_path):
+    data_file = tmp_path / "trainer.txt"
+    write_naz_trainer_text(data_file)
+    dil_dir = tmp_path / "Dil"
+    save_tiny_trainer_dil_checkpoint(dil_dir)
+    trainer = NazPretrainTrainer(tiny_pretrain_args(tmp_path, data_file, dil_dir))
+
+    with torch.no_grad():
+        next(trainer.model.dil_model.parameters()).add_(1.0)
+
+    try:
+        trainer.assert_checkpoint_integrity()
+    except RuntimeError as error:
+        assert "frozen Dil checksum changed" in str(error)
+    else:
+        raise AssertionError("Naz trainer accepted a changed frozen Dil checksum")
+
+
+def test_train_naz_unified_entrypoint_excludes_sft_path():
+    source = (Path(__file__).resolve().parents[1] / "dilnaz" / "train" / "train_naz.py").read_text(encoding="utf-8")
+
+    assert "PromptAnswerNazDataset" not in source
+    assert "masked_sft_forward" not in source
+    assert "exact_answer_accuracy" not in source
 
 
 def test_prompt_answer_naz_dataset_masks_only_answer_targets(tmp_path):

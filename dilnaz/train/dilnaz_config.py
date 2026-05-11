@@ -114,3 +114,26 @@ NAZ_TRAIN_DEFAULTS = {
     "prefetch_factor": 4,
     "seed": 1,
 }
+
+
+NAZ_FINETUNE_DEFAULTS = {
+    "data_mode": "streaming",
+    "max_steps": 5000,
+    "batch_size": 8,
+    "eval_batch_size": 8,
+    "sequence_length": 128,
+    "learning_rate": 3e-5,
+    "weight_decay": 0.05,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.95,
+    "warmup_steps": 100,
+    "max_grad_norm": 1.0,
+    "log_every": 25,
+    "checkpoint_every": 1000,
+    "eval_every": 250,
+    "max_eval_batches": 16,
+    "text_read_chars": 1048576,
+    "num_workers": 4,
+    "prefetch_factor": 4,
+    "seed": 1,
+}

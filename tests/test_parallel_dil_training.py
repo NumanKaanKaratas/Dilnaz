@@ -2,12 +2,14 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz" / "train"))
 
-from dil_data import load_hybrid_tokenizer
+from dil_data import DILNAZ_READY_FORMAT, NLLB_LAYER_GROUPS, file_sha256, load_hybrid_tokenizer
 from models.configuration_dil import DilConfig
 from models.modeling_dil import Dil
 from parallel_dil_data import (
@@ -19,7 +21,13 @@ from parallel_dil_data import (
     parallel_alignment_loss,
     parallel_total_loss,
 )
-from train_dil import model_inputs
+from tokenization import default_vocab_path
+from train_dil import (
+    DilPretrainTrainer,
+    make_trainer as make_dil_trainer,
+    model_inputs,
+    parse_args as parse_dil_args,
+)
 
 
 def tiny_parallel_config(tokenizer) -> DilConfig:
@@ -34,6 +42,170 @@ def tiny_parallel_config(tokenizer) -> DilConfig:
         max_word_bytes=32,
         context_radius=1,
         dil_dropout=0.0,
+    )
+
+
+def tiny_trainer_args(tmp_path: Path, train_file: Path, output_name: str = "dil_out"):
+    return parse_dil_args(
+        [
+            "--train-file",
+            str(train_file),
+            "--output-dir",
+            str(tmp_path / output_name),
+            "--tokenizer-vocab",
+            str(default_vocab_path()),
+            "--compile-mode",
+            "off",
+            "--data-mode",
+            "streaming",
+            "--max-steps",
+            "1",
+            "--batch-size",
+            "2",
+            "--eval-batch-size",
+            "2",
+            "--nllb-batch-size",
+            "1",
+            "--max-batch-reuse",
+            "1",
+            "--text-read-chars",
+            "256",
+            "--prefetch-factor",
+            "1",
+            "--learning-rate",
+            "1e-4",
+            "--weight-decay",
+            "0.0",
+            "--warmup-steps",
+            "0",
+            "--max-grad-norm",
+            "1.0",
+            "--log-every",
+            "1",
+            "--checkpoint-every",
+            "0",
+            "--eval-every",
+            "0",
+            "--max-eval-batches",
+            "1",
+            "--num-workers",
+            "0",
+            "--seed",
+            "1",
+            "--hidden-size",
+            "8",
+            "--intermediate-size",
+            "16",
+            "--num-encoder-layers",
+            "2",
+            "--latent-size",
+            "4",
+            "--max-word-bytes",
+            "8",
+            "--context-radius",
+            "1",
+            "--byte-conv-layers",
+            "0",
+            "--byte-conv-kernel-size",
+            "3",
+            "--byte-conv-expansion",
+            "1",
+            "--dil-dropout",
+            "0.0",
+            "--distillation-weight",
+            "1.0",
+            "--layer-geometry-weight",
+            "1.0",
+            "--mean-geometry-weight",
+            "1.0",
+            "--variance-weight",
+            "0.0",
+            "--writer-loss-weight",
+            "0.0",
+            "--writer-num-layers",
+            "0",
+            "--writer-conv-kernel-size",
+            "3",
+            "--writer-conv-expansion",
+            "1",
+            "--writer-dropout",
+            "0.0",
+        ]
+    )
+
+
+def write_tiny_ready_parquet(path: Path, config: DilConfig) -> None:
+    rows = 4
+    input_rows = []
+    mask_rows = []
+    label_rows = []
+    teacher_rows = []
+    for row_idx in range(rows):
+        input_ids = [config.pad_token_id] * (config.context_size * config.max_word_bytes)
+        word_masks = [False] * (config.context_size * config.max_word_bytes)
+        for context_idx in range(config.context_size):
+            offset = context_idx * config.max_word_bytes
+            input_ids[offset] = 2 + row_idx + context_idx
+            word_masks[offset] = True
+        labels = [-100] * config.max_word_bytes
+        labels[0] = 2 + row_idx
+        labels[1] = config.eos_token_id
+        teacher_layers = torch.randn(len(NLLB_LAYER_GROUPS), 1024, generator=torch.Generator().manual_seed(row_idx))
+        input_rows.append(input_ids)
+        mask_rows.append(word_masks)
+        label_rows.append(labels)
+        teacher_rows.append(teacher_layers.reshape(-1).tolist())
+    table = pa.table(
+        {
+            "input_ids": input_rows,
+            "word_masks": mask_rows,
+            "labels": label_rows,
+            "teacher_layers": teacher_rows,
+            "teacher_mask": [True] * rows,
+        }
+    )
+    metadata = {
+        "format": DILNAZ_READY_FORMAT,
+        "tokenizer_vocab_size": str(config.vocab_size),
+        "pad_token_id": str(config.pad_token_id),
+        "eos_token_id": str(config.eos_token_id),
+        "max_word_bytes": str(config.max_word_bytes),
+        "context_radius": str(config.context_radius),
+        "context_size": str(config.context_size),
+        "target_index": str(config.target_index),
+        "teacher_dim": "1024",
+        "teacher_layer_count": str(len(NLLB_LAYER_GROUPS)),
+        "tokenizer_vocab_sha256": file_sha256(default_vocab_path()),
+        "teacher_formula": "centered_add_w050_grouped",
+    }
+    pq.write_table(table.replace_schema_metadata(metadata), path)
+
+
+def tiny_trainer_config(args, tokenizer) -> DilConfig:
+    return DilConfig(
+        vocab_size=tokenizer.vocab_size,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        num_encoder_layers=args.num_encoder_layers,
+        latent_size=args.latent_size,
+        max_word_bytes=args.max_word_bytes,
+        context_radius=args.context_radius,
+        byte_conv_layers=args.byte_conv_layers,
+        byte_conv_kernel_size=args.byte_conv_kernel_size,
+        byte_conv_expansion=args.byte_conv_expansion,
+        dil_dropout=args.dil_dropout,
+        distillation_weight=args.distillation_weight,
+        layer_geometry_weight=args.layer_geometry_weight,
+        mean_geometry_weight=args.mean_geometry_weight,
+        variance_weight=args.variance_weight,
+        writer_loss_weight=args.writer_loss_weight,
+        writer_num_layers=args.writer_num_layers,
+        writer_conv_kernel_size=args.writer_conv_kernel_size,
+        writer_conv_expansion=args.writer_conv_expansion,
+        writer_dropout=args.writer_dropout,
+        tokenizer_vocab_file=args.tokenizer_vocab.name,
     )
 
 
@@ -199,6 +371,75 @@ def test_parallel_dil_mock_teacher_forward_backward(tmp_path):
     assert outputs.distill_loss is not None
     assert not hasattr(outputs, "ce_loss")
     assert model.encoder.embed_tokens.weight.grad is not None
+
+
+def test_dil_pretrain_trainer_runs_one_ready_parquet_step(tmp_path):
+    tokenizer = load_hybrid_tokenizer()
+    args = tiny_trainer_args(tmp_path, tmp_path / "ready.parquet")
+    write_tiny_ready_parquet(args.train_file, tiny_trainer_config(args, tokenizer))
+
+    trainer = DilPretrainTrainer(args)
+    batch = next(trainer.build_train_iterator())
+    result = trainer.train_step(batch, 1)
+    result.loss.backward()
+
+    assert torch.isfinite(result.loss)
+    assert result.token_count == 4
+    assert result.window_count == 2
+    assert trainer.teacher is None
+    assert trainer.train_is_parquet
+    assert trainer.model.encoder.embed_tokens.weight.grad is not None
+
+
+def test_dil_trainer_resume_restores_step_and_config(tmp_path):
+    tokenizer = load_hybrid_tokenizer()
+    args = tiny_trainer_args(tmp_path, tmp_path / "ready.parquet")
+    write_tiny_ready_parquet(args.train_file, tiny_trainer_config(args, tokenizer))
+    trainer = DilPretrainTrainer(args)
+    checkpoint_dir = trainer.save_checkpoint("checkpoint-1", 1, {"loss": 1.0})
+
+    resume_args = parse_dil_args(
+        [
+            "--train-file",
+            str(args.train_file),
+            "--output-dir",
+            str(tmp_path / "resumed"),
+            "--resume",
+            str(checkpoint_dir / "checkpoint.pt"),
+            "--compile-mode",
+            "off",
+            "--data-mode",
+            "streaming",
+            "--max-steps",
+            "2",
+            "--batch-size",
+            "2",
+            "--eval-batch-size",
+            "2",
+            "--nllb-batch-size",
+            "1",
+            "--max-batch-reuse",
+            "1",
+            "--prefetch-factor",
+            "1",
+            "--log-every",
+            "1",
+            "--checkpoint-every",
+            "0",
+            "--eval-every",
+            "0",
+            "--max-eval-batches",
+            "1",
+            "--num-workers",
+            "0",
+        ]
+    )
+    resumed = make_dil_trainer(resume_args)
+
+    assert isinstance(resumed, DilPretrainTrainer)
+    assert resumed.start_step == 1
+    assert resumed.config.hidden_size == 8
+    assert resumed.config.context_radius == 1
 
 
 def test_dil_checkpoint_format_matches_encoder_only_family():

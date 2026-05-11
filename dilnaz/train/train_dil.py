@@ -11,7 +11,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,9 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from byte_trainer_utils import (
     COMPILE_MODE_CHOICES,
     DeviceBatchPrefetcher,
-    autocast_context,
     compile_forward,
-    cudagraph_step_begin,
     cuda_sync,
     effective_compile_mode,
     load_checkpoint,
@@ -44,6 +41,7 @@ from dilnaz_config import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
 from models.configuration_dil import DilConfig
 from models.modeling_dil import Dil
 from tokenization import default_vocab_path
+from trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
 CHECKPOINT_FORMAT_VERSION = 21
@@ -95,17 +93,6 @@ class AsyncTeacherBatchSource:
         self.stop_event.set()
 
 
-def make_scheduler(optimizer, learning_rate: float, warmup_steps: int):
-    def lr_lambda(step):
-        if warmup_steps <= 0:
-            return 1.0
-        return min(1.0, float(step + 1) / float(warmup_steps))
-
-    for group in optimizer.param_groups:
-        group["lr"] = learning_rate
-    return LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-
 def json_training_state(config, step: int, metrics: dict, compile_mode: str):
     return {
         "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -124,6 +111,31 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
     }
 
 
+def runtime_training_state(args) -> dict:
+    return {
+        "data_mode": args.data_mode,
+        "batch_size": args.batch_size,
+        "eval_batch_size": args.eval_batch_size,
+        "nllb_batch_size": args.nllb_batch_size,
+        "max_batch_reuse": args.max_batch_reuse,
+        "text_read_chars": args.text_read_chars,
+        "prefetch_factor": args.prefetch_factor,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "adam_beta1": args.adam_beta1,
+        "adam_beta2": args.adam_beta2,
+        "warmup_steps": args.warmup_steps,
+        "max_grad_norm": args.max_grad_norm,
+        "log_every": args.log_every,
+        "checkpoint_every": args.checkpoint_every,
+        "eval_every": args.eval_every,
+        "max_eval_batches": args.max_eval_batches,
+        "num_workers": args.num_workers,
+        "seed": args.seed,
+        "max_samples": args.max_samples,
+    }
+
+
 def save_checkpoint(
     output_dir: Path,
     model,
@@ -134,6 +146,7 @@ def save_checkpoint(
     step: int,
     metrics: dict,
     compile_mode: str,
+    runtime: dict | None = None,
     checkpoint_name: str = "",
 ):
     checkpoint_dir = output_dir / checkpoint_name if checkpoint_name else output_dir
@@ -143,6 +156,8 @@ def save_checkpoint(
     if tokenizer_vocab_path.resolve() != dst_vocab.resolve():
         shutil.copyfile(tokenizer_vocab_path, dst_vocab)
     state = json_training_state(config, step, metrics, compile_mode)
+    if runtime is not None:
+        state["runtime"] = runtime
     torch.save(
         {
             "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -164,15 +179,9 @@ def restore_checkpoint(path: Path, model, optimizer, scheduler, device: torch.de
     if checkpoint["format_version"] != CHECKPOINT_FORMAT_VERSION:
         raise ValueError(f"unsupported checkpoint format_version={checkpoint.get('format_version')}")
     model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer_state = checkpoint.get("optimizer_state_dict")
-    scheduler_state = checkpoint.get("scheduler_state_dict")
-    rng = checkpoint.get("rng_state")
-    if optimizer_state is not None:
-        optimizer.load_state_dict(optimizer_state)
-    if scheduler_state is not None:
-        scheduler.load_state_dict(scheduler_state)
-    if rng is not None:
-        restore_rng_state(rng)
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    restore_rng_state(checkpoint["rng_state"])
     training_state = checkpoint["training_state"]
     return int(training_state["step"]), dict(training_state["metrics"])
 
@@ -192,10 +201,31 @@ def model_inputs(batch: dict) -> dict:
     }
 
 
-@torch.no_grad()
-def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_enabled: bool, cuda_prefetch: bool, max_batches: int):
-    model.eval()
-    total = {
+class AsyncTeacherIterator:
+    def __init__(self, batch_source: AsyncTeacherBatchSource):
+        self.batch_source = batch_source
+        self.current_batch = None
+        self.current_batch_seen = 0
+        self.last_data_seconds = 0.0
+        self.last_transfer_seconds = 0.0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.current_batch is None:
+            self.current_batch, self.current_batch_seen, self.last_data_seconds = self.batch_source.first()
+        else:
+            self.current_batch, self.current_batch_seen, self.last_data_seconds = self.batch_source.next_after_step(
+                self.current_batch,
+                self.current_batch_seen,
+            )
+        self.last_transfer_seconds = 0.0
+        return self.current_batch
+
+
+def empty_metric_sums() -> dict:
+    return {
         "loss": 0.0,
         "distill": 0.0,
         "writer": 0.0,
@@ -210,36 +240,38 @@ def evaluate(model, eval_loader, teacher, device, compile_mode: str, autocast_en
         "token_exact": 0.0,
         "stop_acc": 0.0,
         "batches": 0,
+        "source_line_ids": set(),
     }
-    for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
-        if "teacher_layers" not in batch:
-            if teacher is None:
-                raise ValueError("eval batch has no teacher_layers and no NLLB teacher is available")
-            teacher_layers, teacher_mask = teacher.teacher_layers(batch)
-            batch["teacher_layers"] = teacher_layers
-            batch["teacher_mask"] = teacher_mask
-        cudagraph_step_begin(device, compile_mode)
-        with autocast_context(autocast_enabled):
-            outputs = model(**model_inputs(batch))
-        total["loss"] += float(outputs.loss.detach().cpu())
-        total["distill"] += float(outputs.distill_loss.detach().cpu())
-        total["writer"] += float(outputs.writer_loss.detach().cpu())
-        total["writer_token"] += float(outputs.writer_token_loss.detach().cpu())
-        layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
-        for idx in range(4):
-            total[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
-        total["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
-        total["var"] += float(outputs.variance_loss.detach().cpu())
-        total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
-        total["token_exact"] += float(outputs.token_exact.detach().cpu())
-        total["stop_acc"] += float(outputs.stop_acc.detach().cpu())
-        total["batches"] += 1
-        if batch_idx >= max_batches:
-            break
 
-    model.train()
-    batches = max(total.pop("batches"), 1)
-    return {f"eval_{key}": value / batches for key, value in total.items()}
+
+def accumulate_output_metrics(total: dict, outputs, batch: dict) -> None:
+    total["loss"] += float(outputs.loss.detach().cpu())
+    total["distill"] += float(outputs.distill_loss.detach().cpu())
+    total["writer"] += float(outputs.writer_loss.detach().cpu())
+    total["writer_token"] += float(outputs.writer_token_loss.detach().cpu())
+    layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
+    for idx in range(4):
+        total[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
+    total["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
+    total["var"] += float(outputs.variance_loss.detach().cpu())
+    total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
+    total["token_exact"] += float(outputs.token_exact.detach().cpu())
+    total["stop_acc"] += float(outputs.stop_acc.detach().cpu())
+    total["batches"] += 1
+    if "source_line_ids" in batch:
+        total["source_line_ids"].update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
+
+
+def reduce_metric_sums(total: dict) -> dict[str, float]:
+    batches = max(total["batches"], 1)
+    metrics = {
+        key: value / batches
+        for key, value in total.items()
+        if key not in {"batches", "source_line_ids"}
+    }
+    if total["source_line_ids"]:
+        metrics["source_lines_seen"] = len(total["source_line_ids"])
+    return metrics
 
 
 def format_log(step, metrics):
@@ -272,7 +304,7 @@ def format_log(step, metrics):
     return " ".join(fields)
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-file", type=Path, required=True)
     parser.add_argument("--eval-file", type=Path, default=None)
@@ -328,7 +360,7 @@ def parse_args():
     parser.add_argument("--writer-dropout", type=float, default=DIL_MODEL_DEFAULTS["writer_dropout"])
     parser.add_argument("--nllb-model-name", default="facebook/nllb-200-distilled-600M")
     parser.add_argument("--nllb-src-lang", default="tur_Latn")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def validate_args(args):
@@ -409,355 +441,300 @@ def build_config(args, tokenizer):
     )
 
 
-def main():
-    args = parse_args()
-    validate_args(args)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+class DilBaseTrainer(BaseTrainer):
+    def __init__(self, args):
+        validate_args(args)
+        super().__init__(args)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        self.tokenizer_vocab_path = self.resolve_tokenizer_vocab_path(args)
+        self.tokenizer = load_hybrid_tokenizer(self.tokenizer_vocab_path)
+        self.config = build_config(args, self.tokenizer)
+        self.train_is_parquet = is_parquet_path(args.train_file)
+        self.eval_is_parquet = is_parquet_path(args.eval_file)
+        self.validate_data_contracts()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+        self.compile_mode = effective_compile_mode(args.compile_mode, self.device)
+        validate_compile_environment(self.compile_mode)
+        self.autocast_enabled = bool(args.bf16 and self.device.type == "cuda")
+        self.teacher_dtype = torch.bfloat16 if self.autocast_enabled else torch.float32
+        self.cuda_prefetch = bool(self.device.type == "cuda" and not args.no_cuda_prefetch)
+        self.model = Dil(self.config).to(self.device)
+        self.model.train()
+        self.optimizer = AdamW(
+            self.model.parameters(),
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.weight_decay,
+        )
+        self.scheduler = make_scheduler(self.optimizer, args.learning_rate, args.warmup_steps)
+        self.teacher = self.build_teacher()
+        if args.resume is not None:
+            self.start_step, self.last_metrics = restore_checkpoint(
+                args.resume,
+                self.model,
+                self.optimizer,
+                self.scheduler,
+                self.device,
+            )
+        self.model.set_compiled_forwards(
+            encoder_forward=compile_forward(self.model.encoder.forward, self.compile_mode, "DilEncoderCore"),
+            writer_forward=compile_forward(self.model.writer.forward, self.compile_mode, "DilConditionalWriter"),
+        )
+        self.train_iterator = None
+        self.eval_loader = None
+        self.batch_source = None
+        self.prepare_data_sources()
 
-    tokenizer_vocab_path = args.tokenizer_vocab
-    if args.resume is not None:
+    def resolve_tokenizer_vocab_path(self, args) -> Path:
+        if args.resume is None:
+            return args.tokenizer_vocab
         resume_config = DilConfig.from_pretrained(args.resume.parent)
-        tokenizer_vocab_path = args.resume.parent / resume_config.tokenizer_vocab_file
-    tokenizer = load_hybrid_tokenizer(tokenizer_vocab_path)
-    config = build_config(args, tokenizer)
-    train_is_parquet = is_parquet_path(args.train_file)
-    eval_is_parquet = is_parquet_path(args.eval_file)
-    if train_is_parquet:
-        validate_dilnaz_ready_parquet(args.train_file, config, tokenizer_vocab_path)
-    if eval_is_parquet:
-        validate_dilnaz_ready_parquet(args.eval_file, config, tokenizer_vocab_path)
+        return args.resume.parent / resume_config.tokenizer_vocab_file
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        torch.set_float32_matmul_precision("high")
-    compile_mode = effective_compile_mode(args.compile_mode, device)
-    validate_compile_environment(compile_mode)
-    autocast_enabled = bool(args.bf16 and device.type == "cuda")
-    teacher_dtype = torch.bfloat16 if autocast_enabled else torch.float32
-    cuda_prefetch = bool(device.type == "cuda" and not args.no_cuda_prefetch)
+    def validate_data_contracts(self) -> None:
+        if self.train_is_parquet:
+            validate_dilnaz_ready_parquet(self.args.train_file, self.config, self.tokenizer_vocab_path)
+        if self.eval_is_parquet:
+            validate_dilnaz_ready_parquet(self.args.eval_file, self.config, self.tokenizer_vocab_path)
 
-    base_model = Dil(config).to(device)
-    base_model.train()
-    base_model.set_compiled_forwards(
-        encoder_forward=compile_forward(base_model.encoder.forward, compile_mode, "DilEncoderCore"),
-        writer_forward=compile_forward(base_model.writer.forward, compile_mode, "DilConditionalWriter"),
-    )
-    model = base_model
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.weight_decay,
-    )
-    scheduler = make_scheduler(optimizer, args.learning_rate, args.warmup_steps)
-    needs_online_teacher = not train_is_parquet or (args.eval_file is not None and not eval_is_parquet)
-    teacher = None
-    if needs_online_teacher:
-        teacher = NllbTeacher(
-            config.nllb_model_name,
-            config.nllb_src_lang,
-            device,
-            teacher_dtype,
-            batch_size=args.nllb_batch_size,
+    def build_teacher(self):
+        needs_online_teacher = not self.train_is_parquet or (self.args.eval_file is not None and not self.eval_is_parquet)
+        if not needs_online_teacher:
+            return None
+        return NllbTeacher(
+            self.config.nllb_model_name,
+            self.config.nllb_src_lang,
+            self.device,
+            self.teacher_dtype,
+            batch_size=self.args.nllb_batch_size,
         )
 
-    start_step = 0
-    last_metrics = {}
-    if args.resume is not None:
-        start_step, last_metrics = restore_checkpoint(args.resume, model, optimizer, scheduler, device)
-
-    print(
-        f"device={device.type} bf16={int(autocast_enabled)} compile_mode={compile_mode} "
-        f"data_mode={args.data_mode} resume_step={start_step} "
-        f"teacher_source={'parquet nllb=disabled' if train_is_parquet else 'online_nllb'} "
-        f"vocab_size={config.vocab_size} latent_size={config.latent_size} hidden_size={config.hidden_size}",
-        flush=True,
-    )
-
-    if train_is_parquet:
-        train_dataset = ReadyParquetDilBatchDataset(
-            args.train_file,
-            config,
-            batch_size=args.batch_size,
+    def make_train_dataset(self):
+        if self.train_is_parquet:
+            return ReadyParquetDilBatchDataset(
+                self.args.train_file,
+                self.config,
+                batch_size=self.args.batch_size,
+                repeat=True,
+                max_samples=self.args.max_samples,
+            )
+        return HybridDilBatchDataset(
+            self.args.train_file,
+            self.config,
+            self.tokenizer,
+            batch_size=self.args.batch_size,
+            read_chars=self.args.text_read_chars,
             repeat=True,
-            max_samples=args.max_samples,
+            max_samples=self.args.max_samples,
+            teacher_tokenizer=self.teacher.tokenizer,
+            teacher_max_tokens=self.teacher.max_encoder_tokens,
         )
-    else:
-        assert teacher is not None
-        train_dataset = HybridDilBatchDataset(
-            args.train_file,
-            config,
-            tokenizer,
-            batch_size=args.batch_size,
-            read_chars=args.text_read_chars,
-            repeat=True,
-            max_samples=args.max_samples,
-            teacher_tokenizer=teacher.tokenizer,
-            teacher_max_tokens=teacher.max_encoder_tokens,
-        )
-    eval_dataset = None
-    if args.eval_every > 0:
-        if eval_is_parquet:
-            eval_dataset = ReadyParquetDilBatchDataset(
-                args.eval_file,
-                config,
-                batch_size=args.eval_batch_size,
+
+    def make_eval_dataset(self):
+        if self.args.eval_every <= 0:
+            return None
+        if self.eval_is_parquet:
+            return ReadyParquetDilBatchDataset(
+                self.args.eval_file,
+                self.config,
+                batch_size=self.args.eval_batch_size,
                 repeat=False,
             )
+        return HybridDilBatchDataset(
+            self.args.eval_file,
+            self.config,
+            self.tokenizer,
+            batch_size=self.args.eval_batch_size,
+            read_chars=self.args.text_read_chars,
+            repeat=False,
+            teacher_tokenizer=self.teacher.tokenizer,
+            teacher_max_tokens=self.teacher.max_encoder_tokens,
+        )
+
+    def prepare_data_sources(self) -> None:
+        train_dataset = self.make_train_dataset()
+        eval_dataset = self.make_eval_dataset()
+        if self.args.data_mode == "resident":
+            self.prepare_resident_sources(train_dataset, eval_dataset)
         else:
-            assert teacher is not None
-            eval_dataset = HybridDilBatchDataset(
-                args.eval_file,
-                config,
-                tokenizer,
-                batch_size=args.eval_batch_size,
-                read_chars=args.text_read_chars,
-                repeat=False,
-                teacher_tokenizer=teacher.tokenizer,
-                teacher_max_tokens=teacher.max_encoder_tokens,
-            )
+            self.prepare_streaming_sources(train_dataset, eval_dataset)
 
-    if args.data_mode == "resident":
+    def prepare_resident_sources(self, train_dataset, eval_dataset) -> None:
         print("resident_data_prepare_start=1", flush=True)
-        if train_is_parquet:
-            train_iter = ResidentReadyParquetBatcher.from_dataset(
+        if self.train_is_parquet:
+            self.train_iterator = ResidentReadyParquetBatcher.from_dataset(
                 train_dataset,
-                args.batch_size,
-                device,
-                args.seed + start_step,
+                self.args.batch_size,
+                self.device,
+                self.args.seed + self.start_step,
             )
         else:
-            assert teacher is not None
-            train_iter = ResidentDilBatcher.from_dataset(
+            self.train_iterator = ResidentDilBatcher.from_dataset(
                 train_dataset,
-                teacher,
-                args.batch_size,
-                device,
-                args.seed + start_step,
+                self.teacher,
+                self.args.batch_size,
+                self.device,
+                self.args.seed + self.start_step,
             )
-        print(f"resident_data_prepare_done=1 batches={len(train_iter.batches)}", flush=True)
-        eval_loader = None
-        if eval_dataset is not None:
-            print("resident_eval_prepare_start=1", flush=True)
-            if eval_is_parquet:
-                eval_loader = ResidentDilEvalLoader(
-                    ResidentReadyParquetBatcher.from_dataset(
-                        eval_dataset,
-                        args.eval_batch_size,
-                        device,
-                        args.seed + 1,
-                    )
-                )
-            else:
-                assert teacher is not None
-                eval_loader = ResidentDilEvalLoader(
-                    ResidentDilBatcher.from_dataset(
-                        eval_dataset,
-                        teacher,
-                        args.eval_batch_size,
-                        device,
-                        args.seed + 1,
-                    )
-                )
-            print(f"resident_eval_prepare_done=1 batches={len(eval_loader.batches)}", flush=True)
-        batch_source = None
-    else:
+        print(f"resident_data_prepare_done=1 batches={len(self.train_iterator.batches)}", flush=True)
+        if eval_dataset is None:
+            return
+        print("resident_eval_prepare_start=1", flush=True)
+        if self.eval_is_parquet:
+            eval_batcher = ResidentReadyParquetBatcher.from_dataset(
+                eval_dataset,
+                self.args.eval_batch_size,
+                self.device,
+                self.args.seed + 1,
+            )
+        else:
+            eval_batcher = ResidentDilBatcher.from_dataset(
+                eval_dataset,
+                self.teacher,
+                self.args.eval_batch_size,
+                self.device,
+                self.args.seed + 1,
+            )
+        self.eval_loader = ResidentDilEvalLoader(eval_batcher)
+        print(f"resident_eval_prepare_done=1 batches={len(self.eval_loader.batches)}", flush=True)
+
+    def prepare_streaming_sources(self, train_dataset, eval_dataset) -> None:
         train_loader = make_dil_batch_loader(
             train_dataset,
-            num_workers=args.num_workers,
-            pin_memory=device.type == "cuda",
-            prefetch_factor=args.prefetch_factor,
+            num_workers=self.args.num_workers,
+            pin_memory=self.device.type == "cuda",
+            prefetch_factor=self.args.prefetch_factor,
         )
-        eval_loader = None
-        if eval_dataset is not None:
-            eval_loader = make_dil_batch_loader(
-                eval_dataset,
-                num_workers=args.num_workers,
-                pin_memory=device.type == "cuda",
-                prefetch_factor=args.prefetch_factor,
-            )
-        train_iter = DeviceBatchPrefetcher(train_loader, device, cuda_prefetch)
-        if train_is_parquet:
-            batch_source = None
+        train_prefetcher = DeviceBatchPrefetcher(train_loader, self.device, self.cuda_prefetch)
+        if self.train_is_parquet:
+            self.train_iterator = train_prefetcher
         else:
-            assert teacher is not None
-            batch_source = AsyncTeacherBatchSource(train_iter, teacher, device, args.max_batch_reuse)
+            self.batch_source = AsyncTeacherBatchSource(
+                train_prefetcher,
+                self.teacher,
+                self.device,
+                self.args.max_batch_reuse,
+            )
+            self.train_iterator = AsyncTeacherIterator(self.batch_source)
+        if eval_dataset is not None:
+            self.eval_loader = make_dil_batch_loader(
+                eval_dataset,
+                num_workers=self.args.num_workers,
+                pin_memory=self.device.type == "cuda",
+                prefetch_factor=self.args.prefetch_factor,
+            )
 
-    log_start = time.perf_counter()
-    log_tokens = 0
-    log_windows = 0
-    log_steps = 0
-    data_seconds = 0.0
-    compute_seconds = 0.0
-    source_lines_seen: set[int] = set()
-    metric_sums = {
-        "loss": 0.0,
-        "distill": 0.0,
-        "writer": 0.0,
-        "writer_token": 0.0,
-        "geom_l1": 0.0,
-        "geom_l2": 0.0,
-        "geom_l3": 0.0,
-        "geom_l4": 0.0,
-        "geom_mean": 0.0,
-        "var": 0.0,
-        "byte_acc": 0.0,
-        "token_exact": 0.0,
-        "stop_acc": 0.0,
-    }
-    completed_step = start_step
-    current_batch = None
-    current_batch_seen = 0
-    if batch_source is not None:
-        current_batch, current_batch_seen, initial_wait = batch_source.first()
-        data_seconds += initial_wait
+    def build_train_iterator(self):
+        return self.train_iterator
 
-    def save_interrupted():
-        interrupted_dir = save_checkpoint(
-            args.output_dir,
-            model,
-            optimizer,
-            scheduler,
-            config,
-            tokenizer_vocab_path,
-            completed_step,
-            last_metrics,
-            compile_mode,
+    def build_eval_iterator(self):
+        if self.eval_loader is None:
+            return None
+        if self.args.data_mode == "resident":
+            return iter(self.eval_loader)
+        return DeviceBatchPrefetcher(self.eval_loader, self.device, self.cuda_prefetch)
+
+    def has_eval(self) -> bool:
+        return self.eval_loader is not None
+
+    def empty_metric_sums(self) -> dict:
+        return empty_metric_sums()
+
+    def accumulate_metrics(self, total: dict, result: StepResult) -> None:
+        accumulate_output_metrics(total, result.outputs, result.batch)
+
+    def reduce_metrics(self, total: dict) -> dict[str, float]:
+        return reduce_metric_sums(total)
+
+    def materialize_eval_teacher(self, batch: dict) -> None:
+        if "teacher_layers" in batch:
+            return
+        if self.teacher is None:
+            raise ValueError("eval batch has no teacher_layers and no NLLB teacher is available")
+        teacher_layers, teacher_mask = self.teacher.teacher_layers(batch)
+        batch["teacher_layers"] = teacher_layers
+        batch["teacher_mask"] = teacher_mask
+
+    def forward_batch(self, batch: dict, training_step: int | None):
+        model_batch = model_inputs(batch)
+        if training_step is not None:
+            model_batch["training_step"] = training_step
+        outputs = self.model(**model_batch)
+        return outputs
+
+    def train_step(self, batch: dict, step: int) -> StepResult:
+        outputs = self.forward_batch(batch, step)
+        return StepResult(
+            loss=outputs.loss,
+            outputs=outputs,
+            token_count=int(batch["labels"].ne(-100).sum().detach().cpu()),
+            window_count=int(batch["labels"].shape[0]),
+            batch=batch,
         )
-        print(f"interrupted_saved={interrupted_dir}", flush=True)
 
-    try:
-        for step in range(start_step + 1, args.max_steps + 1):
-            if args.data_mode == "resident":
-                batch = next(train_iter)
-            elif train_is_parquet:
-                data_start = time.perf_counter()
-                batch = next(train_iter)
-                data_seconds += time.perf_counter() - data_start
-            else:
-                batch = current_batch
+    def eval_step(self, batch: dict) -> StepResult:
+        self.materialize_eval_teacher(batch)
+        outputs = self.forward_batch(batch, None)
+        return StepResult(
+            loss=outputs.loss,
+            outputs=outputs,
+            token_count=int(batch["labels"].ne(-100).sum().detach().cpu()),
+            window_count=int(batch["labels"].shape[0]),
+            batch=batch,
+        )
 
-            compute_start = time.perf_counter()
-            optimizer.zero_grad(set_to_none=True)
-            cudagraph_step_begin(device, compile_mode)
-            model_batch = model_inputs(batch)
-            model_batch["training_step"] = step
-            with autocast_context(autocast_enabled):
-                outputs = model(**model_batch)
+    def save_checkpoint(self, checkpoint_name: str, step: int, metrics: dict[str, float]):
+        return save_checkpoint(
+            self.args.output_dir,
+            self.model,
+            self.optimizer,
+            self.scheduler,
+            self.config,
+            self.tokenizer_vocab_path,
+            step,
+            metrics,
+            self.compile_mode,
+            runtime_training_state(self.args),
+            checkpoint_name=checkpoint_name,
+        )
 
-            outputs.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            optimizer.step()
-            scheduler.step()
-            cuda_sync(device)
-            compute_seconds += time.perf_counter() - compute_start
-            completed_step = step
-            if batch_source is not None:
-                current_batch, current_batch_seen, wait_seconds = batch_source.next_after_step(
-                    current_batch,
-                    current_batch_seen,
-                )
-                data_seconds += wait_seconds
+    def is_recoverable_runtime_error(self, error: RuntimeError) -> bool:
+        return is_dataloader_worker_exit(error)
 
-            real_tokens = int(batch["labels"].ne(-100).sum().detach().cpu())
-            log_tokens += real_tokens
-            log_windows += int(batch["labels"].shape[0])
-            log_steps += 1
-            if "source_line_ids" in batch:
-                source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
-            metric_sums["loss"] += float(outputs.loss.detach().cpu())
-            metric_sums["distill"] += float(outputs.distill_loss.detach().cpu())
-            metric_sums["writer"] += float(outputs.writer_loss.detach().cpu())
-            metric_sums["writer_token"] += float(outputs.writer_token_loss.detach().cpu())
-            layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
-            for idx in range(4):
-                metric_sums[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
-            metric_sums["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
-            metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
-            metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
-            metric_sums["token_exact"] += float(outputs.token_exact.detach().cpu())
-            metric_sums["stop_acc"] += float(outputs.stop_acc.detach().cpu())
+    def close(self) -> None:
+        if self.batch_source is not None:
+            self.batch_source.close()
 
-            should_log = step % args.log_every == 0 or step == start_step + 1 or step == args.max_steps
-            should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0
-            if should_log or should_eval:
-                elapsed = max(time.perf_counter() - log_start, 1e-9)
-                averaged = {key: value / max(log_steps, 1) for key, value in metric_sums.items()}
-                averaged["lr"] = scheduler.get_last_lr()[0]
-                averaged["data_seconds"] = data_seconds / max(log_steps, 1)
-                averaged["compute_seconds"] = compute_seconds / max(log_steps, 1)
-                averaged["tokens_per_second"] = log_tokens / elapsed
-                averaged["windows_per_second"] = log_windows / elapsed
-                averaged["steps_per_second"] = log_steps / elapsed
-                if source_lines_seen:
-                    averaged["source_lines_seen"] = len(source_lines_seen)
-                if should_eval:
-                    averaged.update(
-                        evaluate(
-                            model,
-                            eval_loader,
-                            teacher,
-                            device,
-                            compile_mode,
-                            autocast_enabled,
-                            cuda_prefetch,
-                            args.max_eval_batches,
-                        )
-                    )
-                print(format_log(step, averaged), flush=True)
-                last_metrics = averaged
-                log_start = time.perf_counter()
-                log_tokens = 0
-                log_windows = 0
-                log_steps = 0
-                data_seconds = 0.0
-                compute_seconds = 0.0
-                for key in metric_sums:
-                    metric_sums[key] = 0.0
+    def format_log(self, step: int, metrics: dict[str, float]) -> str:
+        return format_log(step, metrics)
 
-            if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
-                save_checkpoint(
-                    args.output_dir,
-                    model,
-                    optimizer,
-                    scheduler,
-                    config,
-                    tokenizer_vocab_path,
-                    step,
-                    last_metrics,
-                    compile_mode,
-                    checkpoint_name=f"checkpoint-{step}",
-                )
-    except KeyboardInterrupt:
-        if batch_source is not None:
-            batch_source.close()
-        save_interrupted()
-        return
-    except RuntimeError as error:
-        if batch_source is not None:
-            batch_source.close()
-        if not is_dataloader_worker_exit(error):
-            raise
-        save_interrupted()
-        return
+    def run(self) -> None:
+        print(
+            f"device={self.device.type} bf16={int(self.autocast_enabled)} compile_mode={self.compile_mode} "
+            f"data_mode={self.args.data_mode} resume_step={self.start_step} "
+            f"teacher_source={'parquet nllb=disabled' if self.train_is_parquet else 'online_nllb'} "
+            f"vocab_size={self.config.vocab_size} latent_size={self.config.latent_size} "
+            f"hidden_size={self.config.hidden_size}",
+            flush=True,
+        )
+        super().run()
 
-    if batch_source is not None:
-        batch_source.close()
 
-    final_dir = save_checkpoint(
-        args.output_dir,
-        model,
-        optimizer,
-        scheduler,
-        config,
-        tokenizer_vocab_path,
-        args.max_steps,
-        last_metrics,
-        compile_mode,
-    )
-    print(f"saved={final_dir}", flush=True)
+class DilPretrainTrainer(DilBaseTrainer):
+    pass
+
+
+def make_trainer(args) -> DilBaseTrainer:
+    return DilPretrainTrainer(args)
+
+
+def main(argv: list[str] | None = None):
+    trainer = make_trainer(parse_args(argv))
+    trainer.run()
 
 
 if __name__ == "__main__":
