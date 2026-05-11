@@ -12,7 +12,7 @@ class NazConfig(PretrainedConfig):
         pad_token_id=256,
         eos_token_id=257,
         max_word_bytes=32,
-        latent_size=128,
+        latent_size=512,
         reconstruction_loss_weight=1.0,
         num_semantic_candidates=4,
         mtp_horizons=3,
