@@ -657,7 +657,7 @@ def test_dil_refinement_changes_output_with_frozen_preserved():
     assert not torch.allclose(out1.token_logits, out2.token_logits)
 
 
-def test_dil_position_age_changes_writer_transition_output():
+def test_dil_position_age_changes_writer_condition_without_word_input_shortcut():
     config = tiny_config()
     model = Dil(config).eval()
     semantic = torch.randn(1, config.writer_sliding_window_size, config.latent_size)
@@ -666,27 +666,37 @@ def test_dil_position_age_changes_writer_transition_output():
         -100,
         dtype=torch.long,
     )
+    frozen_mask = torch.zeros_like(surface_state, dtype=torch.bool)
+    _, _, _, state_quality = model.writer._state_embeddings(surface_state, None, frozen_mask)
     zone_ids = torch.full((1, config.writer_sliding_window_size), 1, dtype=torch.long)
+    window_mask = torch.ones((1, config.writer_sliding_window_size), dtype=torch.bool)
     fresh_age = torch.zeros((1, config.writer_sliding_window_size), dtype=torch.long)
     stale_age = torch.full((1, config.writer_sliding_window_size), config.writer_max_position_age, dtype=torch.long)
 
-    fresh = model.writer_transition_outputs(
+    fresh_word, fresh_condition = model.writer._writer_condition(
         semantic,
-        surface_state=surface_state,
-        zone_ids=zone_ids,
-        position_age=fresh_age,
+        state_quality,
+        zone_ids,
+        fresh_age,
+        window_mask,
+        None,
+        None,
     )
-    stale = model.writer_transition_outputs(
+    stale_word, stale_condition = model.writer._writer_condition(
         semantic,
-        surface_state=surface_state,
-        zone_ids=zone_ids,
-        position_age=stale_age,
+        state_quality,
+        zone_ids,
+        stale_age,
+        window_mask,
+        None,
+        None,
     )
 
-    assert not torch.allclose(fresh.token_logits, stale.token_logits)
+    assert torch.allclose(fresh_word, stale_word)
+    assert not torch.allclose(fresh_condition, stale_condition)
 
 
-def test_dil_zone_condition_changes_writer_transition_output():
+def test_dil_zone_condition_changes_writer_condition_without_word_input_shortcut():
     config = tiny_config()
     model = Dil(config).eval()
     semantic = torch.randn(1, config.writer_sliding_window_size, config.latent_size)
@@ -695,13 +705,34 @@ def test_dil_zone_condition_changes_writer_transition_output():
         -100,
         dtype=torch.long,
     )
+    frozen_mask = torch.zeros_like(surface_state, dtype=torch.bool)
+    _, _, _, state_quality = model.writer._state_embeddings(surface_state, None, frozen_mask)
+    position_age = torch.zeros((1, config.writer_sliding_window_size), dtype=torch.long)
+    window_mask = torch.ones((1, config.writer_sliding_window_size), dtype=torch.bool)
     active_zone = torch.full((1, config.writer_sliding_window_size), model.writer.ZONE_ACTIVE, dtype=torch.long)
     right_zone = torch.full((1, config.writer_sliding_window_size), model.writer.ZONE_RIGHT, dtype=torch.long)
 
-    active = model.writer_transition_outputs(semantic, surface_state=surface_state, zone_ids=active_zone)
-    right = model.writer_transition_outputs(semantic, surface_state=surface_state, zone_ids=right_zone)
+    active_word, active_condition = model.writer._writer_condition(
+        semantic,
+        state_quality,
+        active_zone,
+        position_age,
+        window_mask,
+        None,
+        None,
+    )
+    right_word, right_condition = model.writer._writer_condition(
+        semantic,
+        state_quality,
+        right_zone,
+        position_age,
+        window_mask,
+        None,
+        None,
+    )
 
-    assert not torch.allclose(active.token_logits, right.token_logits)
+    assert torch.allclose(active_word, right_word)
+    assert not torch.allclose(active_condition, right_condition)
 
 
 def test_dil_byte_state_cross_attention_handles_empty_state_without_nan():
@@ -775,6 +806,50 @@ def test_dil_future_attention_accepts_short_horizon_inputs():
         config.writer_vocab_size,
     )
     assert torch.isfinite(output.token_logits).all()
+
+
+def test_dil_future_attention_query_uses_writer_condition_core(monkeypatch):
+    config = tiny_config()
+    model = Dil(config).eval()
+    semantic = torch.randn(1, config.writer_sliding_window_size, config.latent_size)
+    surface_state = torch.full(
+        (1, config.writer_sliding_window_size, config.writer_max_positions),
+        -100,
+        dtype=torch.long,
+    )
+    frozen_mask = torch.zeros_like(surface_state, dtype=torch.bool)
+    _, _, _, state_quality = model.writer._state_embeddings(surface_state, None, frozen_mask)
+    position_age = torch.zeros((1, config.writer_sliding_window_size), dtype=torch.long)
+    window_mask = torch.ones((1, config.writer_sliding_window_size), dtype=torch.bool)
+    future_latents = torch.randn(1, config.writer_sliding_window_size, 2, config.latent_size)
+    queries = []
+
+    def capture_future_query(future_latents, query_hidden, window_mask, latent_size):
+        queries.append(query_hidden.detach().clone())
+        return torch.zeros_like(query_hidden)
+
+    monkeypatch.setattr(model.writer, "_future_attention_summary", capture_future_query)
+    model.writer._writer_condition(
+        semantic,
+        state_quality,
+        torch.full((1, config.writer_sliding_window_size), model.writer.ZONE_ACTIVE, dtype=torch.long),
+        position_age,
+        window_mask,
+        future_latents,
+        None,
+    )
+    model.writer._writer_condition(
+        semantic,
+        state_quality,
+        torch.full((1, config.writer_sliding_window_size), model.writer.ZONE_RIGHT, dtype=torch.long),
+        position_age,
+        window_mask,
+        future_latents,
+        None,
+    )
+
+    assert len(queries) == 2
+    assert not torch.allclose(queries[0], queries[1])
 
 
 def test_dil_forward_keeps_target_latent_shape():

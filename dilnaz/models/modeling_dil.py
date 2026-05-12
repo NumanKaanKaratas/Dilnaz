@@ -636,20 +636,20 @@ class DilConditionalWriter(nn.Module):
     def _future_attention_summary(
         self,
         future_latents: Optional[torch.Tensor],
-        semantic_hidden: torch.Tensor,
+        query_hidden: torch.Tensor,
         window_mask: torch.Tensor,
         latent_size: int,
     ) -> torch.Tensor:
-        batch_size, window_size, hidden_size = semantic_hidden.shape
+        batch_size, window_size, hidden_size = query_hidden.shape
         if future_latents is None:
-            return semantic_hidden.new_zeros((batch_size, window_size, hidden_size))
+            return query_hidden.new_zeros((batch_size, window_size, hidden_size))
         if future_latents.dim() == 3:
             future_latents = future_latents.unsqueeze(2)
         if future_latents.shape[:2] != (batch_size, window_size) or future_latents.shape[-1] != latent_size:
             raise ValueError("future_latents must be shaped [batch, window, horizons, latent]")
         horizons = future_latents.shape[2]
         if horizons == 0:
-            return semantic_hidden.new_zeros((batch_size, window_size, hidden_size))
+            return query_hidden.new_zeros((batch_size, window_size, hidden_size))
         if horizons > self.future_horizon_embeddings.num_embeddings:
             raise ValueError("future_latents horizon count exceeds writer_max_window_size")
         horizon_ids = torch.arange(horizons, device=future_latents.device)
@@ -665,7 +665,7 @@ class DilConditionalWriter(nn.Module):
         empty_rows = ~has_future
         if empty_rows.any():
             safe_valid[empty_rows, 0] = True
-        query = self.future_query_proj(self.future_query_norm(semantic_hidden)).unsqueeze(2)
+        query = self.future_query_proj(self.future_query_norm(query_hidden)).unsqueeze(2)
         keys = self.future_key_proj(self.future_key_norm(future_hidden))
         values = self.future_value_proj(future_hidden)
         scores = (query * keys).sum(dim=-1) / math.sqrt(hidden_size)
@@ -673,7 +673,7 @@ class DilConditionalWriter(nn.Module):
         attention = torch.softmax(scores.float(), dim=-1).to(scores.dtype).masked_fill(~safe_valid, 0.0)
         summary = (attention.unsqueeze(-1) * values).sum(dim=2)
         summary = self.future_out_proj(summary) * has_future.unsqueeze(-1).to(summary.dtype)
-        gate = torch.sigmoid(self.future_gate(torch.cat((semantic_hidden, summary), dim=-1)))
+        gate = torch.sigmoid(self.future_gate(torch.cat((query_hidden, summary), dim=-1)))
         return gate * summary
 
     def _writer_condition(
@@ -692,22 +692,26 @@ class DilConditionalWriter(nn.Module):
             window_size,
             -1,
         )
-        condition = (
+        condition_core = (
             semantic_hidden
             + self.zone_embeddings(zone_ids)
             + self.position_age_embeddings(position_age)
             + self.state_quality_proj(state_quality)
         )
-        condition = condition + self._future_attention_summary(future_latents, semantic_hidden, window_mask, latent_size)
         if refinement_step is not None and self.use_step_embedding:
-            condition = condition + self._refinement_step_embedding(refinement_step, semantic_hidden.device, semantic_hidden.dtype).view(
+            condition_core = condition_core + self._refinement_step_embedding(
+                refinement_step,
+                semantic_hidden.device,
+                semantic_hidden.dtype,
+            ).view(
                 1,
                 1,
                 -1,
             )
+        condition = condition_core + self._future_attention_summary(future_latents, condition_core, window_mask, latent_size)
         condition = self.condition_proj(self.condition_norm(condition))
         word_positions = torch.arange(window_size, device=semantic_window.device)
-        word_hidden = semantic_hidden + condition + self.word_position_embeddings(word_positions).unsqueeze(0)
+        word_hidden = semantic_hidden + self.word_position_embeddings(word_positions).unsqueeze(0)
         return word_hidden, condition
 
     def transition(
