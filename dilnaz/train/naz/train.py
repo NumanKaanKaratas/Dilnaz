@@ -11,10 +11,7 @@ import numpy as np
 import torch
 from torch.optim import AdamW
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from byte_trainer_utils import (  # noqa: E402
+from dilnaz.train.common.runtime import (
     COMPILE_MODE_CHOICES,
     DeviceBatchPrefetcher,
     autocast_context,
@@ -25,11 +22,11 @@ from byte_trainer_utils import (  # noqa: E402
     rng_state,
     validate_compile_environment,
 )
-from dilnaz_config import NAZ_FINETUNE_DEFAULTS, NAZ_MODEL_DEFAULTS, NAZ_TRAIN_DEFAULTS  # noqa: E402
-from models.dil import DilConfig  # noqa: E402
-from models.naz import NazConfig  # noqa: E402
-from models.naz import Naz  # noqa: E402
-from naz_data import (  # noqa: E402
+from dilnaz.train.configs.defaults import NAZ_FINETUNE_DEFAULTS, NAZ_MODEL_DEFAULTS, NAZ_TRAIN_DEFAULTS
+from dilnaz.models.dil import DilConfig
+from dilnaz.models.naz import NazConfig
+from dilnaz.models.naz import Naz
+from dilnaz.train.data.naz_data import (
     MemmapNazSemanticBatcher,
     MemmapNazSemanticEvalLoader,
     ResidentNazBatcher,
@@ -39,8 +36,8 @@ from naz_data import (  # noqa: E402
     build_token_cache,
     make_naz_loader,
 )
-from tokenization import HybridTokenizer  # noqa: E402
-from trainer_core import BaseTrainer, StepResult, make_scheduler  # noqa: E402
+from dilnaz.tokenization import HybridTokenizer
+from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
 CHECKPOINT_FORMAT_VERSION = 26

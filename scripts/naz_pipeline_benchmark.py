@@ -2,20 +2,15 @@ from __future__ import annotations
 
 import argparse
 import shutil
-import sys
 import tempfile
 import time
-from pathlib import Path
 
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "dilnaz"))
-
-from models.dil import DilConfig
-from models.naz import NazConfig
-from models.dil import Dil
-from models.naz import Naz
+from dilnaz.models.dil import DilConfig
+from dilnaz.models.naz import NazConfig
+from dilnaz.models.dil import Dil
+from dilnaz.models.naz import Naz
 
 
 def synchronize(device: torch.device) -> None:

@@ -75,7 +75,7 @@ Normal DIL eğitiminde writer detached semantic latent ile beslenir. Bu sayede y
 
 ## DIL Writer-Only Eğitimi
 
-`train_dil_writer.py` mevcut DIL checkpointini yükler, encoder'ı freeze eder ve yalnızca writer'ı plain text üzerinde eğitir. Amaç surface rendering kalitesini artırırken semantic trunk'ı değiştirmemektir.
+`python -m dilnaz.train.writer.train` mevcut DIL checkpointini yükler, encoder'ı freeze eder ve yalnızca writer'ı plain text üzerinde eğitir. Amaç surface rendering kalitesini artırırken semantic trunk'ı değiştirmemektir.
 
 Objective:
 
@@ -182,32 +182,20 @@ JSONL:
 {"text": "Baska bir cumle."}
 ```
 
-NAZ supervised fine-tuning için `train_naz_finetune.py` prompt/answer satırlarını da destekler.
-
-TSV prompt/answer formatı:
-
-```text
-15 + 4241 =	4256
-```
-
-JSONL prompt/answer formatı:
-
-```json
-{"prompt": "15 + 4241 =", "answer": "4256"}
-```
+NAZ fine-tuning tek girişten çalışır: `python -m dilnaz.train.naz.train --stage finetune`.
 
 `scripts/generate_math_sequence_data.py` math continuation ve prompt/answer datasetleri üretebilir.
 
 ## Eğitim
 
-Dependency'leri project metadata'dan veya training requirements dosyasından kurduktan sonra repo root'tan ya da `dilnaz/train` altından çalıştırılabilir. Aşağıdaki örnekler PowerShell içindir.
+Dependency'leri project metadata'dan veya training requirements dosyasından kurduktan sonra repo root'tan çalıştır. Aşağıdaki örnekler PowerShell içindir.
 
 ### 1. DIL Eğitimi
 
 ```powershell
 cd D:\Projects\Dilnaz
 
-python .\dilnaz\train\train_dil.py `
+python -m dilnaz.train.dil.train `
   --train-file .\TrainDatas\Test1.jsonl `
   --eval-file .\TrainDatas\TestCümleler.jsonl `
   --output-dir .\checkpoints\Dil `
@@ -229,7 +217,7 @@ Makinede `torch.compile` için C compiler yoksa `--compile-mode off` kullan.
 ```powershell
 cd D:\Projects\Dilnaz
 
-python .\dilnaz\train\train_dil_writer.py `
+python -m dilnaz.train.writer.train `
   --train-file .\TrainDatas\Test1.jsonl `
   --eval-file .\TrainDatas\TestCümleler.jsonl `
   --checkpoint .\checkpoints\Dil\checkpoint.pt `
@@ -250,7 +238,7 @@ python .\dilnaz\train\train_dil_writer.py `
 ```powershell
 cd D:\Projects\Dilnaz
 
-python .\dilnaz\train\train_naz.py `
+python -m dilnaz.train.naz.train `
   --train-file .\TrainDatas\Test1.jsonl `
   --eval-file .\TrainDatas\TestCümleler.jsonl `
   --dil-checkpoint-dir .\checkpoints\Dil `
@@ -284,30 +272,6 @@ cd D:\Projects\Dilnaz
 
 Pipeline sırayla DIL semantic training, DIL writer-only training ve NAZ training çalıştırır.
 
-## Supervised NAZ Fine-Tuning
-
-`train_naz_finetune.py`, prompt/answer satırlarında sadece answer targetlarına loss uygular.
-
-```powershell
-cd D:\Projects\Dilnaz
-
-python .\dilnaz\train\train_naz_finetune.py `
-  --train-file .\TrainDatas\Math_Add_1M_SFT.tsv `
-  --eval-file .\TrainDatas\Math_Add_Eval_100_SFT.tsv `
-  --dil-checkpoint-dir .\checkpoints\Dil `
-  --output-dir .\checkpoints\NazSft `
-  --max-steps 30000 `
-  --batch-size 8 `
-  --sequence-length 128 `
-  --eval-every 500 `
-  --eval-exact-every 500 `
-  --checkpoint-every 5000 `
-  --compile-mode reduce-overhead `
-  --bf16
-```
-
-Devam etmek için `--resume path\to\checkpoint.pt`, mevcut NAZ checkpointinden başlatmak için `--init-naz-checkpoint path\to\checkpoint.pt` kullanılır.
-
 ## Inference ve İnceleme
 
 ### DIL İnceleme
@@ -315,7 +279,7 @@ Devam etmek için `--resume path\to\checkpoint.pt`, mevcut NAZ checkpointinden b
 ```powershell
 cd D:\Projects\Dilnaz
 
-python .\dilnaz\train\interface_dil.py `
+python -m dilnaz.train.interface.interface_dil `
   --checkpoint-dir .\checkpoints\Dil `
   --text "Dişi aslanın dişi kırıldı."
 ```
@@ -327,7 +291,7 @@ Bu araç tokenizer parçalarını, DIL semantic similarity çıktısını, NLLB 
 ```powershell
 cd D:\Projects\Dilnaz
 
-python .\dilnaz\train\interface_naz.py `
+python -m dilnaz.train.interface.interface_naz `
   --checkpoint-dir .\checkpoints\Naz `
   --text "15 + 4241 =" `
   --max-new-tokens 8 `
@@ -335,7 +299,7 @@ python .\dilnaz\train\interface_naz.py `
   --compile-mode off
 ```
 
-`interface_naz.py`, pending semantic latentleri DIL writer'dan batch halinde geçirerek generated surface text'i stream eder. Writer boş/stop output verdiğinde veya `min_new_tokens` sonrası semantic repetition threshold aşılırsa durur.
+NAZ interface'i pending semantic latentleri DIL writer'dan batch halinde geçirerek generated surface text'i stream eder. Writer boş/stop output verdiğinde veya `min_new_tokens` sonrası semantic repetition threshold aşılırsa durur.
 
 ## Checkpoint Kontratları
 
@@ -387,17 +351,27 @@ dilnaz/
     hybrid_tokenizer.py
     hybrid_surface_vocab.json
   train/
-    train_dil.py
-    train_dil_writer.py
-    train_parallel_dil.py
-    train_naz.py
-    train_naz_finetune.py
-    interface_dil.py
-    interface_naz.py
-    dil_data.py
-    naz_data.py
-    parallel_dil_data.py
-    byte_trainer_utils.py
+    common/
+      runtime.py
+      trainer_core.py
+    configs/
+      defaults.py
+    data/
+      dil_data.py
+      naz_data.py
+      parallel_dil_data.py
+    dil/
+      train.py
+      train_parallel.py
+      train_teacherless_parallel.py
+    writer/
+      train.py
+    naz/
+      train.py
+    interface/
+      interface_dil.py
+      interface_naz.py
+      writer_buffer.py
 scripts/
   train_jsonl_pipeline.ps1
   generate_math_sequence_data.py

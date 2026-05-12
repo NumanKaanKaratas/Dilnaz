@@ -3,7 +3,6 @@ import json
 import queue
 import random
 import shutil
-import sys
 import threading
 import time
 from pathlib import Path
@@ -12,10 +11,7 @@ import numpy as np
 import torch
 from torch.optim import AdamW
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from byte_trainer_utils import (
+from dilnaz.train.common.runtime import (
     COMPILE_MODE_CHOICES,
     DeviceBatchPrefetcher,
     compile_forward,
@@ -26,7 +22,7 @@ from byte_trainer_utils import (
     rng_state,
     validate_compile_environment,
 )
-from dil_data import (
+from dilnaz.train.data.dil_data import (
     HybridDilBatchDataset,
     NllbTeacher,
     ReadyParquetDilBatchDataset,
@@ -37,11 +33,11 @@ from dil_data import (
     load_hybrid_tokenizer,
     make_dil_batch_loader,
 )
-from dilnaz_config import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
-from models.dil import DilConfig
-from models.dil import Dil
-from tokenization import default_vocab_path
-from trainer_core import BaseTrainer, StepResult, make_scheduler
+from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
+from dilnaz.models.dil import DilConfig
+from dilnaz.models.dil import Dil
+from dilnaz.tokenization import default_vocab_path
+from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
 CHECKPOINT_FORMAT_VERSION = 24

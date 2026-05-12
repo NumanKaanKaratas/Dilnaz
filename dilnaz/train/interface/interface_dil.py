@@ -1,20 +1,16 @@
 import argparse
 from itertools import combinations
-import sys
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from byte_trainer_utils import COMPILE_MODE_CHOICES, compile_forward, validate_compile_environment
-from dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add, context_offsets
-from models.dil import DilConfig
-from models.dil import Dil
-from tokenization import HybridTokenizer, TokenSegment
+from dilnaz.train.common.runtime import COMPILE_MODE_CHOICES, compile_forward, validate_compile_environment
+from dilnaz.train.data.dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add, context_offsets
+from dilnaz.models.dil import DilConfig
+from dilnaz.models.dil import Dil
+from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
 CHECKPOINT_FORMAT_VERSION = 24

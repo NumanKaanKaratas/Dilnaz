@@ -8,8 +8,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from models.dil import DilConfig
-from tokenization import HybridTokenizer
+from dilnaz.models.dil import DilConfig
+from dilnaz.tokenization import HybridTokenizer
 
 
 WHITESPACE_PATTERN = re.compile(r"\s+", re.UNICODE)

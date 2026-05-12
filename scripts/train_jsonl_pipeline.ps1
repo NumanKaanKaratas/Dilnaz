@@ -35,7 +35,7 @@ function Invoke-CheckedPython {
     }
 }
 
-Invoke-CheckedPython .\dilnaz\train\train_dil.py `
+Invoke-CheckedPython -m dilnaz.train.dil.train `
     --train-file $TrainFile `
     --eval-file $EvalFile `
     --output-dir $DilOutputDir `
@@ -50,7 +50,7 @@ Invoke-CheckedPython .\dilnaz\train\train_dil.py `
     --compile-mode $CompileMode `
     @bf16Args
 
-Invoke-CheckedPython .\dilnaz\train\train_dil_writer.py `
+Invoke-CheckedPython -m dilnaz.train.writer.train `
     --train-file $TrainFile `
     --eval-file $EvalFile `
     --checkpoint "$DilOutputDir\checkpoint.pt" `
@@ -65,7 +65,7 @@ Invoke-CheckedPython .\dilnaz\train\train_dil_writer.py `
     --compile-mode $CompileMode `
     @bf16Args
 
-Invoke-CheckedPython .\dilnaz\train\train_naz.py `
+Invoke-CheckedPython -m dilnaz.train.naz.train `
     --train-file $TrainFile `
     --eval-file $EvalFile `
     --dil-checkpoint-dir $WriterOutputDir `

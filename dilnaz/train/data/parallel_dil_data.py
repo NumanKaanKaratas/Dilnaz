@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, get_worker_info
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from dil_data import (
+from dilnaz.train.data.dil_data import (
     NLLB_DEFAULT_MAX_ENCODER_TOKENS,
     NLLB_LAYER_GROUPS,
     align_spans_to_pieces,
@@ -22,8 +22,8 @@ from dil_data import (
     teacher_distill_segment,
     trainable_segments,
 )
-from models.dil import DilConfig
-from tokenization import HybridTokenizer, TokenSegment
+from dilnaz.models.dil import DilConfig
+from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
 ALIGN_THRESHOLD = 1e-4

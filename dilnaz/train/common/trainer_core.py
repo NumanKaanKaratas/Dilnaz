@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
-from byte_trainer_utils import autocast_context, cuda_sync, cudagraph_step_begin
+from dilnaz.train.common.runtime import autocast_context, cuda_sync, cudagraph_step_begin
 
 
 @dataclass

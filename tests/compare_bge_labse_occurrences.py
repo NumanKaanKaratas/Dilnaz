@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,11 +8,7 @@ import torch.nn.functional as F
 from FlagEmbedding import BGEM3FlagModel
 from transformers import AutoModel, AutoTokenizer
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "dilnaz"))
-
-from train.dil_data import align_spans_to_pieces
+from dilnaz.train.data.dil_data import align_spans_to_pieces
 
 
 @dataclass(frozen=True)

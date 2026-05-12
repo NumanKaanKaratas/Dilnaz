@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,10 +8,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz"))
-
-from tokenization import HybridTokenizer, default_vocab_path
-from train.dil_data import align_spans_to_pieces
+from dilnaz.tokenization import HybridTokenizer, default_vocab_path
+from dilnaz.train.data.dil_data import align_spans_to_pieces
 
 
 BASE_SENTENCE = (

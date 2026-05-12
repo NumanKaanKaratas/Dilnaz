@@ -2,7 +2,6 @@ import argparse
 import json
 import random
 import shutil
-import sys
 import time
 from pathlib import Path
 
@@ -11,10 +10,7 @@ import torch
 from torch.optim import AdamW
 from torch.utils.data import IterableDataset
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from byte_trainer_utils import (  # noqa: E402
+from dilnaz.train.common.runtime import (
     COMPILE_MODE_CHOICES,
     DeviceBatchPrefetcher,
     autocast_context,
@@ -27,7 +23,7 @@ from byte_trainer_utils import (  # noqa: E402
     rng_state,
     validate_compile_environment,
 )
-from dil_data import (  # noqa: E402
+from dilnaz.train.data.dil_data import (
     ResidentDilBatcher,
     ResidentDilEvalLoader,
     context_offsets,
@@ -37,12 +33,12 @@ from dil_data import (  # noqa: E402
     stream_teacher_text_items,
     trainable_segments,
 )
-from dilnaz_config import DIL_TRAIN_DEFAULTS  # noqa: E402
-from models.dil import DilConfig  # noqa: E402
-from models.naz import NazConfig  # noqa: E402
-from models.dil import Dil, angular_noise_like  # noqa: E402
-from models.naz import Naz  # noqa: E402
-from trainer_core import make_adamw_param_groups, make_scheduler  # noqa: E402
+from dilnaz.train.configs.defaults import DIL_TRAIN_DEFAULTS
+from dilnaz.models.dil import DilConfig
+from dilnaz.models.naz import NazConfig
+from dilnaz.models.dil import Dil, angular_noise_like
+from dilnaz.models.naz import Naz
+from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
 CHECKPOINT_FORMAT_VERSION = 24

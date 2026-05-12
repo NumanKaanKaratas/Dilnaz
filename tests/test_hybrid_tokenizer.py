@@ -1,15 +1,12 @@
-import sys
 import json
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz"))
-
 from dilnaz.tokenization import HybridTokenizer, default_vocab_path
-from models.dil import DilConfig
+from dilnaz.models.dil import DilConfig
 
-from dilnaz.train.dil_data import (
+from dilnaz.train.data.dil_data import (
     BatchSampleRef,
     HybridDilBatchDataset,
     ResidentDilBatcher,
@@ -19,7 +16,7 @@ from dilnaz.train.dil_data import (
     split_text_for_nllb,
     trainable_segments,
 )
-from dilnaz.train.naz_data import stream_token_pieces
+from dilnaz.train.data.naz_data import stream_token_pieces
 
 
 def load_tokenizer():
@@ -263,7 +260,7 @@ def test_naz_token_stream_preserves_extra_spaces(tmp_path):
 
 def test_interfaces_do_not_keep_manual_join_logic():
     root = Path(__file__).resolve().parents[1]
-    for relative_path in ["dilnaz/train/interface_dil.py", "dilnaz/train/interface_naz.py"]:
+    for relative_path in ["dilnaz/train/interface/interface_dil.py", "dilnaz/train/interface/interface_naz.py"]:
         source = (root / relative_path).read_text(encoding="utf-8")
         assert "def join_tokens" not in source
         assert "format_next_token" not in source

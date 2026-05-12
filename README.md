@@ -75,7 +75,7 @@ The writer path is deliberately fed with detached semantic latents during normal
 
 ## DIL Writer-Only Training
 
-`train_dil_writer.py` loads an existing DIL checkpoint, freezes the encoder, and trains only the writer on plain text. This is used when surface rendering needs improvement without changing the semantic trunk.
+`python -m dilnaz.train.writer.train` loads an existing DIL checkpoint, freezes the encoder, and trains only the writer on plain text. This is used when surface rendering needs improvement without changing the semantic trunk.
 
 The objective is:
 
@@ -182,32 +182,20 @@ JSONL:
 {"text": "Baska bir cumle."}
 ```
 
-NAZ supervised fine-tuning also supports prompt/answer rows through `train_naz_finetune.py`.
-
-TSV prompt/answer format:
-
-```text
-15 + 4241 =	4256
-```
-
-JSONL prompt/answer format:
-
-```json
-{"prompt": "15 + 4241 =", "answer": "4256"}
-```
+NAZ fine-tuning is handled by the unified `python -m dilnaz.train.naz.train --stage finetune` entrypoint.
 
 `scripts/generate_math_sequence_data.py` can create math continuation and prompt/answer datasets.
 
 ## Training
 
-Install dependencies from the project metadata or the training requirements, then run from the repository root or from `dilnaz/train`. The examples below use PowerShell.
+Install dependencies from the project metadata or the training requirements, then run from the repository root. The examples below use PowerShell.
 
 ### 1. Train DIL
 
 ```powershell
 cd D:\Projects\Dilnaz
 
-python .\dilnaz\train\train_dil.py `
+python -m dilnaz.train.dil.train `
   --train-file .\TrainDatas\Test1.jsonl `
   --eval-file .\TrainDatas\TestCümleler.jsonl `
   --output-dir .\checkpoints\Dil `
@@ -229,7 +217,7 @@ Set `--compile-mode off` when the machine does not have a C compiler available f
 ```powershell
 cd D:\Projects\Dilnaz
 
-python .\dilnaz\train\train_dil_writer.py `
+python -m dilnaz.train.writer.train `
   --train-file .\TrainDatas\Test1.jsonl `
   --eval-file .\TrainDatas\TestCümleler.jsonl `
   --checkpoint .\checkpoints\Dil\checkpoint.pt `
@@ -250,7 +238,7 @@ python .\dilnaz\train\train_dil_writer.py `
 ```powershell
 cd D:\Projects\Dilnaz
 
-python .\dilnaz\train\train_naz.py `
+python -m dilnaz.train.naz.train `
   --train-file .\TrainDatas\Test1.jsonl `
   --eval-file .\TrainDatas\TestCümleler.jsonl `
   --dil-checkpoint-dir .\checkpoints\Dil `
@@ -284,30 +272,6 @@ cd D:\Projects\Dilnaz
 
 The pipeline runs DIL semantic training, DIL writer-only training, and NAZ training in order.
 
-## Supervised NAZ Fine-Tuning
-
-`train_naz_finetune.py` trains NAZ on prompt/answer rows while applying loss only to answer targets.
-
-```powershell
-cd D:\Projects\Dilnaz
-
-python .\dilnaz\train\train_naz_finetune.py `
-  --train-file .\TrainDatas\Math_Add_1M_SFT.tsv `
-  --eval-file .\TrainDatas\Math_Add_Eval_100_SFT.tsv `
-  --dil-checkpoint-dir .\checkpoints\Dil `
-  --output-dir .\checkpoints\NazSft `
-  --max-steps 30000 `
-  --batch-size 8 `
-  --sequence-length 128 `
-  --eval-every 500 `
-  --eval-exact-every 500 `
-  --checkpoint-every 5000 `
-  --compile-mode reduce-overhead `
-  --bf16
-```
-
-Resume with `--resume path\to\checkpoint.pt`, or initialize from an existing NAZ checkpoint with `--init-naz-checkpoint path\to\checkpoint.pt`.
-
 ## Inference And Inspection
 
 ### Inspect DIL
@@ -315,7 +279,7 @@ Resume with `--resume path\to\checkpoint.pt`, or initialize from an existing NAZ
 ```powershell
 cd D:\Projects\Dilnaz
 
-python .\dilnaz\train\interface_dil.py `
+python -m dilnaz.train.interface.interface_dil `
   --checkpoint-dir .\checkpoints\Dil `
   --text "Disi aslanin disi kirildi."
 ```
@@ -327,7 +291,7 @@ This prints tokenizer pieces, DIL semantic similarity, NLLB teacher similarity, 
 ```powershell
 cd D:\Projects\Dilnaz
 
-python .\dilnaz\train\interface_naz.py `
+python -m dilnaz.train.interface.interface_naz `
   --checkpoint-dir .\checkpoints\Naz `
   --text "15 + 4241 =" `
   --max-new-tokens 8 `
@@ -335,7 +299,7 @@ python .\dilnaz\train\interface_naz.py `
   --compile-mode off
 ```
 
-`interface_naz.py` streams generated surface text by batching pending semantic latents through the DIL writer. It stops when the writer returns an empty/stop output or when semantic repetition crosses the configured threshold after `min_new_tokens`.
+The NAZ interface streams generated surface text by batching pending semantic latents through the DIL writer. It stops when the writer returns an empty/stop output or when semantic repetition crosses the configured threshold after `min_new_tokens`.
 
 ## Checkpoint Contracts
 
@@ -387,17 +351,27 @@ dilnaz/
     hybrid_tokenizer.py
     hybrid_surface_vocab.json
   train/
-    train_dil.py
-    train_dil_writer.py
-    train_parallel_dil.py
-    train_naz.py
-    train_naz_finetune.py
-    interface_dil.py
-    interface_naz.py
-    dil_data.py
-    naz_data.py
-    parallel_dil_data.py
-    byte_trainer_utils.py
+    common/
+      runtime.py
+      trainer_core.py
+    configs/
+      defaults.py
+    data/
+      dil_data.py
+      naz_data.py
+      parallel_dil_data.py
+    dil/
+      train.py
+      train_parallel.py
+      train_teacherless_parallel.py
+    writer/
+      train.py
+    naz/
+      train.py
+    interface/
+      interface_dil.py
+      interface_naz.py
+      writer_buffer.py
 scripts/
   train_jsonl_pipeline.ps1
   generate_math_sequence_data.py

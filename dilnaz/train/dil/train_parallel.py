@@ -1,7 +1,6 @@
 import argparse
 import random
 import queue
-import sys
 import threading
 import time
 from pathlib import Path
@@ -10,10 +9,7 @@ import numpy as np
 import torch
 from torch.optim import AdamW
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from byte_trainer_utils import (  # noqa: E402
+from dilnaz.train.common.runtime import (
     COMPILE_MODE_CHOICES,
     DeviceBatchPrefetcher,
     autocast_context,
@@ -23,11 +19,11 @@ from byte_trainer_utils import (  # noqa: E402
     effective_compile_mode,
     validate_compile_environment,
 )
-from dil_data import load_hybrid_tokenizer, make_dil_batch_loader  # noqa: E402
-from dilnaz_config import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS  # noqa: E402
-from models.dil import DilConfig  # noqa: E402
-from models.dil import Dil  # noqa: E402
-from parallel_dil_data import (  # noqa: E402
+from dilnaz.train.data.dil_data import load_hybrid_tokenizer, make_dil_batch_loader
+from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
+from dilnaz.models.dil import DilConfig
+from dilnaz.models.dil import Dil
+from dilnaz.train.data.parallel_dil_data import (
     DEFAULT_PARALLEL_NLLB_MODEL,
     DEFAULT_SOURCE_LANG,
     DEFAULT_TARGET_LANG,
@@ -35,8 +31,8 @@ from parallel_dil_data import (  # noqa: E402
     ParallelNllbTeacher,
     parallel_total_loss,
 )
-from tokenization import default_vocab_path  # noqa: E402
-from train_dil import (  # noqa: E402
+from dilnaz.tokenization import default_vocab_path
+from dilnaz.train.dil.train import (
     is_dataloader_worker_exit,
     make_scheduler,
     model_inputs,

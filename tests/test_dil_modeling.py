@@ -1,4 +1,3 @@
-import sys
 import shutil
 from types import SimpleNamespace
 from pathlib import Path
@@ -6,13 +5,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz" / "train"))
-
-from dil_data import context_offsets
-from models.dil import DilConfig
-from models.naz import NazConfig
-from models.dil import (
+from dilnaz.train.data.dil_data import context_offsets
+from dilnaz.models.dil import DilConfig
+from dilnaz.models.naz import NazConfig
+from dilnaz.models.dil import (
     Dil,
     DilByteConvStem,
     DilConditionalWriter,
@@ -21,15 +17,15 @@ from models.dil import (
     angular_noise_like,
     normalize_semantic_latents,
 )
-from models.naz import Naz
-from models.naz.backbone import SemanticDeltaMixer, SemanticGlobalAttention, SparseMoEFeedForward, ZeroCenteredRMSNorm
-from naz_data import (
+from dilnaz.models.naz import Naz
+from dilnaz.models.naz.backbone import SemanticDeltaMixer, SemanticGlobalAttention, SparseMoEFeedForward, ZeroCenteredRMSNorm
+from dilnaz.train.data.naz_data import (
     MemmapNazSemanticBatcher,
     ResidentNazBatcher,
     ResidentNazSemanticBatcher,
     StreamingTextNazDataset,
 )
-from train_naz import (
+from dilnaz.train.naz.train import (
     NazFinetuneTrainer,
     NazPretrainTrainer,
     build_resident_semantic_cache,
@@ -37,7 +33,7 @@ from train_naz import (
     parse_args as parse_naz_args,
     validate_args as validate_naz_args,
 )
-from train_dil_writer import (
+from dilnaz.train.writer.train import (
     build_future_latents,
     calibrate_emit_logits,
     freeze_for_writer_only,
@@ -47,7 +43,9 @@ from train_dil_writer import (
     writer_only_forward,
     writer_only_metrics,
 )
-from interface_naz import SlidingWriterBuffer, stream_text as stream_naz_text
+from dilnaz.train.interface.interface_naz import stream_text as stream_naz_text
+from dilnaz.train.interface.writer_buffer import SlidingWriterBuffer
+from dilnaz.tokenization import HybridTokenizer
 
 
 def grad_abs_sum(parameter: torch.nn.Parameter) -> float:
@@ -57,7 +55,7 @@ def grad_abs_sum(parameter: torch.nn.Parameter) -> float:
 
 
 def fixture_tokenizer():
-    return __import__("tokenization").HybridTokenizer.from_file(
+    return HybridTokenizer.from_file(
         Path(__file__).resolve().parents[1] / "dilnaz" / "tokenization" / "hybrid_surface_vocab.json"
     )
 
@@ -1529,7 +1527,7 @@ def test_dil_naz_code_has_no_external_backbone_imports():
 
 def test_naz_interface_has_no_flush_schedule_cli():
     root = Path(__file__).resolve().parents[1]
-    text = (root / "dilnaz" / "train" / "interface_naz.py").read_text(encoding="utf-8")
+    text = (root / "dilnaz" / "train" / "interface" / "interface_naz.py").read_text(encoding="utf-8")
 
     assert "--decode-flush-schedule" not in text
     assert "--no-stream" not in text
@@ -1538,7 +1536,8 @@ def test_naz_interface_has_no_flush_schedule_cli():
     assert "NazLatentWriter" not in text
     assert "def stream_text" in text
     assert "model.generate_stream" in text
-    assert "decode_semantic" in text
+    assert "SlidingWriterBuffer" in text
+    assert "writer_buffer" in text
     assert "model.generate(" not in text
 
 
@@ -2037,7 +2036,7 @@ def test_memmap_naz_semantic_batcher_surfaces_next_latents(tmp_path):
 def test_streaming_text_naz_dataset_reads_plain_text_without_cache(tmp_path):
     data_file = tmp_path / "math.txt"
     data_file.write_text("2 + 2 = 4\n3 + 1 = 4\n", encoding="utf-8")
-    tokenizer = __import__("tokenization").HybridTokenizer.from_file(
+    tokenizer = HybridTokenizer.from_file(
         Path(__file__).resolve().parents[1] / "dilnaz" / "tokenization" / "hybrid_surface_vocab.json"
     )
     config = DilConfig(
@@ -2223,12 +2222,13 @@ def test_naz_trainer_detects_frozen_dil_checksum_change(tmp_path):
 
 
 def test_train_naz_unified_entrypoint_excludes_sft_path():
-    source = (Path(__file__).resolve().parents[1] / "dilnaz" / "train" / "train_naz.py").read_text(encoding="utf-8")
+    train_dir = Path(__file__).resolve().parents[1] / "dilnaz" / "train"
+    source = (train_dir / "naz" / "train.py").read_text(encoding="utf-8")
 
     assert "PromptAnswerNazDataset" not in source
     assert "masked_sft_forward" not in source
     assert "exact_answer_accuracy" not in source
-    assert not (Path(__file__).resolve().parents[1] / "dilnaz" / "train" / "train_naz_finetune.py").exists()
+    assert not (train_dir / "naz" / "train_finetune.py").exists()
 
 
 def test_naz_training_batch_latents_use_single_extended_dil_pass(tmp_path):

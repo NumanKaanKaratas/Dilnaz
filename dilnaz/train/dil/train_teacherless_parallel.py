@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -14,23 +13,20 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import IterableDataset, get_worker_info
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from byte_trainer_utils import (  # noqa: E402
+from dilnaz.train.common.runtime import (
     COMPILE_MODE_CHOICES,
     DeviceBatchPrefetcher,
     compile_forward,
     effective_compile_mode,
     validate_compile_environment,
 )
-from dil_data import context_offsets, load_hybrid_tokenizer, make_dil_batch_loader, segment_piece_ids, trainable_segments  # noqa: E402
-from dilnaz_config import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS  # noqa: E402
-from models.dil import DilConfig  # noqa: E402
-from models.dil import Dil  # noqa: E402
-from tokenization import HybridTokenizer, TokenSegment, default_vocab_path  # noqa: E402
-from train_dil import is_dataloader_worker_exit, restore_checkpoint, save_checkpoint  # noqa: E402
-from trainer_core import BaseTrainer, StepResult, make_scheduler  # noqa: E402
+from dilnaz.train.data.dil_data import context_offsets, load_hybrid_tokenizer, make_dil_batch_loader, segment_piece_ids, trainable_segments
+from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
+from dilnaz.models.dil import DilConfig
+from dilnaz.models.dil import Dil
+from dilnaz.tokenization import HybridTokenizer, TokenSegment, default_vocab_path
+from dilnaz.train.dil.train import is_dataloader_worker_exit, restore_checkpoint, save_checkpoint
+from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
 @dataclass(frozen=True)

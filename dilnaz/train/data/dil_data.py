@@ -12,8 +12,8 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from models.dil import DilConfig
-from tokenization import HybridTokenizer, TokenSegment, default_vocab_path
+from dilnaz.models.dil import DilConfig
+from dilnaz.tokenization import HybridTokenizer, TokenSegment, default_vocab_path
 
 
 SENTENCE_CHUNK_PATTERN = re.compile(r".+?(?:[.!?]+(?:\s+|$)|\n+|$)", re.UNICODE | re.DOTALL)

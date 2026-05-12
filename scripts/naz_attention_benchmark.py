@@ -2,18 +2,13 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import sys
 import time
 from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
 
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "dilnaz"))
-
-from models.naz import NazConfig
-from models.naz.backbone import NazSemanticBackbone
+from dilnaz.models.naz import NazConfig
+from dilnaz.models.naz.backbone import NazSemanticBackbone
 
 
 def synchronize(device: torch.device):

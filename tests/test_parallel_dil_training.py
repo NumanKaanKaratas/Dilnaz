@@ -1,4 +1,3 @@
-import sys
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,13 +6,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz" / "train"))
-
-from dil_data import DILNAZ_READY_FORMAT, NLLB_LAYER_GROUPS, file_sha256, load_hybrid_tokenizer
-from models.dil import DilConfig
-from models.dil import Dil
-from parallel_dil_data import (
+from dilnaz.train.data.dil_data import DILNAZ_READY_FORMAT, NLLB_LAYER_GROUPS, file_sha256, load_hybrid_tokenizer
+from dilnaz.models.dil import DilConfig
+from dilnaz.models.dil import Dil
+from dilnaz.train.data.parallel_dil_data import (
     ParallelAlignmentGroup,
     ParallelDilBatchDataset,
     alignment_groups_to_tensors,
@@ -22,14 +18,14 @@ from parallel_dil_data import (
     parallel_alignment_loss,
     parallel_total_loss,
 )
-from tokenization import default_vocab_path
-from train_dil import (
+from dilnaz.tokenization import default_vocab_path
+from dilnaz.train.dil.train import (
     DilPretrainTrainer,
     make_trainer as make_dil_trainer,
     model_inputs,
     parse_args as parse_dil_args,
 )
-from train_dil_teacherless_parallel import (
+from dilnaz.train.dil.train_teacherless_parallel import (
     TeacherlessParallelDilTrainer,
     TeacherlessParallelJsonlDataset,
     batch_token_set_targets,
