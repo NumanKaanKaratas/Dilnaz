@@ -174,8 +174,6 @@ class DilConditionalWriter(nn.Module):
         surface = surface.to(device)
         if surface.ids.shape[0] != batch_size or surface.unit_count != window_size:
             raise ValueError("writer packed surface must share semantic batch and window dimensions")
-        if int(surface.pos_in_unit.max().detach().cpu()) > self.max_surface_pieces_per_unit:
-            raise ValueError("writer packed surface position exceeds max_surface_pieces_per_unit")
         return surface
 
     def _validate_state(self, state: PackedSurfaceState, batch_size: int, window_size: int, device: torch.device) -> PackedSurfaceState:

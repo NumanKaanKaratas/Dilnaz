@@ -117,6 +117,21 @@ def test_writer_packed_logits_and_all_empty_state_no_nan():
     assert torch.isfinite(output.token_logits).all()
 
 
+def test_writer_surface_validation_keeps_cpu_scalar_sync_out_of_hot_path():
+    tree = ast.parse(Path("dilnaz/models/dil/writer/model.py").read_text(encoding="utf-8"))
+    validate_surface = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_validate_surface"
+    )
+    calls = [node.func for node in ast.walk(validate_surface) if isinstance(node, ast.Call)]
+    called_names = {func.id for func in calls if isinstance(func, ast.Name)}
+    called_attrs = {func.attr for func in calls if isinstance(func, ast.Attribute)}
+    assert "int" not in called_names
+    assert "item" not in called_attrs
+    assert "cpu" not in called_attrs
+
+
 def test_known_frozen_state_changes_writer_output():
     cfg = tiny_config()
     model = Dil(cfg)
