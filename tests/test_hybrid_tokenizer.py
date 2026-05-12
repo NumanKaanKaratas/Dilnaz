@@ -7,7 +7,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz"))
 
 from dilnaz.tokenization import HybridTokenizer, default_vocab_path
-from models.configuration_dil import DilConfig
+from models.dil import DilConfig
 
 from dilnaz.train.dil_data import (
     BatchSampleRef,

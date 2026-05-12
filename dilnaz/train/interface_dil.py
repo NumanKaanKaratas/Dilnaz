@@ -12,8 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from byte_trainer_utils import COMPILE_MODE_CHOICES, compile_forward, validate_compile_environment
 from dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add, context_offsets
-from models.configuration_dil import DilConfig
-from models.modeling_dil import Dil
+from models.dil import DilConfig
+from models.dil import Dil
 from tokenization import HybridTokenizer, TokenSegment
 
 

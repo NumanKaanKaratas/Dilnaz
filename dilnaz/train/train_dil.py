@@ -38,8 +38,8 @@ from dil_data import (
     make_dil_batch_loader,
 )
 from dilnaz_config import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
-from models.configuration_dil import DilConfig
-from models.modeling_dil import Dil
+from models.dil import DilConfig
+from models.dil import Dil
 from tokenization import default_vocab_path
 from trainer_core import BaseTrainer, StepResult, make_scheduler
 

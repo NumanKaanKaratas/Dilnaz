@@ -10,18 +10,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz" / "train"))
 
 from dil_data import context_offsets
-from models.configuration_dil import DilConfig
-from models.configuration_naz import NazConfig
-from models.modeling_dil import (
+from models.dil import DilConfig
+from models.naz import NazConfig
+from models.dil import (
     Dil,
     DilByteConvStem,
+    DilConditionalWriter,
     DilGatedMLP,
     DilRMSNorm,
     angular_noise_like,
     normalize_semantic_latents,
 )
-from models.modeling_naz import Naz
-from models.naz_backbone import SemanticDeltaMixer, SemanticGlobalAttention, SparseMoEFeedForward, ZeroCenteredRMSNorm
+from models.naz import Naz
+from models.naz.backbone import SemanticDeltaMixer, SemanticGlobalAttention, SparseMoEFeedForward, ZeroCenteredRMSNorm
 from naz_data import (
     MemmapNazSemanticBatcher,
     ResidentNazBatcher,
@@ -42,6 +43,7 @@ from train_dil_writer import (
     freeze_for_writer_only,
     resolve_future_mode,
     sample_diffusion_step,
+    synthetic_surface_state,
     writer_only_forward,
     writer_only_metrics,
 )
@@ -1090,6 +1092,38 @@ def test_sliding_writer_metrics_include_state_quality_ratios():
         assert 0.0 <= float(metrics[key]) <= 1.0
 
 
+def test_synthetic_writer_state_keeps_active_target_surface_hidden():
+    config = tiny_config()
+    config.writer_state_corruption_max_ratio = 0.0
+    batch_size = 1
+    window_size = config.writer_sliding_window_size
+    labels = torch.full((batch_size, window_size, config.writer_max_positions), -100, dtype=torch.long)
+    labels[:, :, 0] = 2
+    labels[:, :, 1] = config.writer_stop_token_id
+    zone_ids = torch.full((batch_size, window_size), DilConditionalWriter.ZONE_ACTIVE, dtype=torch.long)
+    zone_ids[:, : config.writer_left_frozen] = DilConditionalWriter.ZONE_LEFT
+    zone_ids[:, config.writer_left_frozen + config.writer_active_size :] = DilConditionalWriter.ZONE_RIGHT
+    window_mask = torch.ones((batch_size, window_size), dtype=torch.bool)
+
+    surface_state, surface_state_mask, frozen_mask = synthetic_surface_state(
+        config,
+        labels,
+        zone_ids,
+        window_mask,
+        mask_ratio=0.0,
+    )
+
+    valid = labels.ne(-100)
+    left = zone_ids.eq(DilConditionalWriter.ZONE_LEFT).unsqueeze(-1) & valid
+    target_scope = ~zone_ids.eq(DilConditionalWriter.ZONE_LEFT).unsqueeze(-1) & valid
+    assert torch.equal(surface_state[left], labels[left])
+    assert surface_state_mask[left].eq(DilConditionalWriter.STATE_KNOWN).all()
+    assert frozen_mask[left].all()
+    assert surface_state[target_scope].eq(-100).all()
+    assert surface_state_mask[target_scope].eq(DilConditionalWriter.STATE_EMPTY).all()
+    assert not frozen_mask[target_scope].any()
+
+
 def test_writer_eval_diffusion_step_uses_low_noise_endpoint():
     config = tiny_config()
     config.writer_diffusion_steps = 4
@@ -1388,7 +1422,7 @@ def test_sparse_moe_selected_expert_dispatch_matches_dense_reference():
 
 def test_naz_global_attention_uses_sdpa_without_expanding_gqa_cache():
     root = Path(__file__).resolve().parents[1]
-    source = (root / "dilnaz" / "models" / "naz_backbone" / "attention.py").read_text(encoding="utf-8")
+    source = (root / "dilnaz" / "models" / "naz" / "backbone" / "attention.py").read_text(encoding="utf-8")
 
     assert "scaled_dot_product_attention" in source
     assert "enable_gqa=self.num_key_value_groups > 1" in source
@@ -1398,7 +1432,7 @@ def test_naz_global_attention_uses_sdpa_without_expanding_gqa_cache():
 
 def test_naz_delta_mixer_uses_fla_gated_delta_kernels():
     root = Path(__file__).resolve().parents[1]
-    source = (root / "dilnaz" / "models" / "naz_backbone" / "delta.py").read_text(encoding="utf-8")
+    source = (root / "dilnaz" / "models" / "naz" / "backbone" / "delta.py").read_text(encoding="utf-8")
 
     assert "ShortConvolution" in source
     assert "chunk_gated_delta_rule" in source
@@ -1481,11 +1515,11 @@ def test_naz_hybrid_backbone_cache_matches_full_forward(tmp_path):
 def test_dil_naz_code_has_no_external_backbone_imports():
     root = Path(__file__).resolve().parents[1]
     paths = [
-        root / "dilnaz" / "models" / "modeling_dil.py",
-        root / "dilnaz" / "models" / "configuration_dil.py",
-        root / "dilnaz" / "models" / "modeling_naz.py",
-        root / "dilnaz" / "models" / "configuration_naz.py",
-        *(root / "dilnaz" / "models" / "naz_backbone").glob("*.py"),
+        root / "dilnaz" / "models" / "dil" / "model.py",
+        root / "dilnaz" / "models" / "dil" / "configuration.py",
+        root / "dilnaz" / "models" / "naz" / "model.py",
+        root / "dilnaz" / "models" / "naz" / "configuration.py",
+        *(root / "dilnaz" / "models" / "naz" / "backbone").glob("*.py"),
     ]
     text = "\n".join(path.read_text(encoding="utf-8") for path in paths)
 

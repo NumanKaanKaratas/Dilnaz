@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from models.configuration_dil import DilConfig
+from models.dil import DilConfig
 from tokenization import HybridTokenizer
 
 

@@ -11,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dilnaz" / "train"))
 
 from dil_data import DILNAZ_READY_FORMAT, NLLB_LAYER_GROUPS, file_sha256, load_hybrid_tokenizer
-from models.configuration_dil import DilConfig
-from models.modeling_dil import Dil
+from models.dil import DilConfig
+from models.dil import Dil
 from parallel_dil_data import (
     ParallelAlignmentGroup,
     ParallelDilBatchDataset,

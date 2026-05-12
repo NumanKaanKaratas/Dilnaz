@@ -25,8 +25,8 @@ from byte_trainer_utils import (  # noqa: E402
 )
 from dil_data import load_hybrid_tokenizer, make_dil_batch_loader  # noqa: E402
 from dilnaz_config import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS  # noqa: E402
-from models.configuration_dil import DilConfig  # noqa: E402
-from models.modeling_dil import Dil  # noqa: E402
+from models.dil import DilConfig  # noqa: E402
+from models.dil import Dil  # noqa: E402
 from parallel_dil_data import (  # noqa: E402
     DEFAULT_PARALLEL_NLLB_MODEL,
     DEFAULT_SOURCE_LANG,

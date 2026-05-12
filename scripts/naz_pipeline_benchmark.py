@@ -12,10 +12,10 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "dilnaz"))
 
-from models.configuration_dil import DilConfig
-from models.configuration_naz import NazConfig
-from models.modeling_dil import Dil
-from models.modeling_naz import Naz
+from models.dil import DilConfig
+from models.naz import NazConfig
+from models.dil import Dil
+from models.naz import Naz
 
 
 def synchronize(device: torch.device) -> None:

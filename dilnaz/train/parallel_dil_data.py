@@ -22,7 +22,7 @@ from dil_data import (
     teacher_distill_segment,
     trainable_segments,
 )
-from models.configuration_dil import DilConfig
+from models.dil import DilConfig
 from tokenization import HybridTokenizer, TokenSegment
 
 

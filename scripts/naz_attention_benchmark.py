@@ -12,8 +12,8 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "dilnaz"))
 
-from models.configuration_naz import NazConfig
-from models.naz_backbone import NazSemanticBackbone
+from models.naz import NazConfig
+from models.naz.backbone import NazSemanticBackbone
 
 
 def synchronize(device: torch.device):

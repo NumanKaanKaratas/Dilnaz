@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from models.configuration_dil import DilConfig
+from models.dil import DilConfig
 from tokenization import HybridTokenizer, TokenSegment, default_vocab_path
 
 

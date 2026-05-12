@@ -26,8 +26,8 @@ from byte_trainer_utils import (  # noqa: E402
 )
 from dil_data import context_offsets, load_hybrid_tokenizer, make_dil_batch_loader, segment_piece_ids, trainable_segments  # noqa: E402
 from dilnaz_config import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS  # noqa: E402
-from models.configuration_dil import DilConfig  # noqa: E402
-from models.modeling_dil import Dil  # noqa: E402
+from models.dil import DilConfig  # noqa: E402
+from models.dil import Dil  # noqa: E402
 from tokenization import HybridTokenizer, TokenSegment, default_vocab_path  # noqa: E402
 from train_dil import is_dataloader_worker_exit, restore_checkpoint, save_checkpoint  # noqa: E402
 from trainer_core import BaseTrainer, StepResult, make_scheduler  # noqa: E402

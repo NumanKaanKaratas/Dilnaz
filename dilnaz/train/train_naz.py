@@ -26,9 +26,9 @@ from byte_trainer_utils import (  # noqa: E402
     validate_compile_environment,
 )
 from dilnaz_config import NAZ_FINETUNE_DEFAULTS, NAZ_MODEL_DEFAULTS, NAZ_TRAIN_DEFAULTS  # noqa: E402
-from models.configuration_dil import DilConfig  # noqa: E402
-from models.configuration_naz import NazConfig  # noqa: E402
-from models.modeling_naz import Naz  # noqa: E402
+from models.dil import DilConfig  # noqa: E402
+from models.naz import NazConfig  # noqa: E402
+from models.naz import Naz  # noqa: E402
 from naz_data import (  # noqa: E402
     MemmapNazSemanticBatcher,
     MemmapNazSemanticEvalLoader,

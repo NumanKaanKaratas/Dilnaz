@@ -8,9 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from byte_trainer_utils import COMPILE_MODE_CHOICES, compile_forward, validate_compile_environment
-from models.configuration_dil import DilConfig
-from models.configuration_naz import NazConfig
-from models.modeling_naz import Naz
+from models.dil import DilConfig
+from models.naz import NazConfig
+from models.naz import Naz
 from tokenization import HybridTokenizer, TokenSegment
 
 

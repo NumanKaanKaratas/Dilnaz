@@ -38,10 +38,10 @@ from dil_data import (  # noqa: E402
     trainable_segments,
 )
 from dilnaz_config import DIL_TRAIN_DEFAULTS  # noqa: E402
-from models.configuration_dil import DilConfig  # noqa: E402
-from models.configuration_naz import NazConfig  # noqa: E402
-from models.modeling_dil import Dil, angular_noise_like  # noqa: E402
-from models.modeling_naz import Naz  # noqa: E402
+from models.dil import DilConfig  # noqa: E402
+from models.naz import NazConfig  # noqa: E402
+from models.dil import Dil, angular_noise_like  # noqa: E402
+from models.naz import Naz  # noqa: E402
 from trainer_core import make_adamw_param_groups, make_scheduler  # noqa: E402
 
 
@@ -307,20 +307,15 @@ def synthetic_surface_state(
     surface_state_mask = torch.zeros_like(labels)
     frozen_mask = torch.zeros_like(labels, dtype=torch.bool)
 
-    draw = torch.rand(labels.shape, device=device)
-    keep = valid & draw.ge(mask_ratio)
-    known_ratio = max(0.05, (1.0 - mask_ratio) * 0.35)
-    known = keep & torch.rand(labels.shape, device=device).lt(known_ratio)
-    draft = keep & ~known
-    corrupt_ratio = min(config.writer_state_corruption_max_ratio, mask_ratio * config.writer_state_corruption_max_ratio)
-    corrupt = draft & torch.rand(labels.shape, device=device).lt(corrupt_ratio)
+    target_scope = valid & ~left
+    draft_ratio = min(config.writer_state_corruption_max_ratio, max(0.0, 1.0 - mask_ratio))
+    draft = target_scope & torch.rand(labels.shape, device=device).lt(draft_ratio)
     random_tokens = torch.randint(config.writer_vocab_size, labels.shape, device=device, dtype=torch.long)
-    surface_state[draft | known] = labels[draft | known]
-    surface_state[corrupt] = random_tokens[corrupt]
+    surface_state[draft] = random_tokens[draft]
     surface_state[left] = labels[left]
     surface_state_mask[draft] = 1
-    surface_state_mask[known | left] = 2
-    frozen_mask[known | left] = True
+    surface_state_mask[left] = 2
+    frozen_mask[left] = True
     return surface_state, surface_state_mask, frozen_mask
 
 

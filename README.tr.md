@@ -380,11 +380,9 @@ Tokenization, checkpointing, cache setup, random state handling ve log bookkeepi
 ```text
 dilnaz/
   models/
-    configuration_dil.py
-    configuration_naz.py
-    modeling_dil.py
-    modeling_naz.py
-    naz_backbone/
+    common/
+    dil/
+    naz/
   tokenization/
     hybrid_tokenizer.py
     hybrid_surface_vocab.json
