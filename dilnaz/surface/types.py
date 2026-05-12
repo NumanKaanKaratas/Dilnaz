@@ -112,7 +112,6 @@ class PackedWriterTarget:
     query: PackedSurface
     labels: torch.LongTensor
     label_mask: torch.BoolTensor
-    length_bucket_targets: torch.LongTensor
     true_lengths: torch.LongTensor
 
     def to(self, *args, **kwargs) -> "PackedWriterTarget":
@@ -120,7 +119,6 @@ class PackedWriterTarget:
             query=self.query.to(*args, **kwargs),
             labels=_move(self.labels, *args, **kwargs),
             label_mask=_move(self.label_mask, *args, **kwargs),
-            length_bucket_targets=_move(self.length_bucket_targets, *args, **kwargs),
             true_lengths=_move(self.true_lengths, *args, **kwargs),
         )
 
@@ -129,7 +127,6 @@ class PackedWriterTarget:
             query=self.query.detach(),
             labels=self.labels.detach(),
             label_mask=self.label_mask.detach(),
-            length_bucket_targets=self.length_bucket_targets.detach(),
             true_lengths=self.true_lengths.detach(),
         )
 

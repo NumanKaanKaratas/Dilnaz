@@ -1,4 +1,4 @@
-from .buckets import bucketize_lengths, choose_bucket_size
+from .buckets import choose_bucket_size
 from .decode import decode_packed_units, generated_unit_tensors
 from .ops import gather_unit_values, scatter_mean_by_unit, scatter_sum_by_unit
 from .packing import (
@@ -20,7 +20,6 @@ __all__ = [
     "PackedSurface",
     "PackedSurfaceState",
     "PackedWriterTarget",
-    "bucketize_lengths",
     "choose_bucket_size",
     "decode_packed_units",
     "empty_surface_state",

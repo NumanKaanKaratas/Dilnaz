@@ -32,13 +32,11 @@ def tiny_config(tokenizer: HybridTokenizer) -> DilConfig:
         latent_size=16,
         num_encoder_layers=2,
         max_surface_pieces_per_unit=16,
-        surface_bucket_sizes=(8, 16, 32),
+        surface_bucket_sizes=(8, 16, 32, 1024),
         context_radius=1,
         writer_num_layers=1,
         writer_word_mixer_layers=1,
         writer_word_attention_heads=4,
-        writer_output_buckets=(2, 4, 8, 16),
-        writer_initial_output_bucket=8,
     )
 
 

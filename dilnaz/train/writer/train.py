@@ -43,12 +43,11 @@ from dilnaz.models.naz import Naz
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 24
-WRITER_OBJECTIVE = "block_diffusion_writer_v1"
+CHECKPOINT_FORMAT_VERSION = 25
+WRITER_OBJECTIVE = "exact_length_writer_v1"
 WRITER_METRIC_KEYS = (
     "loss",
     "token_loss",
-    "length_bucket_loss",
     "active_token_loss",
     "right_guard_token_loss",
     "left_consistency_loss",
@@ -169,7 +168,6 @@ class HybridDilSlidingWindowDataset(IterableDataset):
                 target_rows,
                 pad_token_id=self.config.pad_token_id,
                 stop_token_id=self.config.writer_stop_token_id,
-                writer_output_buckets=self.config.writer_output_buckets,
                 surface_bucket_sizes=self.config.surface_bucket_sizes,
                 max_pieces_per_unit=self.config.max_surface_pieces_per_unit,
             ),
@@ -555,7 +553,6 @@ def writer_only_metrics(
     return {
         "loss": loss,
         "token_loss": token_loss,
-        "length_bucket_loss": loss - token_loss,
         "active_token_loss": token_loss,
         "right_guard_token_loss": zero,
         "left_consistency_loss": zero,

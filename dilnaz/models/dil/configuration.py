@@ -15,7 +15,7 @@ class DilConfig(PretrainedConfig):
         num_encoder_layers=6,
         latent_size=512,
         max_surface_pieces_per_unit=256,
-        surface_bucket_sizes=(64, 128, 256, 512, 1024, 2048, 4096, 8192),
+        surface_bucket_sizes=(64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384),
         context_radius=2,
         byte_conv_layers=2,
         byte_conv_kernel_size=5,
@@ -29,8 +29,6 @@ class DilConfig(PretrainedConfig):
         writer_conv_kernel_size=5,
         writer_conv_expansion=4,
         writer_dropout=0.1,
-        writer_output_buckets=(2, 4, 8, 16, 32, 64, 128, 256),
-        writer_initial_output_bucket=8,
         writer_max_window_size=32,
         writer_word_mixer_layers=2,
         writer_word_attention_heads=8,
@@ -81,11 +79,13 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=24,
+        checkpoint_format_version=25,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:
             raise ValueError("context_left_radius is not supported; use context_radius")
+        if "writer_output_buckets" in kwargs or "writer_initial_output_bucket" in kwargs:
+            raise ValueError("bucketed writer config is not supported; use exact writer lengths")
         kwargs.pop("context_size", None)
         kwargs.pop("target_index", None)
         if ("max_" + "word_bytes") in kwargs or ("writer_max_" + "positions") in kwargs:
@@ -101,15 +101,6 @@ class DilConfig(PretrainedConfig):
             raise ValueError("surface_bucket_sizes must be sorted ascending")
         if self.surface_bucket_sizes[-1] < max_surface_pieces_per_unit:
             raise ValueError("largest surface_bucket_sizes entry must cover max_surface_pieces_per_unit")
-        self.writer_output_buckets = tuple(int(bucket) for bucket in writer_output_buckets)
-        if not self.writer_output_buckets or self.writer_output_buckets[0] < 2:
-            raise ValueError("writer_output_buckets must start at >= 2 to include STOP")
-        if tuple(sorted(self.writer_output_buckets)) != self.writer_output_buckets:
-            raise ValueError("writer_output_buckets must be sorted ascending")
-        if self.writer_output_buckets[-1] > max_surface_pieces_per_unit + 1:
-            raise ValueError("writer output buckets cannot exceed max_surface_pieces_per_unit + STOP")
-        if writer_initial_output_bucket not in self.writer_output_buckets:
-            raise ValueError("writer_initial_output_bucket must be one of writer_output_buckets")
         if byte_conv_layers < 0 or writer_num_layers < 0:
             raise ValueError("conv layer counts must be >= 0")
         if byte_conv_kernel_size <= 0 or byte_conv_kernel_size % 2 == 0:
@@ -118,6 +109,9 @@ class DilConfig(PretrainedConfig):
             raise ValueError("writer_conv_kernel_size must be a positive odd integer")
         if writer_max_window_size <= 0:
             raise ValueError("writer_max_window_size must be > 0")
+        writer_decode_width = (max_surface_pieces_per_unit + 1) * writer_max_window_size
+        if self.surface_bucket_sizes[-1] < writer_decode_width:
+            raise ValueError("largest surface_bucket_sizes entry must cover exact writer decode window")
         if writer_word_mixer_layers < 0:
             raise ValueError("writer_word_mixer_layers must be >= 0")
         if writer_word_attention_heads <= 0:
@@ -217,7 +211,6 @@ class DilConfig(PretrainedConfig):
         self.writer_stop_token_id = vocab_size
         self.writer_state_vocab_size = self.writer_vocab_size + 1
         self.writer_empty_token_id = self.writer_vocab_size
-        self.writer_initial_output_bucket = int(writer_initial_output_bucket)
         self.writer_max_window_size = writer_max_window_size
         self.writer_word_mixer_layers = writer_word_mixer_layers
         self.writer_word_attention_heads = writer_word_attention_heads
