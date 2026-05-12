@@ -278,6 +278,9 @@ class ResidentNazBatcher:
         end = int(self.surface_offsets[token_idx + 1].detach().cpu())
         return self.surface_ids[start:end].detach().cpu().tolist()
 
+    def surface_span_width(self, start: int, end: int) -> int:
+        return int((self.surface_offsets[end] - self.surface_offsets[start]).detach().cpu())
+
     def surface_slice(self, start: int, end: int):
         row = [self.unit_piece_ids(token_idx) for token_idx in range(start, end)]
         return pack_token_units(

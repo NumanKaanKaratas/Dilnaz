@@ -94,7 +94,7 @@ def next_cycle_index(indices: list[int], after_idx: int, excluded: set[int]) -> 
 def build_auto_mapping(tokens: list[str], similarities: list[list[float]]) -> dict[int, int]:
     indices = [idx for idx, token in enumerate(tokens) if is_word_token(token)]
     if len(indices) < 2:
-        raise ValueError("automatic swap needs at least two word tokens")
+        return {}
 
     pair = find_surface_pair(tokens, indices) or find_semantic_pair(indices, similarities)
     target_idx, source_idx = pair
@@ -253,8 +253,11 @@ def main():
     print()
 
     print("mapping:")
-    for target_idx, source_idx in mapping.items():
-        print(f"[{target_idx}]{tokens[target_idx]} <- [{source_idx}]{tokens[source_idx]}")
+    if mapping:
+        for target_idx, source_idx in mapping.items():
+            print(f"[{target_idx}]{tokens[target_idx]} <- [{source_idx}]{tokens[source_idx]}")
+    else:
+        print("not_available")
     print()
 
     print("encoder_units:")

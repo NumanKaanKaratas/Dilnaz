@@ -300,6 +300,38 @@ def reduce_output_metrics(total: dict[str, float]) -> dict[str, float]:
     }
 
 
+def semantic_cache_spans(
+    token_count: int,
+    chunk_tokens: int,
+    context_radius: int,
+    max_surface_width: int,
+    span_width,
+):
+    start = 0
+    while start < token_count:
+        high = min(start + chunk_tokens, token_count)
+        low = start + 1
+        best = 0
+        while low <= high:
+            mid = (low + high) // 2
+            context_start = max(0, start - context_radius)
+            context_end = min(token_count, mid + context_radius)
+            if span_width(context_start, context_end) <= max_surface_width:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best <= start:
+            context_start = max(0, start - context_radius)
+            context_end = min(token_count, start + 1 + context_radius)
+            width = span_width(context_start, context_end)
+            raise ValueError(
+                f"single semantic cache span width {width} exceeds largest DIL surface bucket {max_surface_width}"
+            )
+        yield start, best
+        start = best
+
+
 @torch.no_grad()
 def build_resident_semantic_cache(
     model: Naz,
@@ -310,9 +342,16 @@ def build_resident_semantic_cache(
     model.eval()
     token_count = surface_batcher.token_count
     context_radius = model.dil_config.context_radius
+    max_surface_width = max(model.dil_config.surface_bucket_sizes)
     latent_chunks = []
-    for start in range(0, token_count, chunk_tokens):
-        end = min(start + chunk_tokens, token_count)
+    spans = semantic_cache_spans(
+        token_count,
+        chunk_tokens,
+        context_radius,
+        max_surface_width,
+        surface_batcher.surface_span_width,
+    )
+    for start, end in spans:
         context_start = max(0, start - context_radius)
         context_end = min(token_count, end + context_radius)
         surface = surface_batcher.surface_slice(context_start, context_end)
@@ -374,8 +413,15 @@ def build_memmap_semantic_cache(
     model.eval()
     device = next(model.parameters()).device
     context_radius = model.dil_config.context_radius
-    for start in range(0, token_count, chunk_tokens):
-        end = min(start + chunk_tokens, token_count)
+    max_surface_width = max(model.dil_config.surface_bucket_sizes)
+    spans = semantic_cache_spans(
+        token_count,
+        chunk_tokens,
+        context_radius,
+        max_surface_width,
+        lambda start, end: int(surface_offsets[end] - surface_offsets[start]),
+    )
+    for start, end in spans:
         context_start = max(0, start - context_radius)
         context_end = min(token_count, end + context_radius)
         rows = []
@@ -735,7 +781,7 @@ class NazBaseTrainer(BaseTrainer):
             train_ids_path,
             train_lengths_path,
             train_token_count,
-            self.config,
+            self.dil_config,
             self.args.sequence_length,
             self.args.batch_size,
             self.device,
@@ -767,7 +813,7 @@ class NazBaseTrainer(BaseTrainer):
                 eval_ids_path,
                 eval_lengths_path,
                 eval_token_count,
-                self.config,
+                self.dil_config,
                 self.args.sequence_length,
                 self.args.eval_batch_size,
                 self.device,

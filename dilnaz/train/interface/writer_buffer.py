@@ -197,6 +197,15 @@ class SlidingWriterBuffer:
             return 0
         return min(self.active_size, len(self.pending_latents) - self.right_guard)
 
+    def _ready_values(self, ready_tensor: torch.Tensor, commit_limit: int, force: bool) -> list[bool]:
+        if force:
+            return [True] * commit_limit
+        ready_values = ready_tensor.detach().cpu().tolist()
+        for idx in range(commit_limit):
+            if self.pending_ages[idx] >= self.max_position_age:
+                ready_values[idx] = True
+        return ready_values
+
     def flush(self, force: bool = False) -> bool:
         stop_after_flush = False
         while self.pending_latents:
@@ -228,7 +237,7 @@ class SlidingWriterBuffer:
             ).all(dim=1)
             eos_tensor = token_masks[0, slots, 0] & token_ids[0, slots, 0].eq(self.tokenizer.eos_token_id)
             length_values = slot_lengths.detach().cpu().tolist()
-            ready_values = [True] * commit_limit if force else ready_tensor.detach().cpu().tolist()
+            ready_values = self._ready_values(ready_tensor, commit_limit, force)
             eos_values = eos_tensor.detach().cpu().tolist()
             for local_idx in range(commit_limit):
                 slot = self.left_frozen + local_idx
