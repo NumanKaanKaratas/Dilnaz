@@ -10,6 +10,7 @@ from dilnaz.train.common.runtime import COMPILE_MODE_CHOICES, compile_forward, v
 from dilnaz.train.data.dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add, context_offsets
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
+from dilnaz.surface import pack_context_segments
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
@@ -28,40 +29,37 @@ def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
 
 
 def make_batch(segments: list[TokenSegment], tokenizer: HybridTokenizer, config: DilConfig, device: torch.device):
-    input_ids = torch.full(
-        (len(segments), config.context_size, config.max_word_bytes),
-        config.pad_token_id,
-        dtype=torch.long,
-        device=device,
-    )
-    word_masks = torch.zeros(
-        (len(segments), config.context_size, config.max_word_bytes),
-        dtype=torch.bool,
-        device=device,
-    )
+    rows: list[list[TokenSegment | None]] = []
     byte_lengths = []
 
     for row_idx, segment in enumerate(segments):
         token_ids = segment.token_ids
-        if len(token_ids) > config.max_word_bytes:
+        if len(token_ids) > config.max_surface_pieces_per_unit:
             raise ValueError(
                 f"token {row_idx} {tokenizer.decode(token_ids)!r} has {len(token_ids)} pieces; "
-                f"max_word_bytes={config.max_word_bytes}"
+                f"max_surface_pieces_per_unit={config.max_surface_pieces_per_unit}"
             )
-        ids = torch.tensor(token_ids, dtype=torch.long, device=device)
-        byte_lengths.append(ids.numel())
+        byte_lengths.append(len(token_ids))
+        row: list[TokenSegment | None] = []
         for context_idx, offset in enumerate(context_offsets(config.context_radius)):
             source_idx = row_idx + offset
             if source_idx < 0 or source_idx >= len(segments):
+                row.append(None)
                 continue
             context_ids = segments[source_idx].token_ids
-            if len(context_ids) > config.max_word_bytes:
+            if len(context_ids) > config.max_surface_pieces_per_unit:
+                row.append(None)
                 continue
-            ids = torch.tensor(context_ids, dtype=torch.long, device=device)
-            input_ids[row_idx, context_idx, : ids.numel()] = ids
-            word_masks[row_idx, context_idx, : ids.numel()] = True
+            row.append(segments[source_idx])
+        rows.append(row)
 
-    return input_ids, word_masks, byte_lengths
+    return pack_context_segments(
+        rows,
+        pad_token_id=config.pad_token_id,
+        bucket_sizes=config.surface_bucket_sizes,
+        max_pieces_per_unit=config.max_surface_pieces_per_unit,
+        device=device,
+    ), byte_lengths
 
 
 def is_word_token(token: str) -> bool:
@@ -133,8 +131,8 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
 
 
 @torch.no_grad()
-def encode_tokens(model: Dil, input_ids: torch.Tensor, word_masks: torch.Tensor):
-    return model.encode(input_ids=input_ids, word_masks=word_masks).float()
+def encode_tokens(model: Dil, surface):
+    return model.encode(surface=surface).float()
 
 
 @torch.no_grad()
@@ -240,8 +238,8 @@ def main():
     segments = tokenize_text(args.text, tokenizer)
     tokens = [segment.text for segment in segments]
     decoded_tokens = [tokenizer.decode(segment.token_ids) for segment in segments]
-    input_ids, word_masks, byte_lengths = make_batch(segments, tokenizer, config, device)
-    latents = encode_tokens(model, input_ids, word_masks)
+    surface, byte_lengths = make_batch(segments, tokenizer, config, device)
+    latents = encode_tokens(model, surface)
     roundtrip_tokens = decode_tokens(model, tokenizer, latents)
     similarities = similarity_matrix(latents)
     mapping = build_auto_mapping(tokens, similarities)

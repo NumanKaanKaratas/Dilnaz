@@ -23,6 +23,7 @@ from dilnaz.train.data.dil_data import (
     trainable_segments,
 )
 from dilnaz.models.dil import DilConfig
+from dilnaz.surface import pack_context_segments, pack_writer_targets
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
@@ -187,22 +188,6 @@ def row_positions(batch: dict) -> dict[int, int]:
     }
 
 
-def write_segment(
-    target: np.ndarray,
-    mask: np.ndarray,
-    row_idx: int,
-    context_idx: int,
-    segment: TokenSegment,
-    max_word_bytes: int,
-):
-    piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
-    width = piece_ids.shape[0]
-    if width <= 0 or width > max_word_bytes:
-        return
-    target[row_idx, context_idx, :width] = piece_ids
-    mask[row_idx, context_idx, :width] = True
-
-
 class ParallelDilBatchDataset(IterableDataset):
     def __init__(
         self,
@@ -217,8 +202,9 @@ class ParallelDilBatchDataset(IterableDataset):
         self.train_file = train_file
         self.context_radius = config.context_radius
         self.context_size = config.context_size
-        self.max_word_bytes = config.max_word_bytes
-        self.writer_max_positions = config.writer_max_positions
+        self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
+        self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
+        self.writer_output_buckets = tuple(config.writer_output_buckets)
         self.pad_token_id = config.pad_token_id
         self.writer_stop_token_id = config.writer_stop_token_id
         self.batch_size = batch_size
@@ -239,13 +225,8 @@ class ParallelDilBatchDataset(IterableDataset):
 
     def make_batch(self, rows: list[ParallelBatchRow]) -> dict:
         size = len(rows)
-        input_ids = np.full(
-            (size, self.context_size, self.max_word_bytes),
-            self.pad_token_id,
-            dtype=np.int64,
-        )
-        word_masks = np.zeros((size, self.context_size, self.max_word_bytes), dtype=np.bool_)
-        labels = np.full((size, self.writer_max_positions), -100, dtype=np.int64)
+        context_rows: list[list[TokenSegment | None]] = []
+        target_rows: list[list[list[int]]] = []
         teacher_text_indices = np.zeros((size,), dtype=np.int64)
         teacher_starts = np.zeros((size,), dtype=np.int64)
         teacher_ends = np.zeros((size,), dtype=np.int64)
@@ -279,21 +260,16 @@ class ParallelDilBatchDataset(IterableDataset):
             segments = row.item.source_segments if row.side_id == SOURCE_SIDE else row.item.target_segments
             text_idx = pair_text_indices[pair_idx, row.side_id]
             segment = segments[row.token_idx]
+            context_row: list[TokenSegment | None] = []
             for context_idx, offset in enumerate(context_offsets(self.context_radius)):
                 source_idx = row.token_idx + offset
                 if 0 <= source_idx < len(segments):
-                    write_segment(
-                        input_ids,
-                        word_masks,
-                        row_idx,
-                        context_idx,
-                        segments[source_idx],
-                        self.max_word_bytes,
-                    )
+                    context_row.append(segments[source_idx])
+                else:
+                    context_row.append(None)
+            context_rows.append(context_row)
 
-            piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
-            labels[row_idx, : piece_ids.shape[0]] = piece_ids
-            labels[row_idx, piece_ids.shape[0]] = self.writer_stop_token_id
+            target_rows.append([segment_piece_ids(segment)])
             teacher_text_indices[row_idx] = text_idx
             teacher_starts[row_idx] = segment.start
             teacher_ends[row_idx] = segment.end
@@ -309,9 +285,20 @@ class ParallelDilBatchDataset(IterableDataset):
             dtype=np.int64,
         )
         return {
-            "input_ids": torch.from_numpy(input_ids),
-            "word_masks": torch.from_numpy(word_masks),
-            "labels": torch.from_numpy(labels),
+            "surface": pack_context_segments(
+                context_rows,
+                pad_token_id=self.pad_token_id,
+                bucket_sizes=self.surface_bucket_sizes,
+                max_pieces_per_unit=self.max_surface_pieces_per_unit,
+            ),
+            "labels": pack_writer_targets(
+                target_rows,
+                pad_token_id=self.pad_token_id,
+                stop_token_id=self.writer_stop_token_id,
+                writer_output_buckets=self.writer_output_buckets,
+                surface_bucket_sizes=self.surface_bucket_sizes,
+                max_pieces_per_unit=self.max_surface_pieces_per_unit,
+            ),
             "teacher_texts": teacher_texts,
             "teacher_text_side_ids": torch.from_numpy(teacher_text_side_ids),
             "teacher_text_indices": torch.from_numpy(teacher_text_indices),
@@ -333,8 +320,8 @@ class ParallelDilBatchDataset(IterableDataset):
         for pair in iter_parallel_pairs(self.train_file):
             if pair.index % worker_count != worker_id:
                 continue
-            source_segments = trainable_segments(self.tokenizer, pair.source_text, self.max_word_bytes)
-            target_segments = trainable_segments(self.tokenizer, pair.target_text, self.max_word_bytes)
+            source_segments = trainable_segments(self.tokenizer, pair.source_text, self.max_surface_pieces_per_unit)
+            target_segments = trainable_segments(self.tokenizer, pair.target_text, self.max_surface_pieces_per_unit)
             if not source_segments or not target_segments:
                 continue
 

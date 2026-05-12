@@ -7,6 +7,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_utils import PreTrainedModel
 
+from dilnaz.surface import PackedSurface, pack_token_units
+
 from ..common.latents import angular_noise_like
 from ..dil import Dil, DilConfig
 from .configuration import NazConfig
@@ -25,7 +27,6 @@ class Naz(PreTrainedModel):
             raise ValueError("NazConfig.dil_path is required")
 
         self.student_core = NazStudentCore(config)
-        self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
         self.reconstruction_loss_weight = config.reconstruction_loss_weight
         self.repetition_cos_threshold = config.repetition_cos_threshold
@@ -73,10 +74,6 @@ class Naz(PreTrainedModel):
             raise ValueError(
                 f"Naz latent_size={config.latent_size} does not match Dil latent_size={dil_config.latent_size}"
             )
-        if config.max_word_bytes != dil_config.max_word_bytes:
-            raise ValueError(
-                f"Naz max_word_bytes={config.max_word_bytes} does not match Dil max_word_bytes={dil_config.max_word_bytes}"
-            )
         if config.vocab_size != dil_config.vocab_size:
             raise ValueError(
                 f"Naz vocab_size={config.vocab_size} does not match Dil vocab_size={dil_config.vocab_size}"
@@ -121,153 +118,62 @@ class Naz(PreTrainedModel):
     def set_input_embeddings(self, value):
         raise ValueError("Naz uses semantic inputs_embeds and has no token embedding table")
 
-    def validate_byte_inputs(self, input_ids: torch.LongTensor):
-        batch_size, sequence_length, byte_width = input_ids.shape
-        if byte_width != self.max_word_bytes:
-            raise ValueError(f"input_ids byte width {byte_width} != max_word_bytes {self.max_word_bytes}")
-        return batch_size, sequence_length
-
     @torch.no_grad()
-    def dil_context_inputs(
+    def dil_context_surface(
         self,
-        target_input_ids: torch.LongTensor,
-        target_word_masks: torch.Tensor,
+        surface: PackedSurface,
         unit_mask: torch.Tensor,
-    ) -> tuple[torch.LongTensor, torch.Tensor, torch.Tensor]:
-        batch_size, sequence_length, byte_width = target_input_ids.shape
+    ) -> tuple[PackedSurface, torch.Tensor]:
+        surface = surface.to(unit_mask.device)
+        batch_size, sequence_length = unit_mask.shape
+        if surface.ids.shape[0] != batch_size or surface.unit_count != sequence_length:
+            raise ValueError("surface must be packed as [batch, sequence_units]")
         context_radius = self.dil_config.context_radius
         context_size = self.dil_config.context_size
-        context_ids = torch.full(
-            (batch_size, sequence_length, context_size, byte_width),
-            self.pad_token_id,
-            dtype=target_input_ids.dtype,
-            device=target_input_ids.device,
-        )
-        context_masks = torch.zeros(
-            (batch_size, sequence_length, context_size, byte_width),
-            dtype=target_word_masks.dtype,
-            device=target_word_masks.device,
-        )
-        for context_idx, offset in enumerate(range(-context_radius, context_radius + 1)):
-            if offset < 0:
-                if -offset >= sequence_length:
+        rows: list[list[list[int]]] = []
+        active_indices: list[int] = []
+        surface_cpu = surface.cpu()
+        unit_mask_cpu = unit_mask.detach().cpu()
+        for batch_idx in range(batch_size):
+            for unit_idx in range(sequence_length):
+                if not bool(unit_mask_cpu[batch_idx, unit_idx]):
                     continue
-                dst = slice(-offset, sequence_length)
-                src = slice(0, sequence_length + offset)
-            elif offset > 0:
-                if offset >= sequence_length:
-                    continue
-                dst = slice(0, sequence_length - offset)
-                src = slice(offset, sequence_length)
-            else:
-                dst = slice(0, sequence_length)
-                src = slice(0, sequence_length)
-            context_ids[:, dst, context_idx] = target_input_ids[:, src]
-            context_masks[:, dst, context_idx] = target_word_masks[:, src]
-        context_masks = context_masks & unit_mask.unsqueeze(-1).unsqueeze(-1)
-        active = unit_mask.reshape(-1)
-        return (
-            context_ids.reshape(-1, context_size, byte_width)[active],
-            context_masks.reshape(-1, context_size, byte_width)[active],
-            active,
+                row = []
+                for offset in range(-context_radius, context_radius + 1):
+                    source_idx = unit_idx + offset
+                    if 0 <= source_idx < sequence_length and bool(unit_mask_cpu[batch_idx, source_idx]):
+                        start = int(surface_cpu.unit_offsets[batch_idx, source_idx])
+                        length = int(surface_cpu.unit_lengths[batch_idx, source_idx])
+                        row.append(surface_cpu.ids[batch_idx, start : start + length].tolist())
+                    else:
+                        row.append([])
+                if len(row) != context_size:
+                    raise RuntimeError("internal context packing error")
+                rows.append(row)
+                active_indices.append(batch_idx * sequence_length + unit_idx)
+        if not rows:
+            raise ValueError("surface has no active units to encode")
+        active = torch.zeros((batch_size * sequence_length,), dtype=torch.bool, device=unit_mask.device)
+        active[torch.tensor(active_indices, dtype=torch.long, device=unit_mask.device)] = True
+        packed = pack_token_units(
+            rows,
+            pad_token_id=self.pad_token_id,
+            bucket_sizes=self.dil_config.surface_bucket_sizes,
+            max_pieces_per_unit=self.dil_config.max_surface_pieces_per_unit,
+            device=unit_mask.device,
         )
+        return packed, active
 
     @torch.no_grad()
-    def encode_active_dil_latents(
-        self,
-        input_ids: torch.LongTensor,
-        word_masks: torch.Tensor,
-        unit_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        context_ids, context_masks, _ = self.dil_context_inputs(input_ids, word_masks, unit_mask)
-        return self.dil_model.encode(input_ids=context_ids, word_masks=context_masks).float()
-
-    def encode_training_batch_latents(
-        self,
-        input_ids: torch.LongTensor,
-        word_masks: torch.Tensor,
-        target_input_ids: torch.LongTensor,
-        target_word_masks: torch.Tensor,
-        unit_mask: torch.Tensor,
-        target_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, sequence_length = self.validate_byte_inputs(input_ids)
-        if target_input_ids.dim() != 4:
-            raise ValueError("target_input_ids must be shaped [batch, sequence, horizons, bytes]")
-        if target_word_masks.shape != target_input_ids.shape:
-            raise ValueError("target_word_masks must match target_input_ids")
-        if target_mask.shape != target_input_ids.shape[:3]:
-            raise ValueError("target_mask must be shaped [batch, sequence, horizons]")
-        if target_input_ids.shape[:2] != (batch_size, sequence_length):
-            raise ValueError("target_input_ids must share input batch and sequence dimensions")
-
-        horizons = target_input_ids.shape[2]
-        byte_width = target_input_ids.shape[3]
-        last_source = unit_mask.long().sum(dim=1).clamp_min(1) - 1
-        tail_index = last_source.view(batch_size, 1, 1, 1).expand(-1, 1, horizons, byte_width)
-        tail_ids = target_input_ids.gather(dim=1, index=tail_index).squeeze(1)
-        tail_word_masks = target_word_masks.gather(dim=1, index=tail_index).squeeze(1)
-        tail_mask = target_mask.gather(
-            dim=1,
-            index=last_source.view(batch_size, 1, 1).expand(-1, 1, horizons),
-        ).squeeze(1)
-
-        extended_ids = torch.cat((input_ids, tail_ids), dim=1)
-        extended_word_masks = torch.cat((word_masks, tail_word_masks), dim=1)
-        extended_unit_mask = torch.cat((unit_mask, tail_mask), dim=1)
-        source_context_ids, source_context_masks, source_active = self.dil_context_inputs(input_ids, word_masks, unit_mask)
-        target_context_ids, target_context_masks, target_active = self.dil_context_inputs(
-            extended_ids,
-            extended_word_masks,
-            extended_unit_mask,
-        )
-        source_count = source_context_ids.shape[0]
-        encoded = self.dil_model.encode(
-            input_ids=torch.cat((source_context_ids, target_context_ids), dim=0),
-            word_masks=torch.cat((source_context_masks, target_context_masks), dim=0),
-        ).float()
-        source_latents = encoded[:source_count]
-        target_latents = encoded[source_count:]
-
-        source_semantic = torch.zeros(
-            (batch_size * sequence_length, self.config.latent_size),
-            dtype=source_latents.dtype,
-            device=source_latents.device,
-        )
-        source_semantic[source_active] = source_latents
-        source_semantic = source_semantic.reshape(batch_size, sequence_length, self.config.latent_size)
-
-        extended_semantic = torch.zeros(
-            (batch_size * (sequence_length + horizons), self.config.latent_size),
-            dtype=target_latents.dtype,
-            device=target_latents.device,
-        )
-        extended_semantic[target_active] = target_latents
-        extended_semantic = extended_semantic.reshape(batch_size, sequence_length + horizons, self.config.latent_size)
-
-        horizon_positions = (
-            torch.arange(sequence_length, device=input_ids.device).view(1, sequence_length, 1)
-            + torch.arange(1, horizons + 1, device=input_ids.device).view(1, 1, horizons)
-        )
-        target_latents = extended_semantic.gather(
-            dim=1,
-            index=horizon_positions.reshape(1, sequence_length * horizons, 1).expand(
-                batch_size,
-                -1,
-                self.config.latent_size,
-            ),
-        ).reshape(batch_size, sequence_length, horizons, self.config.latent_size)
-        return source_semantic, target_latents
-
     def encode_sequence_latents(
         self,
-        input_ids: torch.LongTensor,
-        word_masks: torch.Tensor,
-        unit_mask: torch.Tensor,
+        surface: PackedSurface,
+        unit_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        batch_size, sequence_length = self.validate_byte_inputs(input_ids)
-        active_latents = self.encode_active_dil_latents(input_ids, word_masks, unit_mask)
-        active = unit_mask.reshape(-1)
+        unit_mask = surface.unit_mask if unit_mask is None else unit_mask.to(surface.ids.device, dtype=torch.bool)
+        batch_size, sequence_length = unit_mask.shape
+        context_surface, active = self.dil_context_surface(surface, unit_mask)
+        active_latents = self.dil_model.encode(surface=context_surface).float()
         semantic_states = torch.zeros(
             (batch_size * sequence_length, self.config.latent_size),
             dtype=active_latents.dtype,
@@ -278,12 +184,11 @@ class Naz(PreTrainedModel):
 
     def embed_sequence_latents(
         self,
-        input_ids: torch.LongTensor,
-        word_masks: torch.Tensor,
-        unit_mask: torch.Tensor,
+        surface: PackedSurface,
+        unit_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.student_core.embed_semantic_states(
-            self.encode_sequence_latents(input_ids, word_masks, unit_mask)
+            self.encode_sequence_latents(surface, unit_mask)
         )
 
     def _student_output(
@@ -341,12 +246,12 @@ class Naz(PreTrainedModel):
 
     def predict_next_latents_from_surface(
         self,
-        input_ids: torch.LongTensor,
-        word_masks: torch.Tensor,
-        unit_mask: torch.Tensor,
+        surface: PackedSurface,
+        unit_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        unit_mask = surface.unit_mask if unit_mask is None else unit_mask
         return self.predict_semantic_latents(
-            self.encode_sequence_latents(input_ids, word_masks, unit_mask),
+            self.encode_sequence_latents(surface, unit_mask),
             unit_mask,
         )
 
@@ -485,24 +390,14 @@ class Naz(PreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        word_masks: torch.Tensor,
-        target_input_ids: torch.LongTensor,
-        target_word_masks: torch.Tensor,
+        semantic_states: torch.Tensor,
+        target_latents: torch.Tensor,
         unit_mask: torch.Tensor,
         target_mask: torch.Tensor,
         attention_mask=_DEFAULT_ATTENTION_MASK,
         training_step: Optional[int] = None,
     ) -> NazOutput:
         del training_step
-        semantic_states, target_latents = self.encode_training_batch_latents(
-            input_ids,
-            word_masks,
-            target_input_ids,
-            target_word_masks,
-            unit_mask,
-            target_mask,
-        )
         return self.forward_semantic(
             semantic_states,
             target_latents,
@@ -514,23 +409,22 @@ class Naz(PreTrainedModel):
     @torch.no_grad()
     def generate(
         self,
-        input_ids: torch.LongTensor,
-        word_masks: torch.Tensor,
+        surface: PackedSurface,
         unit_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 16,
         min_new_tokens: Optional[int] = None,
         repetition_cos_threshold: Optional[float] = None,
     ) -> NazGenerationOutput:
+        unit_mask = surface.unit_mask if unit_mask is None else unit_mask
         prompt_model_latents = self.encode_sequence_latents(
-            input_ids,
-            word_masks,
-            unit_mask if unit_mask is not None else word_masks.any(dim=-1),
+            surface,
+            unit_mask,
         )
         generated = [
             step.latent
             for step in self._generate_stream_from_semantic_states(
                 semantic_states=prompt_model_latents,
-                unit_mask=unit_mask if unit_mask is not None else word_masks.any(dim=-1),
+                unit_mask=unit_mask,
                 max_new_tokens=max_new_tokens,
                 min_new_tokens=min_new_tokens,
                 repetition_cos_threshold=repetition_cos_threshold,
@@ -595,8 +489,7 @@ class Naz(PreTrainedModel):
     @torch.no_grad()
     def generate_stream(
         self,
-        input_ids: torch.LongTensor,
-        word_masks: torch.Tensor,
+        surface: PackedSurface,
         unit_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 16,
         min_new_tokens: Optional[int] = None,
@@ -606,21 +499,19 @@ class Naz(PreTrainedModel):
         self.eval()
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be > 0")
-        if input_ids.dim() != 3 or word_masks.shape != input_ids.shape:
-            raise ValueError("input_ids and word_masks must be shaped [batch, units, bytes]")
-        unit_mask = unit_mask if unit_mask is not None else word_masks.any(dim=-1)
-        if unit_mask.shape != input_ids.shape[:2]:
+        unit_mask = surface.unit_mask if unit_mask is None else unit_mask.to(surface.ids.device, dtype=torch.bool)
+        if unit_mask.shape != surface.unit_lengths.shape:
             raise ValueError("unit_mask must be shaped [batch, units]")
         if not bool(unit_mask.all().detach().cpu()):
             raise ValueError("Naz.generate_stream expects packed prompts without unit padding")
         if prompt_latents is not None:
-            if prompt_latents.dim() != 3 or prompt_latents.shape[:2] != input_ids.shape[:2]:
+            if prompt_latents.dim() != 3 or prompt_latents.shape[:2] != unit_mask.shape:
                 raise ValueError("prompt_latents must be shaped [batch, units, latent_size]")
             if prompt_latents.shape[-1] != self.config.latent_size:
                 raise ValueError("prompt_latents last dimension must equal config.latent_size")
             semantic_states = prompt_latents
         else:
-            semantic_states = self.encode_sequence_latents(input_ids, word_masks, unit_mask)
+            semantic_states = self.encode_sequence_latents(surface, unit_mask)
 
         yield from self._generate_stream_from_semantic_states(
             semantic_states=semantic_states,

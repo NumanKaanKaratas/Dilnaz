@@ -5,6 +5,17 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from dilnaz.surface import (
+    PackedSurface,
+    PackedSurfaceState,
+    empty_surface_state,
+    generated_unit_tensors,
+    gather_unit_values,
+    merge_frozen_state,
+    writer_query_from_lengths,
+)
+from dilnaz.surface.state import STATE_DRAFT, STATE_EMPTY, STATE_KNOWN
+
 from ..configuration import DilConfig
 from ...common.norms import DilRMSNorm
 from .blocks import DilAdaLNConvSwiGLUBlock, DilByteStateCrossAttention, DilWriterWordMixerBlock
@@ -12,22 +23,24 @@ from .outputs import DilWriterOutput
 
 
 class DilConditionalWriter(nn.Module):
-    STATE_EMPTY = 0
-    STATE_DRAFT = 1
-    STATE_KNOWN = 2
+    STATE_EMPTY = STATE_EMPTY
+    STATE_DRAFT = STATE_DRAFT
+    STATE_KNOWN = STATE_KNOWN
     ZONE_LEFT = 0
     ZONE_ACTIVE = 1
     ZONE_RIGHT = 2
 
     def __init__(self, config: DilConfig):
         super().__init__()
-        self.max_word_bytes = config.max_word_bytes
-        self.writer_max_positions = config.writer_max_positions
         self.pad_token_id = config.pad_token_id
         self.writer_stop_token_id = config.writer_stop_token_id
         self.writer_vocab_size = config.writer_vocab_size
         self.writer_state_vocab_size = config.writer_state_vocab_size
         self.writer_empty_token_id = config.writer_empty_token_id
+        self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
+        self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
+        self.writer_output_buckets = tuple(config.writer_output_buckets)
+        self.writer_initial_output_bucket = int(config.writer_initial_output_bucket)
         self.max_window_size = config.writer_max_window_size
         self.hidden_size = config.hidden_size
         self.refinement_step_scale = config.initializer_range
@@ -52,7 +65,7 @@ class DilConditionalWriter(nn.Module):
         self.zone_embeddings = nn.Embedding(3, config.hidden_size)
         self.position_age_embeddings = nn.Embedding(config.writer_max_position_age + 1, config.hidden_size)
         self.word_position_embeddings = nn.Embedding(config.writer_max_window_size, config.hidden_size)
-        self.position_embeddings = nn.Embedding(config.writer_max_positions, config.hidden_size)
+        self.position_embeddings = nn.Embedding(config.max_surface_pieces_per_unit + 1, config.hidden_size)
         self.state_quality_proj = nn.Linear(4, config.hidden_size, bias=False)
         self.condition_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.condition_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
@@ -92,6 +105,7 @@ class DilConditionalWriter(nn.Module):
         self.token_head = nn.Linear(config.hidden_size, config.writer_vocab_size, bias=False)
         self.state_valid_head = nn.Linear(config.hidden_size, 1, bias=True)
         self.emit_head = nn.Linear(config.hidden_size, 1, bias=True)
+        self.length_bucket_head = nn.Linear(config.hidden_size, len(self.writer_output_buckets), bias=True)
         self.dropout = nn.Dropout(config.writer_dropout)
 
     def _canonical_semantic(self, semantic: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -102,26 +116,6 @@ class DilConditionalWriter(nn.Module):
         if semantic.dim() != 3:
             raise ValueError("writer semantic must be shaped [batch, latent] or [batch, window, latent]")
         return semantic, False
-
-    def _canonical_window_arg(
-        self,
-        value: Optional[torch.Tensor],
-        batch_size: int,
-        window_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        fill_value: int | bool,
-    ) -> torch.Tensor:
-        if value is None:
-            return torch.full((batch_size, window_size, self.writer_max_positions), fill_value, dtype=dtype, device=device)
-        if value.dim() == 2:
-            value = value.unsqueeze(1)
-        if value.shape != (batch_size, window_size, self.writer_max_positions):
-            raise ValueError(
-                f"writer state argument must be shaped {(batch_size, window_size, self.writer_max_positions)}, "
-                f"got {tuple(value.shape)}"
-            )
-        return value.to(device=device, dtype=dtype)
 
     def _canonical_zone_ids(
         self,
@@ -168,42 +162,61 @@ class DilConditionalWriter(nn.Module):
             raise ValueError(f"position_age must be shaped {(batch_size, window_size)}, got {tuple(position_age.shape)}")
         return position_age.to(device=device, dtype=torch.long).clamp(0, self.max_position_age)
 
-    def _state_embeddings(
-        self,
-        surface_state: torch.Tensor,
-        surface_state_mask: Optional[torch.Tensor],
-        frozen_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        valid_token = surface_state.ge(0) & surface_state.lt(self.writer_vocab_size)
-        input_ids = torch.where(valid_token, surface_state, torch.full_like(surface_state, self.writer_empty_token_id))
-        if surface_state_mask is None:
-            state_kind = torch.where(
-                valid_token,
-                torch.full_like(surface_state, self.STATE_DRAFT),
-                torch.full_like(surface_state, self.STATE_EMPTY),
-            )
-        else:
-            if surface_state_mask.shape != surface_state.shape:
-                raise ValueError("surface_state_mask must match surface_state")
-            state_kind = surface_state_mask.to(device=surface_state.device, dtype=torch.long).clamp(0, 2)
-        state_kind = torch.where(frozen_mask, torch.full_like(state_kind, self.STATE_KNOWN), state_kind)
+    def _default_query(self, window_mask: torch.Tensor) -> PackedSurface:
+        lengths = torch.full_like(window_mask, self.writer_initial_output_bucket, dtype=torch.long)
+        lengths = torch.where(window_mask, lengths, torch.zeros_like(lengths))
+        return writer_query_from_lengths(
+            lengths,
+            pad_token_id=self.pad_token_id,
+            surface_bucket_sizes=self.surface_bucket_sizes,
+        )
+
+    def _validate_surface(self, surface: PackedSurface, batch_size: int, window_size: int, device: torch.device) -> PackedSurface:
+        surface = surface.to(device)
+        if surface.ids.shape[0] != batch_size or surface.unit_count != window_size:
+            raise ValueError("writer packed surface must share semantic batch and window dimensions")
+        if int(surface.pos_in_unit.max().detach().cpu()) > self.max_surface_pieces_per_unit:
+            raise ValueError("writer packed surface position exceeds max_surface_pieces_per_unit")
+        return surface
+
+    def _validate_state(self, state: PackedSurfaceState, batch_size: int, window_size: int, device: torch.device) -> PackedSurfaceState:
+        state = state.to(device)
+        if state.ids.shape[0] != batch_size or state.unit_count != window_size:
+            raise ValueError("writer packed state must share semantic batch and window dimensions")
+        return state
+
+    def _state_embeddings(self, state: PackedSurfaceState) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid_token = state.mask & state.ids.ge(0) & state.ids.lt(self.writer_vocab_size)
+        input_ids = torch.where(valid_token, state.ids, torch.full_like(state.ids, self.writer_empty_token_id))
+        state_kind = state.state_kind.clamp(0, 2)
+        state_kind = torch.where(state.frozen, torch.full_like(state_kind, self.STATE_KNOWN), state_kind)
         state_hidden = (
             self.state_token_embeddings(input_ids)
             + self.state_kind_embeddings(state_kind)
-            + self.frozen_embeddings(frozen_mask.to(dtype=torch.long))
+            + self.frozen_embeddings(state.frozen.to(dtype=torch.long))
         )
         state_present = valid_token & state_kind.gt(0)
-        denom = torch.full(
-            state_present.shape[:2],
-            float(self.writer_max_positions),
-            device=state_hidden.device,
-            dtype=state_hidden.dtype,
+        batch_size, unit_count = state.unit_lengths.shape
+        denom = state.unit_lengths.clamp_min(1).to(state_hidden.dtype)
+        index = state.unit_ids.clamp_min(0)
+        present_counts = state_hidden.new_zeros((batch_size, unit_count))
+        draft_counts = state_hidden.new_zeros((batch_size, unit_count))
+        known_counts = state_hidden.new_zeros((batch_size, unit_count))
+        frozen_counts = state_hidden.new_zeros((batch_size, unit_count))
+        present_counts.scatter_add_(1, index, state_present.to(state_hidden.dtype))
+        draft_counts.scatter_add_(1, index, (state_present & state_kind.eq(self.STATE_DRAFT)).to(state_hidden.dtype))
+        known_counts.scatter_add_(1, index, (state_present & state_kind.eq(self.STATE_KNOWN)).to(state_hidden.dtype))
+        frozen_counts.scatter_add_(1, index, (state_present & state.frozen).to(state_hidden.dtype))
+        empty_ratio = (denom - present_counts).clamp_min(0.0) / denom
+        state_quality = torch.stack(
+            (
+                empty_ratio,
+                draft_counts / denom,
+                known_counts / denom,
+                frozen_counts / denom,
+            ),
+            dim=-1,
         )
-        empty_ratio = (~state_present).sum(dim=2).to(state_hidden.dtype) / denom
-        draft_ratio = (state_present & state_kind.eq(self.STATE_DRAFT)).sum(dim=2).to(state_hidden.dtype) / denom
-        known_ratio = (state_present & state_kind.eq(self.STATE_KNOWN)).sum(dim=2).to(state_hidden.dtype) / denom
-        frozen_ratio = (state_present & frozen_mask).sum(dim=2).to(state_hidden.dtype) / denom
-        state_quality = torch.stack((empty_ratio, draft_ratio, known_ratio, frozen_ratio), dim=-1)
         return state_hidden, state_present, state_kind, state_quality
 
     def _refinement_step_embedding(self, refinement_step: int | torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -285,64 +298,38 @@ class DilConditionalWriter(nn.Module):
                 refinement_step,
                 semantic_hidden.device,
                 semantic_hidden.dtype,
-            ).view(
-                1,
-                1,
-                -1,
-            )
+            ).view(1, 1, -1)
         condition = condition_core + self._future_attention_summary(future_latents, condition_core, window_mask, latent_size)
         condition = self.condition_proj(self.condition_norm(condition))
         word_positions = torch.arange(window_size, device=semantic_window.device)
-        word_hidden = semantic_hidden + self.word_position_embeddings(word_positions).unsqueeze(0)
+        word_hidden = semantic_hidden + condition + self.word_position_embeddings(word_positions).unsqueeze(0)
         return word_hidden, condition
 
     def transition(
         self,
         semantic: torch.Tensor,
-        surface_state: Optional[torch.Tensor] = None,
-        surface_state_mask: Optional[torch.Tensor] = None,
-        frozen_mask: Optional[torch.Tensor] = None,
+        query_surface: Optional[PackedSurface] = None,
+        surface_state: Optional[PackedSurfaceState] = None,
         zone_ids: Optional[torch.Tensor] = None,
         window_mask: Optional[torch.Tensor] = None,
         future_latents: Optional[torch.Tensor] = None,
         refinement_step: Optional[int | torch.Tensor] = None,
         position_age: Optional[torch.Tensor] = None,
     ) -> DilWriterOutput:
-        semantic_window, squeeze_window = self._canonical_semantic(semantic)
-        batch_size, window_size, latent_size = semantic_window.shape
+        semantic_window, _ = self._canonical_semantic(semantic)
+        batch_size, window_size, _ = semantic_window.shape
         if window_size > self.max_window_size:
             raise ValueError(f"writer window size {window_size} exceeds writer_max_window_size={self.max_window_size}")
         device = semantic_window.device
-        surface_state = self._canonical_window_arg(
-            surface_state,
-            batch_size,
-            window_size,
-            torch.long,
-            device,
-            -100,
-        )
-        frozen_mask = self._canonical_window_arg(
-            frozen_mask,
-            batch_size,
-            window_size,
-            torch.bool,
-            device,
-            False,
-        )
-        if surface_state_mask is not None:
-            surface_state_mask = self._canonical_window_arg(
-                surface_state_mask,
-                batch_size,
-                window_size,
-                torch.long,
-                device,
-                self.STATE_EMPTY,
-            )
         zone_ids = self._canonical_zone_ids(zone_ids, batch_size, window_size, device)
         window_mask = self._canonical_window_mask(window_mask, batch_size, window_size, device)
         position_age = self._canonical_position_age(position_age, batch_size, window_size, device)
+        query_surface = self._default_query(window_mask) if query_surface is None else query_surface
+        query_surface = self._validate_surface(query_surface, batch_size, window_size, device)
+        surface_state = empty_surface_state(query_surface, self.writer_empty_token_id) if surface_state is None else surface_state
+        surface_state = self._validate_state(surface_state, batch_size, window_size, device)
 
-        state_hidden, state_present, _, state_quality = self._state_embeddings(surface_state, surface_state_mask, frozen_mask)
+        state_hidden, state_present, _, state_quality = self._state_embeddings(surface_state)
         word_hidden, condition = self._writer_condition(
             semantic_window,
             state_quality,
@@ -360,68 +347,59 @@ class DilConditionalWriter(nn.Module):
             else:
                 word_hidden = mixer(word_hidden, condition, window_mask)
 
-        positions = torch.arange(self.writer_max_positions, device=semantic.device)
-        hidden_states = word_hidden.unsqueeze(2) + self.position_embeddings(positions).view(1, 1, -1, word_hidden.shape[-1])
-        hidden_states = hidden_states + state_hidden
-        hidden_states = hidden_states.reshape(batch_size * window_size, self.writer_max_positions, -1)
-        state_hidden = state_hidden.reshape(batch_size * window_size, self.writer_max_positions, -1)
-        state_present = state_present.reshape(batch_size * window_size, self.writer_max_positions)
-        byte_condition = condition.reshape(batch_size * window_size, -1)
+        length_bucket_logits = self.length_bucket_head(word_hidden)
+        byte_condition = gather_unit_values(condition, query_surface.unit_ids)
+        hidden_states = gather_unit_values(word_hidden, query_surface.unit_ids)
+        pos_ids = query_surface.pos_in_unit.clamp_max(self.max_surface_pieces_per_unit)
+        hidden_states = hidden_states + self.position_embeddings(pos_ids)
         hidden_states = self.dropout(hidden_states)
-        byte_mask = window_mask.unsqueeze(-1).expand(-1, -1, self.writer_max_positions).reshape(
-            batch_size * window_size,
-            self.writer_max_positions,
-        )
+        byte_mask = query_surface.mask & window_mask.gather(1, query_surface.unit_ids.clamp_max(window_size - 1))
+        state_mask = state_present & surface_state.mask & window_mask.gather(1, surface_state.unit_ids.clamp_max(window_size - 1))
+
         if self.gradient_checkpointing and self.training and hidden_states.requires_grad:
             hidden_states = checkpoint(
                 self.byte_state_cross_attention,
                 hidden_states,
                 byte_condition,
                 state_hidden,
-                state_present,
+                state_mask,
+                query_surface.unit_ids,
+                surface_state.unit_ids,
                 byte_mask,
                 use_reentrant=False,
             )
         else:
-            hidden_states = self.byte_state_cross_attention(hidden_states, byte_condition, state_hidden, state_present, byte_mask)
+            hidden_states = self.byte_state_cross_attention(
+                hidden_states,
+                byte_condition,
+                state_hidden,
+                state_mask,
+                query_surface.unit_ids,
+                surface_state.unit_ids,
+                byte_mask,
+            )
         for block in self.blocks:
             if self.gradient_checkpointing and self.training and hidden_states.requires_grad:
-                hidden_states = checkpoint(block, hidden_states, byte_condition, byte_mask, use_reentrant=False)
+                hidden_states = checkpoint(block, hidden_states, byte_condition, query_surface.unit_ids, byte_mask, use_reentrant=False)
             else:
-                hidden_states = block(hidden_states, byte_condition, byte_mask)
+                hidden_states = block(hidden_states, byte_condition, query_surface.unit_ids, byte_mask)
         hidden_states = self.final_norm(hidden_states)
-        token_logits = self.token_head(hidden_states).reshape(
-            batch_size,
-            window_size,
-            self.writer_max_positions,
-            self.writer_vocab_size,
-        )
-        state_valid_logits = self.state_valid_head(hidden_states).squeeze(-1).reshape(
-            batch_size,
-            window_size,
-            self.writer_max_positions,
-        )
-        emit_logits = self.emit_head(hidden_states).squeeze(-1).reshape(
-            batch_size,
-            window_size,
-            self.writer_max_positions,
-        )
-        if squeeze_window:
-            token_logits = token_logits.squeeze(1)
-            state_valid_logits = state_valid_logits.squeeze(1)
-            emit_logits = emit_logits.squeeze(1)
+        token_logits = self.token_head(hidden_states)
+        state_valid_logits = self.state_valid_head(hidden_states).squeeze(-1)
+        emit_logits = self.emit_head(hidden_states).squeeze(-1)
         return DilWriterOutput(
             token_logits=token_logits,
             state_valid_logits=state_valid_logits,
             emit_logits=emit_logits,
+            length_bucket_logits=length_bucket_logits,
+            query_surface=query_surface,
         )
 
     def forward(
         self,
         semantic: torch.Tensor,
-        surface_state: Optional[torch.Tensor] = None,
-        surface_state_mask: Optional[torch.Tensor] = None,
-        frozen_mask: Optional[torch.Tensor] = None,
+        query_surface: Optional[PackedSurface] = None,
+        surface_state: Optional[PackedSurfaceState] = None,
         zone_ids: Optional[torch.Tensor] = None,
         window_mask: Optional[torch.Tensor] = None,
         future_latents: Optional[torch.Tensor] = None,
@@ -430,9 +408,8 @@ class DilConditionalWriter(nn.Module):
     ) -> torch.Tensor:
         return self.transition(
             semantic,
+            query_surface=query_surface,
             surface_state=surface_state,
-            surface_state_mask=surface_state_mask,
-            frozen_mask=frozen_mask,
             zone_ids=zone_ids,
             window_mask=window_mask,
             future_latents=future_latents,
@@ -440,108 +417,116 @@ class DilConditionalWriter(nn.Module):
             position_age=position_age,
         ).token_logits
 
-    @torch.no_grad()
-    def _decode_generated(self, generated: torch.Tensor) -> tuple[torch.LongTensor, torch.Tensor, torch.LongTensor]:
-        stop_hits = generated.eq(self.writer_stop_token_id)
-        has_stop = stop_hits.any(dim=-1)
-        first_stop = stop_hits.float().argmax(dim=-1).long()
-        fallback = torch.full_like(first_stop, self.max_word_bytes)
-        lengths = torch.where(has_stop, first_stop, fallback).clamp_max(self.max_word_bytes)
-        generated = generated[..., : self.max_word_bytes]
-        mask = torch.arange(self.max_word_bytes, device=generated.device).view(
-            *([1] * (generated.dim() - 1)),
-            self.max_word_bytes,
-        ) < lengths.unsqueeze(-1)
-        return generated.masked_fill(~mask, self.pad_token_id), mask, lengths
+    def _bucket_values(self, device: torch.device) -> torch.Tensor:
+        return torch.tensor(self.writer_output_buckets, dtype=torch.long, device=device)
 
     @torch.no_grad()
     def generate(self, semantic: torch.Tensor) -> tuple[torch.LongTensor, torch.Tensor, torch.LongTensor]:
-        token_logits = self.forward(semantic)
-        generated = token_logits.argmax(dim=-1)
-        return self._decode_generated(generated)
+        token_ids, token_mask, lengths, _ = self.generate_window(semantic)
+        if token_ids.shape[1] == 1:
+            return token_ids[:, 0], token_mask[:, 0], lengths[:, 0]
+        return token_ids, token_mask, lengths
+
+    @torch.no_grad()
+    def _promote_missing_stop(
+        self,
+        generated: torch.Tensor,
+        query: PackedSurface,
+        bucket_indices: torch.Tensor,
+        window_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        stop_found = torch.zeros_like(bucket_indices, dtype=torch.bool)
+        for row_idx in range(query.batch_size):
+            for unit_idx in range(query.unit_count):
+                width = int(query.unit_lengths[row_idx, unit_idx].detach().cpu())
+                if width <= 0:
+                    continue
+                start = int(query.unit_offsets[row_idx, unit_idx].detach().cpu())
+                stop_found[row_idx, unit_idx] = bool(generated[row_idx, start : start + width].eq(self.writer_stop_token_id).any().detach().cpu())
+        max_bucket = len(self.writer_output_buckets) - 1
+        promote = (~stop_found) & window_mask & bucket_indices.lt(max_bucket)
+        return torch.where(promote, bucket_indices + 1, bucket_indices), promote
 
     @torch.no_grad()
     def generate_window(
         self,
         semantic: torch.Tensor,
-        surface_state: Optional[torch.Tensor] = None,
-        surface_state_mask: Optional[torch.Tensor] = None,
-        frozen_mask: Optional[torch.Tensor] = None,
+        surface_state: Optional[PackedSurfaceState] = None,
         zone_ids: Optional[torch.Tensor] = None,
         window_mask: Optional[torch.Tensor] = None,
         future_latents: Optional[torch.Tensor] = None,
         refinement_steps: Optional[int] = None,
         position_age: Optional[torch.Tensor] = None,
     ) -> tuple[torch.LongTensor, torch.Tensor, torch.LongTensor, torch.Tensor]:
-        output = self.transition(
-            semantic,
+        semantic_window, _ = self._canonical_semantic(semantic)
+        batch_size, window_size, _ = semantic_window.shape
+        device = semantic_window.device
+        window_mask = self._canonical_window_mask(window_mask, batch_size, window_size, device)
+        probe = self.transition(
+            semantic_window,
             surface_state=surface_state,
-            surface_state_mask=surface_state_mask,
-            frozen_mask=frozen_mask,
             zone_ids=zone_ids,
             window_mask=window_mask,
             future_latents=future_latents,
             position_age=position_age,
         )
+        bucket_indices = probe.length_bucket_logits.argmax(dim=-1).to(dtype=torch.long)
+        max_bucket = len(self.writer_output_buckets) - 1
+        bucket_indices = bucket_indices.clamp(0, max_bucket)
+        bucket_values = self._bucket_values(device)
+        output = probe
+        query = probe.query_surface
         steps = int(self.writer_refinement_steps if refinement_steps is None else refinement_steps)
-        if steps <= 0:
-            raise ValueError("refinement_steps must be > 0")
-        surface_state_base = surface_state
-        surface_state_mask_base = surface_state_mask
-        frozen_mask_base = frozen_mask
-        for step_idx in range(1, steps):
-            generated = output.token_logits.argmax(dim=-1)
-            next_state = generated
-            next_mask = torch.full_like(generated, self.STATE_DRAFT)
-            if surface_state_base is not None:
-                base_state = self._canonical_window_arg(
-                    surface_state_base,
-                    generated.shape[0],
-                    1 if generated.dim() == 2 else generated.shape[1],
-                    torch.long,
-                    generated.device,
-                    -100,
-                )
-                if frozen_mask_base is None:
-                    frozen = torch.zeros_like(generated, dtype=torch.bool)
-                else:
-                    frozen = self._canonical_window_arg(
-                        frozen_mask_base,
-                        generated.shape[0],
-                        1 if generated.dim() == 2 else generated.shape[1],
-                        torch.bool,
-                        generated.device,
-                        False,
-                    )
-                next_state = torch.where(frozen, base_state, next_state)
-                if surface_state_mask_base is not None:
-                    base_mask = self._canonical_window_arg(
-                        surface_state_mask_base,
-                        generated.shape[0],
-                        1 if generated.dim() == 2 else generated.shape[1],
-                        torch.long,
-                        generated.device,
-                        self.STATE_EMPTY,
-                    )
-                    next_mask = torch.where(frozen, base_mask, next_mask)
-                else:
-                    next_mask = torch.where(
-                        frozen,
-                        torch.full_like(next_mask, self.STATE_KNOWN),
-                        next_mask,
-                    )
+        for step_idx in range(steps):
+            query_lengths = torch.where(window_mask, bucket_values[bucket_indices], torch.zeros_like(bucket_indices))
+            query = writer_query_from_lengths(
+                query_lengths,
+                pad_token_id=self.pad_token_id,
+                surface_bucket_sizes=self.surface_bucket_sizes,
+            )
             output = self.transition(
-                semantic,
-                surface_state=next_state,
-                surface_state_mask=next_mask,
-                frozen_mask=frozen_mask,
+                semantic_window,
+                query_surface=query,
+                surface_state=surface_state,
                 zone_ids=zone_ids,
                 window_mask=window_mask,
                 future_latents=future_latents,
-                refinement_step=step_idx,
+                refinement_step=step_idx if step_idx > 0 else None,
                 position_age=position_age,
             )
+            generated = output.token_logits.argmax(dim=-1)
+            next_bucket_indices, promoted = self._promote_missing_stop(generated, query, bucket_indices, window_mask)
+            if not bool(promoted.any().detach().cpu()):
+                if step_idx + 1 >= steps:
+                    break
+                token_ids, token_masks, _ = generated_unit_tensors(
+                    generated,
+                    query,
+                    stop_token_id=self.writer_stop_token_id,
+                    pad_token_id=self.pad_token_id,
+                )
+                surface_state = merge_frozen_state(
+                    empty_surface_state(query, self.writer_empty_token_id),
+                    output.token_logits.argmax(dim=-1),
+                    query.mask,
+                )
+                continue
+            bucket_indices = next_bucket_indices
         generated = output.token_logits.argmax(dim=-1)
-        token_ids, token_mask, lengths = self._decode_generated(generated)
-        commit_scores = torch.sigmoid(output.emit_logits.float() / float(self.commit_temperature))
+        token_ids, token_mask, lengths = generated_unit_tensors(
+            generated,
+            query,
+            stop_token_id=self.writer_stop_token_id,
+            pad_token_id=self.pad_token_id,
+        )
+        packed_commit_scores = torch.sigmoid(output.emit_logits.float() / float(self.commit_temperature))
+        commit_width = int(query.unit_lengths.max().detach().cpu().item())
+        commit_scores = packed_commit_scores.new_zeros((query.batch_size, query.unit_count, max(commit_width, 1)))
+        for row_idx in range(query.batch_size):
+            for unit_idx in range(query.unit_count):
+                width = int(query.unit_lengths[row_idx, unit_idx].detach().cpu())
+                if width <= 0:
+                    continue
+                start = int(query.unit_offsets[row_idx, unit_idx].detach().cpu())
+                commit_scores[row_idx, unit_idx, :width] = packed_commit_scores[row_idx, start : start + width]
         return token_ids, token_mask, lengths, commit_scores

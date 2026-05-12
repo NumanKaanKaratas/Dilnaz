@@ -153,7 +153,7 @@ Tokenizer şunları sağlar:
 - sık yüzey biçimleri için compact surface pieces
 - boundary-aware decoding için leading-space varyantları
 - numeric, punctuation, common-word, contextual ve character parçaları
-- `max_word_bytes` ile fixed-width segment tensorları
+- `dilnaz.surface` üzerinden packed variable-length surface tensorları
 - Türkçe metin, digit, punctuation ve JSONL newline escape roundtrip testleri
 
 Varsayılan vocabulary:

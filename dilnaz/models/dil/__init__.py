@@ -1,7 +1,7 @@
 from ..common.latents import angular_noise_like, normalize_semantic_latents, semantic_unit_latents
 from ..common.norms import DilRMSNorm
 from .configuration import DilConfig
-from .encoder import DilByteConvStem, DilEncoderCore
+from .encoder import DilEncoderCore, DilPackedSurfaceStem
 from .layers import DilGatedMLP
 from .model import Dil
 from .outputs import DilOutput
@@ -11,9 +11,9 @@ __all__ = [
     "Dil",
     "DilConfig",
     "DilConditionalWriter",
-    "DilByteConvStem",
     "DilEncoderCore",
     "DilGatedMLP",
+    "DilPackedSurfaceStem",
     "DilOutput",
     "DilRMSNorm",
     "DilWriterOutput",

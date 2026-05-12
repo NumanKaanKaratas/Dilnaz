@@ -4,6 +4,7 @@ import argparse
 import shutil
 import tempfile
 import time
+from pathlib import Path
 
 import torch
 
@@ -27,7 +28,7 @@ def make_dil_config(args) -> DilConfig:
         intermediate_size=args.dil_intermediate_size,
         num_encoder_layers=args.dil_layers,
         latent_size=args.latent_size,
-        max_word_bytes=args.max_word_bytes,
+        max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         context_radius=args.context_radius,
         dil_dropout=0.0,
     )
@@ -39,7 +40,6 @@ def make_naz_config(args, dil_path: Path) -> NazConfig:
         vocab_size=args.vocab_size,
         pad_token_id=0,
         eos_token_id=1,
-        max_word_bytes=args.max_word_bytes,
         latent_size=args.latent_size,
         hidden_size=args.naz_hidden_size,
         intermediate_size=args.naz_intermediate_size,
@@ -76,56 +76,9 @@ def save_frozen_dil_checkpoint(dil_config: DilConfig, path: Path) -> None:
 
 
 def synthetic_batch(args, device: torch.device) -> dict[str, torch.Tensor]:
-    extended_length = args.seq + args.horizons
-    ids = torch.full(
-        (args.batch_size, extended_length, args.max_word_bytes),
-        0,
-        dtype=torch.long,
-        device=device,
-    )
-    lengths = torch.randint(
-        1,
-        min(args.max_word_bytes, 8) + 1,
-        (args.batch_size, extended_length),
-        dtype=torch.long,
-        device=device,
-    )
-    random_ids = torch.randint(
-        2,
-        args.vocab_size,
-        ids.shape,
-        dtype=torch.long,
-        device=device,
-    )
-    positions = torch.arange(args.max_word_bytes, device=device).view(1, 1, -1)
-    masks = positions < lengths.unsqueeze(-1)
-    ids[masks] = random_ids[masks]
-
-    horizon_positions = (
-        torch.arange(args.seq, device=device).view(1, args.seq, 1)
-        + torch.arange(1, args.horizons + 1, device=device).view(1, 1, args.horizons)
-    )
-    target_input_ids = ids.gather(
-        dim=1,
-        index=horizon_positions.reshape(1, args.seq * args.horizons, 1).expand(
-            args.batch_size,
-            -1,
-            args.max_word_bytes,
-        ),
-    ).reshape(args.batch_size, args.seq, args.horizons, args.max_word_bytes)
-    target_word_masks = masks.gather(
-        dim=1,
-        index=horizon_positions.reshape(1, args.seq * args.horizons, 1).expand(
-            args.batch_size,
-            -1,
-            args.max_word_bytes,
-        ),
-    ).reshape(args.batch_size, args.seq, args.horizons, args.max_word_bytes)
     return {
-        "input_ids": ids[:, : args.seq],
-        "word_masks": masks[:, : args.seq],
-        "target_input_ids": target_input_ids,
-        "target_word_masks": target_word_masks,
+        "semantic_states": torch.randn(args.batch_size, args.seq, args.latent_size, device=device),
+        "target_latents": torch.randn(args.batch_size, args.seq, args.horizons, args.latent_size, device=device),
         "unit_mask": torch.ones(args.batch_size, args.seq, dtype=torch.bool, device=device),
         "target_mask": torch.ones(args.batch_size, args.seq, args.horizons, dtype=torch.bool, device=device),
     }
@@ -180,7 +133,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--vocab-size", type=int, default=778)
-    parser.add_argument("--max-word-bytes", type=int, default=32)
+    parser.add_argument("--max-surface-pieces-per-unit", type=int, default=256)
     parser.add_argument("--context-radius", type=int, default=2)
     parser.add_argument("--latent-size", type=int, default=512)
     parser.add_argument("--dil-hidden-size", type=int, default=512)

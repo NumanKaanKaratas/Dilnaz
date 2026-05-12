@@ -33,6 +33,8 @@ from dilnaz.train.data.dil_data import (
     stream_teacher_text_items,
     trainable_segments,
 )
+from dilnaz.surface import PackedSurfaceState, pack_context_segments, pack_writer_targets, synthetic_state_from_targets, merge_frozen_state, empty_surface_state
+from dilnaz.surface.state import STATE_DRAFT, STATE_KNOWN
 from dilnaz.train.configs.defaults import DIL_TRAIN_DEFAULTS
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.naz import NazConfig
@@ -46,6 +48,7 @@ WRITER_OBJECTIVE = "block_diffusion_writer_v1"
 WRITER_METRIC_KEYS = (
     "loss",
     "token_loss",
+    "length_bucket_loss",
     "active_token_loss",
     "right_guard_token_loss",
     "left_consistency_loss",
@@ -124,63 +127,55 @@ class HybridDilSlidingWindowDataset(IterableDataset):
         self._carry_refs: list[tuple[int, int]] = []
         self._produced = 0
 
-    def write_segment(self, target: np.ndarray, mask: np.ndarray, context_idx: int, segment):
-        piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
-        width = piece_ids.shape[0]
-        if width <= 0 or width > self.config.max_word_bytes:
-            return
-        target[context_idx, :width] = piece_ids
-        mask[context_idx, :width] = True
-
     def make_batch(self, texts: list[str], line_ids: list[int], segments_by_text: list, refs: list[tuple[int, int]]):
         batch_size = len(refs)
-        input_ids = np.full(
-            (batch_size, self.window_size, self.config.context_size, self.config.max_word_bytes),
-            self.config.pad_token_id,
-            dtype=np.int64,
-        )
-        word_masks = np.zeros(
-            (batch_size, self.window_size, self.config.context_size, self.config.max_word_bytes),
-            dtype=np.bool_,
-        )
-        labels = np.full(
-            (batch_size, self.window_size, self.config.writer_max_positions),
-            -100,
-            dtype=np.int64,
-        )
-        window_mask = np.zeros((batch_size, self.window_size), dtype=np.bool_)
-        source_line_ids = np.zeros((batch_size,), dtype=np.int64)
+        context_rows = []
+        target_rows = []
+        window_mask = torch.zeros((batch_size, self.window_size), dtype=torch.bool)
+        source_line_ids = torch.zeros((batch_size,), dtype=torch.long)
 
         for batch_idx, (text_idx, active_start) in enumerate(refs):
             segments = segments_by_text[text_idx]
-            source_line_ids[batch_idx] = line_ids[text_idx]
+            source_line_ids[batch_idx] = int(line_ids[text_idx])
             window_start = active_start - self.left_frozen
+            target_row: list[list[int]] = []
             for window_idx in range(self.window_size):
                 token_idx = window_start + window_idx
                 if token_idx < 0 or token_idx >= len(segments):
+                    context_rows.append([None for _ in context_offsets(self.config.context_radius)])
+                    target_row.append([])
                     continue
                 window_mask[batch_idx, window_idx] = True
                 segment = segments[token_idx]
+                context_row = []
                 for context_idx, offset in enumerate(context_offsets(self.config.context_radius)):
                     source_idx = token_idx + offset
                     if 0 <= source_idx < len(segments):
-                        self.write_segment(
-                            input_ids[batch_idx, window_idx],
-                            word_masks[batch_idx, window_idx],
-                            context_idx,
-                            segments[source_idx],
-                        )
-                piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
-                labels[batch_idx, window_idx, : piece_ids.shape[0]] = piece_ids
-                labels[batch_idx, window_idx, piece_ids.shape[0]] = self.config.writer_stop_token_id
+                        context_row.append(segments[source_idx])
+                    else:
+                        context_row.append(None)
+                context_rows.append(context_row)
+                target_row.append(segment_piece_ids(segment))
+            target_rows.append(target_row)
 
         return {
-            "input_ids": torch.from_numpy(input_ids),
-            "word_masks": torch.from_numpy(word_masks),
-            "labels": torch.from_numpy(labels),
+            "surface": pack_context_segments(
+                context_rows,
+                pad_token_id=self.config.pad_token_id,
+                bucket_sizes=self.config.surface_bucket_sizes,
+                max_pieces_per_unit=self.config.max_surface_pieces_per_unit,
+            ),
+            "labels": pack_writer_targets(
+                target_rows,
+                pad_token_id=self.config.pad_token_id,
+                stop_token_id=self.config.writer_stop_token_id,
+                writer_output_buckets=self.config.writer_output_buckets,
+                surface_bucket_sizes=self.config.surface_bucket_sizes,
+                max_pieces_per_unit=self.config.max_surface_pieces_per_unit,
+            ),
             "zone_ids": self.zone_template.unsqueeze(0).expand(batch_size, -1).clone(),
-            "window_mask": torch.from_numpy(window_mask),
-            "source_line_ids": torch.from_numpy(source_line_ids),
+            "window_mask": window_mask,
+            "source_line_ids": source_line_ids,
         }
 
     def carry_batch(self):
@@ -206,7 +201,7 @@ class HybridDilSlidingWindowDataset(IterableDataset):
         for text_idx, (source_line_id, text) in enumerate(stream_teacher_text_items(self.train_file, self.read_chars)):
             if text_idx % worker_count != worker_id:
                 continue
-            segments = trainable_segments(self.tokenizer, text, self.config.max_word_bytes)
+            segments = trainable_segments(self.tokenizer, text, self.config.max_surface_pieces_per_unit)
             if not segments:
                 continue
             local_text_idx = len(texts)
@@ -289,38 +284,12 @@ def sample_diffusion_step(config: DilConfig, device: torch.device, training_step
     return step, mask_ratio
 
 
-def synthetic_surface_state(
-    config: DilConfig,
-    labels: torch.Tensor,
-    zone_ids: torch.Tensor,
-    window_mask: torch.Tensor,
-    mask_ratio: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    device = labels.device
-    valid = labels.ne(-100) & window_mask.unsqueeze(-1)
-    left = zone_ids.eq(0).unsqueeze(-1) & valid
-    surface_state = torch.full_like(labels, -100)
-    surface_state_mask = torch.zeros_like(labels)
-    frozen_mask = torch.zeros_like(labels, dtype=torch.bool)
-
-    target_scope = valid & ~left
-    draft_ratio = min(config.writer_state_corruption_max_ratio, max(0.0, 1.0 - mask_ratio))
-    draft = target_scope & torch.rand(labels.shape, device=device).lt(draft_ratio)
-    random_tokens = torch.randint(config.writer_vocab_size, labels.shape, device=device, dtype=torch.long)
-    surface_state[draft] = random_tokens[draft]
-    surface_state[left] = labels[left]
-    surface_state_mask[draft] = 1
-    surface_state_mask[left] = 2
-    frozen_mask[left] = True
-    return surface_state, surface_state_mask, frozen_mask
-
-
-def synthetic_position_age(config: DilConfig, labels: torch.Tensor, zone_ids: torch.Tensor, window_mask: torch.Tensor) -> torch.Tensor:
-    valid_words = labels.ne(-100).any(dim=-1) & window_mask
+def synthetic_position_age(config: DilConfig, target, zone_ids: torch.Tensor, window_mask: torch.Tensor) -> torch.Tensor:
+    valid_words = target.true_lengths.to(window_mask.device).gt(0) & window_mask
     active = zone_ids.eq(1) & valid_words
     left = zone_ids.eq(0) & valid_words
-    age = torch.zeros(zone_ids.shape, device=labels.device, dtype=torch.long)
-    random_age = torch.randint(config.writer_max_position_age + 1, zone_ids.shape, device=labels.device, dtype=torch.long)
+    age = torch.zeros(zone_ids.shape, device=window_mask.device, dtype=torch.long)
+    random_age = torch.randint(config.writer_max_position_age + 1, zone_ids.shape, device=window_mask.device, dtype=torch.long)
     age = torch.where(active, random_age, age)
     age = torch.where(left, torch.full_like(age, config.writer_max_position_age), age)
     return age
@@ -330,26 +299,37 @@ def synthetic_position_age(config: DilConfig, labels: torch.Tensor, zone_ids: to
 def self_conditioned_surface_state(
     model: Dil,
     semantic: torch.Tensor,
-    labels: torch.Tensor,
+    target,
     zone_ids: torch.Tensor,
     window_mask: torch.Tensor,
     future_latents: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> PackedSurfaceState:
     output = model.writer_transition_outputs(
         semantic,
+        query_surface=target.query,
         zone_ids=zone_ids,
         window_mask=window_mask,
         future_latents=future_latents,
     )
-    valid = labels.ne(-100) & window_mask.unsqueeze(-1)
-    left = zone_ids.eq(0).unsqueeze(-1) & valid
-    surface_state = output.token_logits.argmax(dim=-1).masked_fill(~valid, -100)
-    surface_state[left] = labels[left]
-    surface_state_mask = torch.where(valid, torch.ones_like(labels), torch.zeros_like(labels))
-    surface_state_mask[left] = 2
-    frozen_mask = torch.zeros_like(labels, dtype=torch.bool)
-    frozen_mask[left] = True
-    return surface_state, surface_state_mask, frozen_mask
+    generated = output.token_logits.argmax(dim=-1)
+    zone_per_pos = zone_ids.gather(1, target.query.unit_ids.clamp_max(zone_ids.shape[1] - 1))
+    window_per_pos = window_mask.gather(1, target.query.unit_ids.clamp_max(window_mask.shape[1] - 1))
+    valid = target.label_mask & window_per_pos
+    left = zone_per_pos.eq(0) & valid
+    ids = torch.where(left, target.labels, generated)
+    state_kind = torch.where(left, torch.full_like(target.labels, STATE_KNOWN), torch.full_like(target.labels, STATE_DRAFT))
+    state_kind = torch.where(valid, state_kind, torch.zeros_like(state_kind))
+    return PackedSurfaceState(
+        ids=ids,
+        state_kind=state_kind,
+        frozen=left,
+        mask=valid,
+        unit_ids=target.query.unit_ids,
+        pos_in_unit=target.query.pos_in_unit,
+        unit_lengths=target.query.unit_lengths,
+        unit_offsets=target.query.unit_offsets,
+        unit_mask=target.query.unit_mask,
+    )
 
 
 def sliding_future_latents(semantic: torch.Tensor, window_mask: torch.Tensor, horizons: int) -> torch.Tensor | None:
@@ -457,20 +437,16 @@ def sliding_writer_metrics(
     future_predictor: Naz | None = None,
     future_latent_mode: str = "curriculum",
 ) -> dict[str, torch.Tensor]:
-    input_ids = batch["input_ids"]
-    labels = batch["labels"].to(input_ids.device)
-    word_masks = batch["word_masks"]
-    zone_ids = batch["zone_ids"].to(input_ids.device)
-    window_mask = batch["window_mask"].to(input_ids.device, dtype=torch.bool)
-    batch_size, window_size, context_size, byte_width = input_ids.shape
+    surface = batch["surface"]
+    labels = batch["labels"].to(surface.ids.device)
+    zone_ids = batch["zone_ids"].to(surface.ids.device)
+    window_mask = batch["window_mask"].to(surface.ids.device, dtype=torch.bool)
+    batch_size, window_size = window_mask.shape
     with torch.no_grad():
-        flat_semantic = model.encode(
-            input_ids.reshape(batch_size * window_size, context_size, byte_width),
-            word_masks.reshape(batch_size * window_size, context_size, byte_width),
-        ).float()
+        flat_semantic = model.encode(surface).float()
         semantic = flat_semantic.reshape(batch_size, window_size, -1)
 
-    diffusion_step, mask_ratio = sample_diffusion_step(model.config, input_ids.device, training_step)
+    diffusion_step, mask_ratio = sample_diffusion_step(model.config, surface.ids.device, training_step)
     true_future_latents = None
     if use_future_latents:
         true_future_latents = sliding_future_latents(
@@ -496,10 +472,10 @@ def sliding_writer_metrics(
     self_conditioned = (
         use_persistent_state
         and model.training
-        and torch.rand((), device=input_ids.device).item() < probability
+        and torch.rand((), device=surface.ids.device).item() < probability
     )
     if self_conditioned:
-        surface_state, surface_state_mask, frozen_mask = self_conditioned_surface_state(
+        surface_state = self_conditioned_surface_state(
             model,
             semantic,
             labels,
@@ -508,24 +484,22 @@ def sliding_writer_metrics(
             future_latents=future_latents,
         )
     else:
-        surface_state, surface_state_mask, frozen_mask = synthetic_surface_state(
-            model.config,
+        surface_state = synthetic_state_from_targets(
             labels,
-            zone_ids,
-            window_mask,
-            mask_ratio,
+            zone_ids=zone_ids,
+            window_mask=window_mask,
+            empty_token_id=model.config.writer_empty_token_id,
+            vocab_size=model.config.writer_vocab_size,
+            mask_ratio=mask_ratio,
+            draft_max_ratio=model.config.writer_state_corruption_max_ratio,
         )
         if not use_persistent_state:
-            surface_state = torch.full_like(labels, -100)
-            surface_state_mask = torch.zeros_like(labels)
-            frozen_mask = torch.zeros_like(labels, dtype=torch.bool)
+            surface_state = empty_surface_state(labels.query, model.config.writer_empty_token_id)
     position_age = synthetic_position_age(model.config, labels, zone_ids, window_mask)
     metrics = model.writer_transition_loss_and_metrics(
         semantic.detach(),
         labels,
         surface_state,
-        surface_state_mask,
-        frozen_mask,
         zone_ids,
         window_mask,
         future_latents=future_latents,
@@ -534,9 +508,10 @@ def sliding_writer_metrics(
         training_step=training_step,
         return_metrics=True,
     )
-    valid = labels.ne(-100) & window_mask.unsqueeze(-1)
-    filled = surface_state_mask.gt(0) & valid
-    state_present = filled & surface_state.ge(0)
+    window_per_pos = window_mask.gather(1, labels.query.unit_ids.clamp_max(window_mask.shape[1] - 1))
+    valid = labels.label_mask & window_per_pos
+    filled = surface_state.state_kind.gt(0) & valid
+    state_present = filled & surface_state.mask
     denom = valid.sum().clamp_min(1).to(metrics["loss"].dtype)
     metrics["self_conditioning_ratio"] = metrics["loss"].new_tensor(float(self_conditioned))
     metrics["mean_mask_ratio"] = 1.0 - filled.sum().to(metrics["loss"].dtype) / denom
@@ -545,9 +520,9 @@ def sliding_writer_metrics(
     metrics["diffusion_step"] = metrics["loss"].new_tensor(float(diffusion_step))
     metrics["diffusion_mask_ratio"] = metrics["loss"].new_tensor(float(mask_ratio))
     metrics["empty_ratio"] = 1.0 - state_present.sum().to(metrics["loss"].dtype) / denom
-    metrics["draft_ratio"] = (state_present & surface_state_mask.eq(1)).sum().to(metrics["loss"].dtype) / denom
-    metrics["known_ratio"] = (state_present & surface_state_mask.eq(2)).sum().to(metrics["loss"].dtype) / denom
-    metrics["frozen_ratio"] = (state_present & frozen_mask).sum().to(metrics["loss"].dtype) / denom
+    metrics["draft_ratio"] = (state_present & surface_state.state_kind.eq(STATE_DRAFT)).sum().to(metrics["loss"].dtype) / denom
+    metrics["known_ratio"] = (state_present & surface_state.state_kind.eq(STATE_KNOWN)).sum().to(metrics["loss"].dtype) / denom
+    metrics["frozen_ratio"] = (state_present & surface_state.frozen).sum().to(metrics["loss"].dtype) / denom
     return metrics
 
 
@@ -560,7 +535,7 @@ def writer_only_metrics(
     future_predictor: Naz | None = None,
     future_latent_mode: str = "curriculum",
 ) -> dict[str, torch.Tensor]:
-    if batch["input_ids"].dim() == 4:
+    if "window_mask" in batch:
         return sliding_writer_metrics(
             model,
             batch,
@@ -570,9 +545,9 @@ def writer_only_metrics(
             future_predictor=future_predictor,
             future_latent_mode=future_latent_mode,
         )
-    labels = batch["labels"].to(batch["input_ids"].device)
+    labels = batch["labels"].to(batch["surface"].ids.device)
     loss, token_loss, byte_acc, token_exact, stop_acc = model.writer_loss_and_metrics(
-        model.encode(batch["input_ids"], batch["word_masks"]).detach(),
+        model.encode(batch["surface"]).detach(),
         labels,
         training_step=training_step,
     )
@@ -580,6 +555,7 @@ def writer_only_metrics(
     return {
         "loss": loss,
         "token_loss": token_loss,
+        "length_bucket_loss": loss - token_loss,
         "active_token_loss": token_loss,
         "right_guard_token_loss": zero,
         "left_consistency_loss": zero,
@@ -624,9 +600,9 @@ def writer_only_forward(model: Dil, batch: dict, training_step: int | None = Non
 def materialize_writer_batches(dataset, device: torch.device, batch_size: int, seed: int):
     batches = [
         {
-            key: value.detach().cpu()
+            key: value.detach().cpu() if hasattr(value, "detach") else value
             for key, value in batch.items()
-            if key in ("input_ids", "word_masks", "labels", "source_line_ids", "zone_ids", "window_mask")
+            if key in ("surface", "labels", "source_line_ids", "zone_ids", "window_mask")
         }
         for batch in dataset.iter_once(worker_id=0, worker_count=1)
     ]
@@ -634,9 +610,9 @@ def materialize_writer_batches(dataset, device: torch.device, batch_size: int, s
     if carry_batch is not None:
         batches.append(
             {
-                key: value.detach().cpu()
+                key: value.detach().cpu() if hasattr(value, "detach") else value
                 for key, value in carry_batch.items()
-                if key in ("input_ids", "word_masks", "labels", "source_line_ids", "zone_ids", "window_mask")
+                if key in ("surface", "labels", "source_line_ids", "zone_ids", "window_mask")
             }
         )
     return ResidentDilBatcher(batches, batch_size=batch_size, device=device, seed=seed)
@@ -669,7 +645,7 @@ def save_checkpoint(
         "vocab_size": config.vocab_size,
         "pad_token_id": config.pad_token_id,
         "eos_token_id": config.eos_token_id,
-        "max_word_bytes": config.max_word_bytes,
+        "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
         "context_radius": config.context_radius,
         "target_index": config.target_index,
         "latent_size": config.latent_size,
@@ -1217,9 +1193,9 @@ def main():
             compute_seconds += time.perf_counter() - compute_start
             completed_step = step
 
-            real_tokens = int(batch["labels"].ne(-100).sum().detach().cpu())
+            real_tokens = int(batch["labels"].label_mask.sum().detach().cpu())
             log_tokens += real_tokens
-            log_windows += int(batch["labels"].shape[0])
+            log_windows += int(batch["labels"].true_lengths.gt(0).sum().detach().cpu())
             log_steps += 1
             if "source_line_ids" in batch:
                 source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())

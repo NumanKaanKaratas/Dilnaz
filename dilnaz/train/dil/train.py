@@ -25,11 +25,8 @@ from dilnaz.train.common.runtime import (
 from dilnaz.train.data.dil_data import (
     HybridDilBatchDataset,
     NllbTeacher,
-    ReadyParquetDilBatchDataset,
     ResidentDilBatcher,
     ResidentDilEvalLoader,
-    ResidentReadyParquetBatcher,
-    validate_dilnaz_ready_parquet,
     load_hybrid_tokenizer,
     make_dil_batch_loader,
 )
@@ -98,7 +95,7 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "vocab_size": config.vocab_size,
         "pad_token_id": config.pad_token_id,
         "eos_token_id": config.eos_token_id,
-        "max_word_bytes": config.max_word_bytes,
+        "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
         "context_radius": config.context_radius,
         "target_index": config.target_index,
         "latent_size": config.latent_size,
@@ -189,8 +186,7 @@ def is_dataloader_worker_exit(error: RuntimeError) -> bool:
 
 def model_inputs(batch: dict) -> dict:
     return {
-        "input_ids": batch["input_ids"],
-        "word_masks": batch["word_masks"],
+        "surface": batch["surface"],
         "labels": batch["labels"],
         "teacher_layers": batch["teacher_layers"],
         "teacher_mask": batch["teacher_mask"],
@@ -329,7 +325,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--num-encoder-layers", type=int, default=DIL_MODEL_DEFAULTS["num_encoder_layers"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
-    parser.add_argument("--max-word-bytes", type=int, default=DIL_MODEL_DEFAULTS["max_word_bytes"])
+    parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--context-radius", type=int, default=DIL_MODEL_DEFAULTS["context_radius"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -391,7 +387,7 @@ def validate_args(args):
         raise ValueError("--max-samples is not supported with --data-mode resident")
 
 def is_parquet_path(path: Path | None) -> bool:
-    return path is not None and path.suffix.casefold() == ".parquet"
+    return False
 
 
 def build_config(args, tokenizer):
@@ -405,7 +401,7 @@ def build_config(args, tokenizer):
         intermediate_size=args.intermediate_size,
         num_encoder_layers=args.num_encoder_layers,
         latent_size=args.latent_size,
-        max_word_bytes=args.max_word_bytes,
+        max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         context_radius=args.context_radius,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -479,10 +475,10 @@ class DilBaseTrainer(BaseTrainer):
         return args.resume.parent / resume_config.tokenizer_vocab_file
 
     def validate_data_contracts(self) -> None:
-        if self.train_is_parquet:
-            validate_dilnaz_ready_parquet(self.args.train_file, self.config, self.tokenizer_vocab_path)
-        if self.eval_is_parquet:
-            validate_dilnaz_ready_parquet(self.args.eval_file, self.config, self.tokenizer_vocab_path)
+        if self.args.train_file.suffix.casefold() == ".parquet":
+            raise ValueError("fixed surface parquet caches are not part of the packed surface training contract")
+        if self.args.eval_file is not None and self.args.eval_file.suffix.casefold() == ".parquet":
+            raise ValueError("fixed surface parquet caches are not part of the packed surface training contract")
 
     def build_teacher(self):
         needs_online_teacher = not self.train_is_parquet or (self.args.eval_file is not None and not self.eval_is_parquet)
@@ -497,14 +493,6 @@ class DilBaseTrainer(BaseTrainer):
         )
 
     def make_train_dataset(self):
-        if self.train_is_parquet:
-            return ReadyParquetDilBatchDataset(
-                self.args.train_file,
-                self.config,
-                batch_size=self.args.batch_size,
-                repeat=True,
-                max_samples=self.args.max_samples,
-            )
         return HybridDilBatchDataset(
             self.args.train_file,
             self.config,
@@ -520,13 +508,6 @@ class DilBaseTrainer(BaseTrainer):
     def make_eval_dataset(self):
         if self.args.eval_every <= 0:
             return None
-        if self.eval_is_parquet:
-            return ReadyParquetDilBatchDataset(
-                self.args.eval_file,
-                self.config,
-                batch_size=self.args.eval_batch_size,
-                repeat=False,
-            )
         return HybridDilBatchDataset(
             self.args.eval_file,
             self.config,
@@ -548,40 +529,24 @@ class DilBaseTrainer(BaseTrainer):
 
     def prepare_resident_sources(self, train_dataset, eval_dataset) -> None:
         print("resident_data_prepare_start=1", flush=True)
-        if self.train_is_parquet:
-            self.train_iterator = ResidentReadyParquetBatcher.from_dataset(
-                train_dataset,
-                self.args.batch_size,
-                self.device,
-                self.args.seed + self.start_step,
-            )
-        else:
-            self.train_iterator = ResidentDilBatcher.from_dataset(
-                train_dataset,
-                self.teacher,
-                self.args.batch_size,
-                self.device,
-                self.args.seed + self.start_step,
-            )
+        self.train_iterator = ResidentDilBatcher.from_dataset(
+            train_dataset,
+            self.teacher,
+            self.args.batch_size,
+            self.device,
+            self.args.seed + self.start_step,
+        )
         print(f"resident_data_prepare_done=1 batches={len(self.train_iterator.batches)}", flush=True)
         if eval_dataset is None:
             return
         print("resident_eval_prepare_start=1", flush=True)
-        if self.eval_is_parquet:
-            eval_batcher = ResidentReadyParquetBatcher.from_dataset(
-                eval_dataset,
-                self.args.eval_batch_size,
-                self.device,
-                self.args.seed + 1,
-            )
-        else:
-            eval_batcher = ResidentDilBatcher.from_dataset(
-                eval_dataset,
-                self.teacher,
-                self.args.eval_batch_size,
-                self.device,
-                self.args.seed + 1,
-            )
+        eval_batcher = ResidentDilBatcher.from_dataset(
+            eval_dataset,
+            self.teacher,
+            self.args.eval_batch_size,
+            self.device,
+            self.args.seed + 1,
+        )
         self.eval_loader = ResidentDilEvalLoader(eval_batcher)
         print(f"resident_eval_prepare_done=1 batches={len(self.eval_loader.batches)}", flush=True)
 
@@ -654,8 +619,8 @@ class DilBaseTrainer(BaseTrainer):
         return StepResult(
             loss=outputs.loss,
             outputs=outputs,
-            token_count=int(batch["labels"].ne(-100).sum().detach().cpu()),
-            window_count=int(batch["labels"].shape[0]),
+            token_count=int(batch["labels"].label_mask.sum().detach().cpu()),
+            window_count=int(batch["labels"].true_lengths.gt(0).sum().detach().cpu()),
             batch=batch,
         )
 
@@ -665,8 +630,8 @@ class DilBaseTrainer(BaseTrainer):
         return StepResult(
             loss=outputs.loss,
             outputs=outputs,
-            token_count=int(batch["labels"].ne(-100).sum().detach().cpu()),
-            window_count=int(batch["labels"].shape[0]),
+            token_count=int(batch["labels"].label_mask.sum().detach().cpu()),
+            window_count=int(batch["labels"].true_lengths.gt(0).sum().detach().cpu()),
             batch=batch,
         )
 

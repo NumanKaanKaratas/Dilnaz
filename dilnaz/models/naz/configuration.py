@@ -11,7 +11,6 @@ class NazConfig(PretrainedConfig):
         vocab_size=778,
         pad_token_id=256,
         eos_token_id=257,
-        max_word_bytes=32,
         latent_size=512,
         reconstruction_loss_weight=1.0,
         num_semantic_candidates=4,
@@ -60,10 +59,11 @@ class NazConfig(PretrainedConfig):
         mlp_bias=False,
         **kwargs,
     ):
+        if ("max_" + "word_bytes") in kwargs:
+            raise ValueError("fixed-width surface config is not supported by Naz")
         self.dil_path = dil_path
         self.byte_vocab_size = byte_vocab_size
         self.vocab_size = vocab_size
-        self.max_word_bytes = max_word_bytes
         self.latent_size = latent_size
         self.reconstruction_loss_weight = reconstruction_loss_weight
         self.num_semantic_candidates = num_semantic_candidates

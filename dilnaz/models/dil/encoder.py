@@ -1,17 +1,20 @@
 import torch
 from torch import nn
 
+from dilnaz.surface import PackedSurface
+from dilnaz.surface.ops import scatter_softmax_by_unit
+
 from ..common.norms import DilRMSNorm
-from .layers import DilConvSwiGLUBlock, DilLayer
+from .layers import DilLayer, DilPackedConvSwiGLUBlock
 
 
-class DilByteConvStem(nn.Module):
+class DilPackedSurfaceStem(nn.Module):
     def __init__(self, config):
         super().__init__()
         intermediate_size = config.hidden_size * config.byte_conv_expansion
         self.layers = nn.ModuleList(
             [
-                DilConvSwiGLUBlock(
+                DilPackedConvSwiGLUBlock(
                     config.hidden_size,
                     intermediate_size,
                     config.byte_conv_kernel_size,
@@ -23,13 +26,10 @@ class DilByteConvStem(nn.Module):
             ]
         )
 
-    def forward(self, hidden_states: torch.Tensor, word_masks: torch.Tensor) -> torch.Tensor:
-        batch_size, context_size, byte_width, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.reshape(batch_size * context_size, byte_width, hidden_size)
-        masks = word_masks.reshape(batch_size * context_size, byte_width)
+    def forward(self, hidden_states: torch.Tensor, surface: PackedSurface) -> torch.Tensor:
         for layer in self.layers:
-            hidden_states = layer(hidden_states, masks)
-        return hidden_states.reshape(batch_size, context_size, byte_width, hidden_size)
+            hidden_states = layer(hidden_states, surface.unit_ids, surface.mask)
+        return hidden_states
 
 
 def dil_context_attention_heads(hidden_size: int) -> int:
@@ -39,7 +39,6 @@ def dil_context_attention_heads(hidden_size: int) -> int:
 class DilEncoderCore(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.max_word_bytes = config.max_word_bytes
         self.context_size = config.context_size
         self.target_index = config.target_index
         self.latent_size = config.latent_size
@@ -47,7 +46,7 @@ class DilEncoderCore(nn.Module):
         self.context_head_dim = config.hidden_size // self.context_attention_heads
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.byte_stem = DilByteConvStem(config)
+        self.surface_stem = DilPackedSurfaceStem(config)
         self.encoder_layers = nn.ModuleList([DilLayer(config) for _ in range(config.num_encoder_layers)])
         self.num_stage_layers = config.num_encoder_layers // 2
         self.pool_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -66,20 +65,19 @@ class DilEncoderCore(nn.Module):
         indices = torch.arange(config.context_size)
         self.register_buffer("context_indices", indices[indices != self.target_index], persistent=False)
 
-    def pooled_target_vector(self, hidden_states: torch.Tensor, word_masks: torch.Tensor) -> torch.Tensor:
-        target_states = hidden_states[:, self.target_index]
-        target_masks = word_masks[:, self.target_index].unsqueeze(-1).to(target_states.dtype)
-        denom = target_masks.sum(dim=1).clamp_min(1.0)
-        return (target_states * target_masks).sum(dim=1) / denom
-
-    def pool_token_states(self, hidden_states: torch.Tensor, word_masks: torch.Tensor) -> torch.Tensor:
+    def pool_unit_states(self, hidden_states: torch.Tensor, surface: PackedSurface) -> torch.Tensor:
         scores = self.pool_score(self.pool_norm(hidden_states)).squeeze(-1)
-        scores = scores.masked_fill(~word_masks, torch.finfo(scores.dtype).min)
-        attention = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
-        attention = attention * word_masks.to(attention.dtype)
-        attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(attention.dtype).tiny)
+        attention = scatter_softmax_by_unit(scores, surface.unit_ids, surface.unit_count, surface.mask)
         values = self.pool_value(hidden_states)
-        return (values * attention.unsqueeze(-1)).sum(dim=2)
+        output = values.new_zeros((values.shape[0], surface.unit_count, values.shape[-1]))
+        index = surface.unit_ids.clamp_min(0).unsqueeze(-1).expand(-1, -1, values.shape[-1])
+        output.scatter_add_(1, index, values * attention.unsqueeze(-1))
+        return output * surface.unit_mask.unsqueeze(-1).to(output.dtype)
+
+    def pooled_target_vector(self, hidden_states: torch.Tensor, surface: PackedSurface) -> torch.Tensor:
+        token_states = self.pool_unit_states(hidden_states, surface)
+        target_idx = min(self.target_index, token_states.shape[1] - 1)
+        return token_states[:, target_idx]
 
     def target_conditioned_by_context(self, token_states: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
         target_state = token_states[:, self.target_index]
@@ -108,8 +106,12 @@ class DilEncoderCore(nn.Module):
         )
         scores = torch.einsum("bhd,bchd->bhc", query, keys) / (self.context_head_dim**0.5)
         context_mask = context_mask.unsqueeze(1)
-        scores = scores.masked_fill(~context_mask, torch.finfo(scores.dtype).min)
-        attention = torch.softmax(scores.float(), dim=-1).to(scores.dtype).masked_fill(~context_mask, 0.0)
+        safe_mask = context_mask.clone()
+        empty_rows = ~safe_mask.any(dim=-1, keepdim=True)
+        safe_mask = torch.where(empty_rows, torch.ones_like(safe_mask), safe_mask)
+        scores = scores.masked_fill(~safe_mask, torch.finfo(scores.dtype).min)
+        attention = torch.softmax(scores.float(), dim=-1).to(scores.dtype).masked_fill(~safe_mask, 0.0)
+        attention = attention * (~empty_rows).to(attention.dtype)
         context_delta = torch.einsum("bhc,bchd->bhd", attention, values).reshape(batch_size, -1)
         context_delta = self.context_out_proj(context_delta)
         gate_input = torch.cat(
@@ -121,33 +123,29 @@ class DilEncoderCore(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        word_masks: torch.Tensor,
+        surface: PackedSurface,
         output_hidden_states: bool = False,
     ) -> torch.Tensor:
-        if input_ids.dim() == 2:
-            input_ids = input_ids.unsqueeze(1)
-            word_masks = word_masks.unsqueeze(1)
-        batch_size, context_size, byte_width = input_ids.shape
-        if context_size != self.context_size:
-            raise ValueError(f"input_ids context width {context_size} != context_size {self.context_size}")
-        if byte_width != self.max_word_bytes:
-            raise ValueError(f"input_ids width {byte_width} != max_word_bytes {self.max_word_bytes}")
+        if not isinstance(surface, PackedSurface):
+            raise TypeError("DilEncoderCore.forward expects PackedSurface")
+        if surface.unit_count != self.context_size:
+            raise ValueError(f"packed surface unit_count {surface.unit_count} != context_size {self.context_size}")
 
-        hidden_states = self.embed_tokens(input_ids)
-        hidden_states = hidden_states * word_masks.unsqueeze(-1).to(hidden_states.dtype)
-        hidden_states = self.byte_stem(hidden_states, word_masks)
+        hidden_states = self.embed_tokens(surface.ids)
+        hidden_states = hidden_states * surface.mask.unsqueeze(-1).to(hidden_states.dtype)
+        hidden_states = self.surface_stem(hidden_states, surface)
 
         layer_vectors = [] if output_hidden_states else None
         for layer_idx in range(self.num_stage_layers):
             hidden_states = self.encoder_layers[layer_idx](hidden_states)
+            hidden_states = hidden_states * surface.mask.unsqueeze(-1).to(hidden_states.dtype)
             if output_hidden_states:
-                layer_vectors.append(self.pooled_target_vector(hidden_states, word_masks))
+                layer_vectors.append(self.pooled_target_vector(hidden_states, surface))
 
-        token_states = self.pool_token_states(hidden_states, word_masks)
-        offsets = torch.arange(context_size, device=token_states.device)
+        token_states = self.pool_unit_states(hidden_states, surface)
+        offsets = torch.arange(self.context_size, device=token_states.device)
         token_states = token_states + self.context_offset_embeddings(offsets).unsqueeze(0)
-        token_mask = word_masks.any(dim=-1)
+        token_mask = surface.unit_mask
         hidden_states = self.target_conditioned_by_context(token_states, token_mask)
 
         for layer_idx in range(self.num_stage_layers):

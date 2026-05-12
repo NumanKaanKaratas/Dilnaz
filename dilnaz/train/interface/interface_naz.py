@@ -8,6 +8,7 @@ from dilnaz.train.common.runtime import COMPILE_MODE_CHOICES, compile_forward, v
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.naz import NazConfig
 from dilnaz.models.naz import Naz
+from dilnaz.surface import pack_token_units
 from dilnaz.train.interface.writer_buffer import SlidingWriterBuffer
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
@@ -27,32 +28,27 @@ def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
     return segments
 
 
-def make_batch(segments: list[TokenSegment], tokenizer: HybridTokenizer, config: NazConfig, device: torch.device):
-    input_ids = torch.full(
-        (1, len(segments), config.max_word_bytes),
-        config.pad_token_id,
-        dtype=torch.long,
-        device=device,
-    )
-    word_masks = torch.zeros(
-        (1, len(segments), config.max_word_bytes),
-        dtype=torch.bool,
-        device=device,
-    )
+def make_batch(segments: list[TokenSegment], tokenizer: HybridTokenizer, config: DilConfig, device: torch.device):
+    rows: list[list[list[int]]] = [[]]
     byte_lengths = []
     for unit_idx, segment in enumerate(segments):
         token_ids = segment.token_ids
-        if len(token_ids) > config.max_word_bytes:
+        if len(token_ids) > config.max_surface_pieces_per_unit:
             raise ValueError(
                 f"token {unit_idx} {tokenizer.decode(token_ids)!r} has {len(token_ids)} pieces; "
-                f"max_word_bytes={config.max_word_bytes}"
+                f"max_surface_pieces_per_unit={config.max_surface_pieces_per_unit}"
             )
-        ids = torch.tensor(token_ids, dtype=torch.long, device=device)
-        input_ids[0, unit_idx, : ids.numel()] = ids
-        word_masks[0, unit_idx, : ids.numel()] = True
-        byte_lengths.append(ids.numel())
+        rows[0].append(list(token_ids))
+        byte_lengths.append(len(token_ids))
     unit_mask = torch.ones((1, len(segments)), dtype=torch.bool, device=device)
-    return input_ids, word_masks, unit_mask, byte_lengths
+    surface = pack_token_units(
+        rows,
+        pad_token_id=config.pad_token_id,
+        bucket_sizes=config.surface_bucket_sizes,
+        max_pieces_per_unit=config.max_surface_pieces_per_unit,
+        device=device,
+    )
+    return surface, unit_mask, byte_lengths
 
 
 def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
@@ -102,7 +98,7 @@ def stream_text(
         raise ValueError("--max-new-tokens must be > 0")
     if writer_microbatch_size <= 0:
         raise ValueError("--writer-microbatch-size must be > 0")
-    input_ids, word_masks, unit_mask, _ = make_batch(prompt_segments, tokenizer, config, device)
+    surface, unit_mask, _ = make_batch(prompt_segments, tokenizer, model.dil_model.config, device)
     prompt_text = "".join(tokenizer.decode(segment.token_ids) for segment in prompt_segments)
     sys.stdout.write(prompt_text)
     sys.stdout.flush()
@@ -110,12 +106,11 @@ def stream_text(
     writer_buffer = SlidingWriterBuffer(model, model.dil_model.config, tokenizer)
     prompt_latents = None
     if hasattr(model, "encode_sequence_latents"):
-        prompt_latents = model.encode_sequence_latents(input_ids, word_masks, unit_mask)
+        prompt_latents = model.encode_sequence_latents(surface, unit_mask)
         writer_buffer.seed_prompt(prompt_latents, prompt_segments)
 
     for step in model.generate_stream(
-        input_ids=input_ids,
-        word_masks=word_masks,
+        surface=surface,
         unit_mask=unit_mask,
         max_new_tokens=max_new_tokens,
         min_new_tokens=min_new_tokens,

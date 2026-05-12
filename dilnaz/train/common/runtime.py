@@ -4,6 +4,7 @@ import shutil
 import time
 from contextlib import nullcontext
 from pathlib import Path
+from dataclasses import is_dataclass
 from typing import Any
 
 import numpy as np
@@ -52,11 +53,36 @@ def autocast_context(enabled: bool):
     return torch.cuda.amp.autocast(dtype=torch.bfloat16)
 
 
+def move_to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if hasattr(value, "to") and is_dataclass(value):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: move_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(move_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [move_to_device(item, device) for item in value]
+    return value
+
+
+def record_stream(value, stream):
+    if isinstance(value, torch.Tensor):
+        value.record_stream(stream)
+    elif is_dataclass(value):
+        for item in value.__dict__.values():
+            record_stream(item, stream)
+    elif isinstance(value, dict):
+        for item in value.values():
+            record_stream(item, stream)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            record_stream(item, stream)
+
+
 def batch_to_device(batch, device):
-    return {
-        key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
-        for key, value in batch.items()
-    }
+    return move_to_device(batch, device)
 
 
 def cuda_sync(device: torch.device):
@@ -99,9 +125,7 @@ class DeviceBatchPrefetcher:
         current_stream = torch.cuda.current_stream(self.device_index)
         current_stream.wait_stream(self.stream)
         batch = self.next_batch
-        for value in batch.values():
-            if isinstance(value, torch.Tensor):
-                value.record_stream(current_stream)
+        record_stream(batch, current_stream)
         self.preload()
         return batch
 

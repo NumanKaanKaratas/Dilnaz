@@ -117,7 +117,7 @@ def parse_args():
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--num-encoder-layers", type=int, default=DIL_MODEL_DEFAULTS["num_encoder_layers"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
-    parser.add_argument("--max-word-bytes", type=int, default=DIL_MODEL_DEFAULTS["max_word_bytes"])
+    parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--context-radius", type=int, default=DIL_MODEL_DEFAULTS["context_radius"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -190,7 +190,7 @@ def build_config(args, tokenizer):
         intermediate_size=args.intermediate_size,
         num_encoder_layers=args.num_encoder_layers,
         latent_size=args.latent_size,
-        max_word_bytes=args.max_word_bytes,
+        max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         context_radius=args.context_radius,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -453,8 +453,8 @@ def main():
             )
             data_seconds += wait_seconds
 
-            log_tokens += int(batch["labels"].ne(-100).sum().detach().cpu())
-            log_windows += int(batch["labels"].shape[0])
+            log_tokens += int(batch["labels"].label_mask.sum().detach().cpu())
+            log_windows += int(batch["labels"].true_lengths.gt(0).sum().detach().cpu())
             log_steps += 1
             source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
             accumulate_metrics(

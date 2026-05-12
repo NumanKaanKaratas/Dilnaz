@@ -13,7 +13,9 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from dilnaz.models.dil import DilConfig
+from dilnaz.surface import pack_context_segments, pack_writer_targets
 from dilnaz.tokenization import HybridTokenizer, TokenSegment, default_vocab_path
+from dilnaz.train.common.runtime import move_to_device
 
 
 SENTENCE_CHUNK_PATTERN = re.compile(r".+?(?:[.!?]+(?:\s+|$)|\n+|$)", re.UNICODE | re.DOTALL)
@@ -22,9 +24,9 @@ TEACHER_CENTERED_ADD_WEIGHT = 0.5
 NLLB_DEFAULT_MAX_ENCODER_TOKENS = 1024
 DILNAZ_READY_FORMAT = "dilnaz-ready-teacher-v2"
 DILNAZ_READY_REQUIRED_COLUMNS = [
-    "input_ids",
-    "word_masks",
-    "labels",
+    "surface_ids",
+    "surface_offsets",
+    "target_ids",
     "teacher_layers",
     "teacher_mask",
 ]
@@ -137,7 +139,7 @@ def validate_dilnaz_ready_parquet(path: Path, config: DilConfig, vocab_path: Pat
         "tokenizer_vocab_size": config.vocab_size,
         "pad_token_id": config.pad_token_id,
         "eos_token_id": config.eos_token_id,
-        "max_word_bytes": config.max_word_bytes,
+        "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
         "context_radius": config.context_radius,
         "context_size": config.context_size,
         "target_index": config.target_index,
@@ -246,11 +248,11 @@ def context_offsets(context_radius: int) -> range:
     return range(-context_radius, context_radius + 1)
 
 
-def trainable_segments(tokenizer: HybridTokenizer, text: str, max_word_bytes: int) -> list[TokenSegment]:
+def trainable_segments(tokenizer: HybridTokenizer, text: str, max_surface_pieces_per_unit: int) -> list[TokenSegment]:
     return [
         segment
         for segment in tokenizer.encode_segments(text)
-        if 0 < segment.piece_len <= max_word_bytes
+        if 0 < segment.piece_len <= max_surface_pieces_per_unit
     ]
 
 
@@ -304,8 +306,9 @@ class HybridDilBatchDataset(IterableDataset):
         self.train_file = train_file
         self.context_radius = config.context_radius
         self.context_size = config.context_size
-        self.max_word_bytes = config.max_word_bytes
-        self.writer_max_positions = config.writer_max_positions
+        self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
+        self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
+        self.writer_output_buckets = tuple(config.writer_output_buckets)
         self.pad_token_id = config.pad_token_id
         self.writer_stop_token_id = config.writer_stop_token_id
         self.batch_size = batch_size
@@ -321,21 +324,6 @@ class HybridDilBatchDataset(IterableDataset):
         self._carry_refs: list[BatchSampleRef] = []
         self._produced = 0
 
-    def write_segment(
-        self,
-        target: np.ndarray,
-        mask: np.ndarray,
-        row_idx: int,
-        context_idx: int,
-        segment: TokenSegment,
-    ):
-        piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
-        width = piece_ids.shape[0]
-        if width <= 0 or width > self.max_word_bytes:
-            return
-        target[row_idx, context_idx, :width] = piece_ids
-        mask[row_idx, context_idx, :width] = True
-
     def make_batch(
         self,
         texts: list[str],
@@ -344,13 +332,8 @@ class HybridDilBatchDataset(IterableDataset):
         refs: list[BatchSampleRef],
     ):
         size = len(refs)
-        input_ids = np.full(
-            (size, self.context_size, self.max_word_bytes),
-            self.pad_token_id,
-            dtype=np.int64,
-        )
-        word_masks = np.zeros((size, self.context_size, self.max_word_bytes), dtype=np.bool_)
-        labels = np.full((size, self.writer_max_positions), -100, dtype=np.int64)
+        context_rows: list[list[TokenSegment | None]] = []
+        target_rows: list[list[list[int]]] = []
         teacher_text_indices = np.zeros((size,), dtype=np.int64)
         teacher_starts = np.zeros((size,), dtype=np.int64)
         teacher_ends = np.zeros((size,), dtype=np.int64)
@@ -362,23 +345,36 @@ class HybridDilBatchDataset(IterableDataset):
             token_idx = ref.token_idx
             segment = segments[token_idx]
             source_line_ids[row_idx] = line_ids[ref.text_idx]
+            context_row: list[TokenSegment | None] = []
             for context_idx, offset in enumerate(context_offsets(self.context_radius)):
                 source_idx = token_idx + offset
                 if 0 <= source_idx < len(segments):
-                    self.write_segment(input_ids, word_masks, row_idx, context_idx, segments[source_idx])
+                    context_row.append(segments[source_idx])
+                else:
+                    context_row.append(None)
+            context_rows.append(context_row)
 
-            piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
-            labels[row_idx, : piece_ids.shape[0]] = piece_ids
-            labels[row_idx, piece_ids.shape[0]] = self.writer_stop_token_id
+            target_rows.append([segment_piece_ids(segment)])
             teacher_text_indices[row_idx] = ref.text_idx
             teacher_starts[row_idx] = segment.start
             teacher_ends[row_idx] = segment.end
             teacher_distill_mask[row_idx] = teacher_distill_segment(segment)
 
         return {
-            "input_ids": torch.from_numpy(input_ids),
-            "word_masks": torch.from_numpy(word_masks),
-            "labels": torch.from_numpy(labels),
+            "surface": pack_context_segments(
+                context_rows,
+                pad_token_id=self.pad_token_id,
+                bucket_sizes=self.surface_bucket_sizes,
+                max_pieces_per_unit=self.max_surface_pieces_per_unit,
+            ),
+            "labels": pack_writer_targets(
+                target_rows,
+                pad_token_id=self.pad_token_id,
+                stop_token_id=self.writer_stop_token_id,
+                writer_output_buckets=self.writer_output_buckets,
+                surface_bucket_sizes=self.surface_bucket_sizes,
+                max_pieces_per_unit=self.max_surface_pieces_per_unit,
+            ),
             "teacher_texts": texts,
             "teacher_text_indices": torch.from_numpy(teacher_text_indices),
             "teacher_starts": torch.from_numpy(teacher_starts),
@@ -407,7 +403,7 @@ class HybridDilBatchDataset(IterableDataset):
         ):
             if text_idx % worker_count != worker_id:
                 continue
-            segments = trainable_segments(self.tokenizer, text, self.max_word_bytes)
+            segments = trainable_segments(self.tokenizer, text, self.max_surface_pieces_per_unit)
             if not segments:
                 continue
 
@@ -466,7 +462,7 @@ class ResidentDilBatcher:
             raise ValueError("resident Dil data has no batches")
         self.batches = [
             {
-                key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+                key: move_to_device(value, device)
                 for key, value in batch.items()
             }
             for batch in batches
@@ -482,7 +478,7 @@ class ResidentDilBatcher:
         batch["teacher_layers"] = teacher_layers.detach().cpu()
         batch["teacher_mask"] = teacher_mask.detach().cpu()
         return {
-            key: value.detach().cpu() if torch.is_tensor(value) else value
+            key: value.detach().cpu() if hasattr(value, "detach") else value
             for key, value in batch.items()
         }
 
@@ -531,10 +527,10 @@ class ReadyParquetDilBatchDataset(IterableDataset):
         max_samples: int = 0,
     ):
         super().__init__()
+        raise ValueError("Dilnaz-ready fixed surface parquet is not supported; regenerate packed surface streaming data")
         self.parquet_path = parquet_path
         self.context_size = config.context_size
-        self.max_word_bytes = config.max_word_bytes
-        self.writer_max_positions = config.writer_max_positions
+        self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.teacher_layer_count = len(NLLB_LAYER_GROUPS)
         self.teacher_dim = 1024
         self.batch_size = batch_size
@@ -555,33 +551,7 @@ class ReadyParquetDilBatchDataset(IterableDataset):
         ]
 
     def make_batch(self, rows: list[dict]) -> dict:
-        input_ids = np.asarray([row["input_ids"] for row in rows], dtype=np.int64).reshape(
-            len(rows),
-            self.context_size,
-            self.max_word_bytes,
-        )
-        word_masks = np.asarray([row["word_masks"] for row in rows], dtype=np.bool_).reshape(
-            len(rows),
-            self.context_size,
-            self.max_word_bytes,
-        )
-        labels = np.asarray([row["labels"] for row in rows], dtype=np.int64).reshape(
-            len(rows),
-            self.writer_max_positions,
-        )
-        teacher_layers = np.asarray([row["teacher_layers"] for row in rows], dtype=np.float32).reshape(
-            len(rows),
-            self.teacher_layer_count,
-            self.teacher_dim,
-        )
-        teacher_mask = np.asarray([row["teacher_mask"] for row in rows], dtype=np.bool_)
-        return {
-            "input_ids": torch.from_numpy(input_ids),
-            "word_masks": torch.from_numpy(word_masks),
-            "labels": torch.from_numpy(labels),
-            "teacher_layers": torch.from_numpy(teacher_layers),
-            "teacher_mask": torch.from_numpy(teacher_mask),
-        }
+        raise ValueError("packed surface parquet batching is not implemented; use streaming data")
 
     def iter_once(self, worker_id: int, worker_count: int):
         rows = self._carry

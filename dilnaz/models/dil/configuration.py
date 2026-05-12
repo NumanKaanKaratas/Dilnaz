@@ -14,7 +14,8 @@ class DilConfig(PretrainedConfig):
         intermediate_size=1280,
         num_encoder_layers=6,
         latent_size=512,
-        max_word_bytes=32,
+        max_surface_pieces_per_unit=256,
+        surface_bucket_sizes=(64, 128, 256, 512, 1024, 2048, 4096, 8192),
         context_radius=2,
         byte_conv_layers=2,
         byte_conv_kernel_size=5,
@@ -28,6 +29,8 @@ class DilConfig(PretrainedConfig):
         writer_conv_kernel_size=5,
         writer_conv_expansion=4,
         writer_dropout=0.1,
+        writer_output_buckets=(2, 4, 8, 16, 32, 64, 128, 256),
+        writer_initial_output_bucket=8,
         writer_max_window_size=32,
         writer_word_mixer_layers=2,
         writer_word_attention_heads=8,
@@ -85,8 +88,28 @@ class DilConfig(PretrainedConfig):
             raise ValueError("context_left_radius is not supported; use context_radius")
         kwargs.pop("context_size", None)
         kwargs.pop("target_index", None)
+        if ("max_" + "word_bytes") in kwargs or ("writer_max_" + "positions") in kwargs:
+            raise ValueError("fixed-width surface config is not supported; use packed variable surface fields")
         if context_radius < 0:
             raise ValueError("context_radius must be >= 0")
+        if max_surface_pieces_per_unit <= 0:
+            raise ValueError("max_surface_pieces_per_unit must be > 0")
+        self.surface_bucket_sizes = tuple(int(bucket) for bucket in surface_bucket_sizes)
+        if not self.surface_bucket_sizes or any(bucket <= 0 for bucket in self.surface_bucket_sizes):
+            raise ValueError("surface_bucket_sizes must be a non-empty positive tuple")
+        if tuple(sorted(self.surface_bucket_sizes)) != self.surface_bucket_sizes:
+            raise ValueError("surface_bucket_sizes must be sorted ascending")
+        if self.surface_bucket_sizes[-1] < max_surface_pieces_per_unit:
+            raise ValueError("largest surface_bucket_sizes entry must cover max_surface_pieces_per_unit")
+        self.writer_output_buckets = tuple(int(bucket) for bucket in writer_output_buckets)
+        if not self.writer_output_buckets or self.writer_output_buckets[0] < 2:
+            raise ValueError("writer_output_buckets must start at >= 2 to include STOP")
+        if tuple(sorted(self.writer_output_buckets)) != self.writer_output_buckets:
+            raise ValueError("writer_output_buckets must be sorted ascending")
+        if self.writer_output_buckets[-1] > max_surface_pieces_per_unit + 1:
+            raise ValueError("writer output buckets cannot exceed max_surface_pieces_per_unit + STOP")
+        if writer_initial_output_bucket not in self.writer_output_buckets:
+            raise ValueError("writer_initial_output_bucket must be one of writer_output_buckets")
         if byte_conv_layers < 0 or writer_num_layers < 0:
             raise ValueError("conv layer counts must be >= 0")
         if byte_conv_kernel_size <= 0 or byte_conv_kernel_size % 2 == 0:
@@ -174,7 +197,7 @@ class DilConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_encoder_layers = num_encoder_layers
         self.latent_size = latent_size
-        self.max_word_bytes = max_word_bytes
+        self.max_surface_pieces_per_unit = max_surface_pieces_per_unit
         self.context_radius = context_radius
         self.context_size = 2 * context_radius + 1
         self.target_index = context_radius
@@ -192,9 +215,9 @@ class DilConfig(PretrainedConfig):
         self.writer_dropout = writer_dropout
         self.writer_vocab_size = vocab_size + 1
         self.writer_stop_token_id = vocab_size
-        self.writer_max_positions = max_word_bytes + 1
         self.writer_state_vocab_size = self.writer_vocab_size + 1
         self.writer_empty_token_id = self.writer_vocab_size
+        self.writer_initial_output_bucket = int(writer_initial_output_bucket)
         self.writer_max_window_size = writer_max_window_size
         self.writer_word_mixer_layers = writer_word_mixer_layers
         self.writer_word_attention_heads = writer_word_attention_heads

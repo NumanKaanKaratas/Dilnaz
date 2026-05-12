@@ -4,6 +4,7 @@ import torch
 
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.naz import Naz
+from dilnaz.surface import PackedSurfaceState, writer_query_from_lengths
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
@@ -12,24 +13,18 @@ def decode_token_ids(tokenizer: HybridTokenizer, token_ids: torch.Tensor, token_
     return tokenizer.decode(ids)
 
 
-def decoded_surface_state(token_ids: torch.Tensor, token_mask: torch.Tensor, config: DilConfig) -> torch.Tensor:
-    state = torch.full((config.writer_max_positions,), -100, dtype=torch.long, device=token_ids.device)
-    length = int(token_mask.sum().detach().cpu())
-    if length > 0:
-        state[:length] = token_ids[:length]
-    if length < config.writer_max_positions:
-        state[length] = config.writer_stop_token_id
-    return state
+def decoded_surface_state(token_ids: torch.Tensor, token_mask: torch.Tensor, config: DilConfig) -> list[int]:
+    ids = token_ids[token_mask].detach().cpu().tolist()
+    return ids
 
 
-def segment_surface_state(segment: TokenSegment, config: DilConfig, device: torch.device) -> torch.Tensor:
-    token_ids = torch.tensor(segment.token_ids, dtype=torch.long, device=device)
-    if token_ids.numel() > config.writer_max_positions - 1:
+def segment_surface_state(segment: TokenSegment, config: DilConfig, device: torch.device) -> list[int]:
+    token_ids = list(segment.token_ids)
+    if len(token_ids) > config.max_surface_pieces_per_unit:
         raise ValueError(
-            f"prompt token has {token_ids.numel()} pieces; max_word_bytes={config.writer_max_positions - 1}"
+            f"prompt token has {len(token_ids)} pieces; max_surface_pieces_per_unit={config.max_surface_pieces_per_unit}"
         )
-    token_mask = torch.ones((token_ids.numel(),), dtype=torch.bool, device=device)
-    return decoded_surface_state(token_ids, token_mask, config)
+    return token_ids
 
 
 class SlidingWriterBuffer:
@@ -45,10 +40,10 @@ class SlidingWriterBuffer:
         self.latent_size = config.latent_size
         self.max_position_age = config.writer_max_position_age
         self.left_latents: list[torch.Tensor] = []
-        self.left_surfaces: list[torch.Tensor] = []
+        self.left_surfaces: list[list[int]] = []
         self.pending_latents: list[torch.Tensor] = []
         self.pending_futures: list[torch.Tensor | None] = []
-        self.pending_surfaces: list[torch.Tensor | None] = []
+        self.pending_surfaces: list[list[int] | None] = []
         self.pending_ages: list[int] = []
         self.pending_should_stop: list[bool] = []
         self._tensor_cache = {}
@@ -69,7 +64,7 @@ class SlidingWriterBuffer:
         device = latents.device
         for latent, segment in zip(latents, segments):
             self.left_latents.append(latent.detach())
-            self.left_surfaces.append(segment_surface_state(segment, self.config, device).detach())
+            self.left_surfaces.append(segment_surface_state(segment, self.config, device))
         self.left_latents = self.left_latents[-self.left_frozen :]
         self.left_surfaces = self.left_surfaces[-self.left_frozen :]
 
@@ -91,48 +86,69 @@ class SlidingWriterBuffer:
         cached = self._tensor_cache.get(key)
         if cached is None:
             semantic = torch.zeros((1, self.window_size, self.latent_size), dtype=dtype, device=device)
-            surface_state = torch.empty(
-                (1, self.window_size, self.config.writer_max_positions),
-                dtype=torch.long,
-                device=device,
-            )
-            surface_state_mask = torch.empty_like(surface_state)
-            frozen_mask = torch.empty_like(surface_state, dtype=torch.bool)
             window_mask = torch.empty((1, self.window_size), dtype=torch.bool, device=device)
             future_tensor = None
             if future_horizons > 0:
                 future_tensor = torch.zeros((1, self.window_size, future_horizons, self.latent_size), dtype=dtype, device=device)
             position_age = torch.empty((1, self.window_size), dtype=torch.long, device=device)
-            cached = semantic, surface_state, surface_state_mask, frozen_mask, window_mask, future_tensor, position_age
+            cached = semantic, window_mask, future_tensor, position_age
             self._tensor_cache[key] = cached
-        semantic, surface_state, surface_state_mask, frozen_mask, window_mask, future_tensor, position_age = cached
+        semantic, window_mask, future_tensor, position_age = cached
         semantic.zero_()
-        surface_state.fill_(-100)
-        surface_state_mask.zero_()
-        frozen_mask.zero_()
         window_mask.zero_()
         position_age.zero_()
         if future_tensor is not None:
             future_tensor.zero_()
         return cached
 
+    def _packed_state(self, rows: list[list[int]], kinds: list[int], frozen_flags: list[bool], device: torch.device) -> PackedSurfaceState:
+        lengths = torch.tensor([[len(row) for row in rows]], dtype=torch.long, device=device)
+        query = writer_query_from_lengths(
+            lengths,
+            pad_token_id=self.config.pad_token_id,
+            surface_bucket_sizes=self.config.surface_bucket_sizes,
+        )
+        ids = torch.full_like(query.ids, self.config.writer_empty_token_id)
+        state_kind = torch.zeros_like(query.ids)
+        frozen = torch.zeros_like(query.mask)
+        for unit_idx, row in enumerate(rows):
+            if not row:
+                continue
+            start = int(query.unit_offsets[0, unit_idx].detach().cpu())
+            end = start + len(row)
+            ids[0, start:end] = torch.tensor(row, dtype=torch.long, device=device)
+            state_kind[0, start:end] = int(kinds[unit_idx])
+            frozen[0, start:end] = bool(frozen_flags[unit_idx])
+        return PackedSurfaceState(
+            ids=ids,
+            state_kind=state_kind,
+            frozen=frozen,
+            mask=query.mask,
+            unit_ids=query.unit_ids,
+            pos_in_unit=query.pos_in_unit,
+            unit_lengths=query.unit_lengths,
+            unit_offsets=query.unit_offsets,
+            unit_mask=query.unit_mask,
+        )
+
     def _window_tensors(self):
         device = self.pending_latents[0].device
         dtype = self.pending_latents[0].dtype
         future_horizons = self._future_horizons()
-        semantic, surface_state, surface_state_mask, frozen_mask, window_mask, future_tensor, position_age = (
-            self._cached_window_tensors(device, dtype, future_horizons)
-        )
+        semantic, window_mask, future_tensor, position_age = self._cached_window_tensors(device, dtype, future_horizons)
         zone_ids = self.zone_ids.to(device=device).unsqueeze(0)
+        state_rows = [[] for _ in range(self.window_size)]
+        state_kinds = [0 for _ in range(self.window_size)]
+        state_frozen = [False for _ in range(self.window_size)]
 
         left_count = min(self.left_frozen, len(self.left_latents))
         left_start = self.left_frozen - left_count
         for idx in range(left_count):
             slot = left_start + idx
             semantic[0, slot] = self.left_latents[-left_count + idx].to(device=device, dtype=dtype)
-            surface_state[0, slot] = self.left_surfaces[-left_count + idx].to(device=device)
-            surface_state_mask[0, slot] = torch.where(surface_state[0, slot].ge(0), 2, 0)
-            frozen_mask[0, slot] = surface_state[0, slot].ge(0)
+            state_rows[slot] = self.left_surfaces[-left_count + idx] + [self.config.writer_stop_token_id]
+            state_kinds[slot] = 2
+            state_frozen[slot] = True
             window_mask[0, slot] = True
             position_age[0, slot] = self.max_position_age
 
@@ -144,13 +160,14 @@ class SlidingWriterBuffer:
             position_age[0, slot] = min(self.pending_ages[idx], self.max_position_age)
             pending_surface = self.pending_surfaces[idx]
             if pending_surface is not None:
-                surface_state[0, slot] = pending_surface.to(device=device)
-                surface_state_mask[0, slot] = torch.where(surface_state[0, slot].ge(0), 1, 0)
+                state_rows[slot] = pending_surface + [self.config.writer_stop_token_id]
+                state_kinds[slot] = 1
             future = self.pending_futures[idx]
             if future_tensor is not None and future is not None and future.numel() > 0:
                 copy_count = min(future_horizons, future.shape[0])
                 future_tensor[0, slot, :copy_count] = future[:copy_count].to(device=device, dtype=dtype)
-        return semantic, surface_state, surface_state_mask, frozen_mask, zone_ids, window_mask, future_tensor, position_age
+        surface_state = self._packed_state(state_rows, state_kinds, state_frozen, device)
+        return semantic, surface_state, zone_ids, window_mask, future_tensor, position_age
 
     def _cache_pending_surfaces(self, token_ids: torch.Tensor, token_masks: torch.Tensor, pending_count: int):
         for idx in range(pending_count):
@@ -159,7 +176,7 @@ class SlidingWriterBuffer:
                 token_ids[0, slot],
                 token_masks[0, slot],
                 self.config,
-            ).detach()
+            )
 
     def _drop_pending_prefix(self, count: int):
         del self.pending_latents[:count]
@@ -190,12 +207,10 @@ class SlidingWriterBuffer:
             token_ids, token_masks, lengths, commit_scores = self.model.dil_model.decode_semantic_window(
                 tensors[0],
                 surface_state=tensors[1],
-                surface_state_mask=tensors[2],
-                frozen_mask=tensors[3],
-                zone_ids=tensors[4],
-                window_mask=tensors[5],
-                future_latents=tensors[6],
-                position_age=tensors[7],
+                zone_ids=tensors[2],
+                window_mask=tensors[3],
+                future_latents=tensors[4],
+                position_age=tensors[5],
             )
             emitted = 0
             pending_count = min(len(self.pending_latents), self.window_size - self.left_frozen)
@@ -205,9 +220,9 @@ class SlidingWriterBuffer:
                 self.left_frozen + commit_limit,
                 device=lengths.device,
             )
-            slot_lengths = lengths[0, slots].clamp_max(self.config.writer_max_positions - 1)
-            positions = torch.arange(self.config.writer_max_positions, device=lengths.device).unsqueeze(0)
-            valid_commit_positions = positions < (slot_lengths.unsqueeze(1) + 1).clamp_max(self.config.writer_max_positions)
+            slot_lengths = lengths[0, slots].clamp_max(self.config.max_surface_pieces_per_unit)
+            positions = torch.arange(commit_scores.shape[-1], device=lengths.device).unsqueeze(0)
+            valid_commit_positions = positions < (slot_lengths.unsqueeze(1) + 1).clamp_max(commit_scores.shape[-1])
             ready_tensor = (
                 commit_scores[0, slots].ge(self.commit_threshold) | ~valid_commit_positions
             ).all(dim=1)

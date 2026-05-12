@@ -148,7 +148,7 @@ def json_training_state(
         "metrics": metrics,
         "dil_checksum": checksum,
         "compile_mode": compile_mode,
-        "max_word_bytes": config.max_word_bytes,
+        "max_surface_pieces_per_unit": getattr(config, "max_surface_pieces_per_unit", 0),
         "latent_size": config.latent_size,
         "semantic_space": "dil_normalized_latent",
         "objective": OBJECTIVE,
@@ -308,29 +308,24 @@ def build_resident_semantic_cache(
     autocast_enabled: bool,
 ):
     model.eval()
-    byte_ids = surface_batcher.byte_ids
-    lengths = surface_batcher.lengths
     token_count = surface_batcher.token_count
-    positions = surface_batcher.positions.reshape(1, 1, surface_batcher.max_word_bytes)
     context_radius = model.dil_config.context_radius
     latent_chunks = []
     for start in range(0, token_count, chunk_tokens):
         end = min(start + chunk_tokens, token_count)
         context_start = max(0, start - context_radius)
         context_end = min(token_count, end + context_radius)
-        ids = byte_ids[context_start:context_end].unsqueeze(0)
-        token_lengths = lengths[context_start:context_end].reshape(1, -1, 1)
-        masks = positions < token_lengths
-        unit_mask = torch.ones(ids.shape[:2], dtype=torch.bool, device=ids.device)
+        surface = surface_batcher.surface_slice(context_start, context_end)
+        unit_mask = torch.ones(surface.unit_lengths.shape, dtype=torch.bool, device=surface.ids.device)
         with autocast_context(autocast_enabled):
-            active_latents = model.encode_active_dil_latents(ids, masks, unit_mask)
+            active_latents = model.encode_sequence_latents(surface, unit_mask)
         local_start = start - context_start
         local_end = local_start + end - start
-        latents = active_latents.reshape(1, context_end - context_start, -1)[:, local_start:local_end]
+        latents = active_latents[:, local_start:local_end]
         latent_chunks.append(latents.squeeze(0).float())
     semantic_states = torch.cat(latent_chunks, dim=0)
     model.train()
-    return semantic_states, semantic_states, surface_batcher.byte_ids, surface_batcher.lengths
+    return semantic_states, semantic_states
 
 
 def semantic_cache_paths(cache_dir: Path, ids_path: Path, checksum: str) -> tuple[Path, Path]:
@@ -355,7 +350,7 @@ def build_memmap_semantic_cache(
         "format_version": SEMANTIC_CACHE_FORMAT_VERSION,
         "token_count": token_count,
         "latent_size": model.config.latent_size,
-        "max_word_bytes": model.config.max_word_bytes,
+        "surface_cache": "packed_flat_offsets",
         "dil_checksum": checksum,
         "ids_path": str(ids_path.resolve()),
         "lengths_path": str(lengths_path.resolve()),
@@ -366,8 +361,8 @@ def build_memmap_semantic_cache(
         if all(meta.get(key) == value for key, value in expected_meta.items()):
             return latents_path
 
-    byte_ids = np.load(ids_path, mmap_mode="r")
-    lengths = np.load(lengths_path, mmap_mode="r")
+    surface_ids = np.load(ids_path, mmap_mode="r")
+    surface_offsets = np.load(lengths_path, mmap_mode="r")
     semantic = np.lib.format.open_memmap(
         latents_path,
         mode="w+",
@@ -378,27 +373,30 @@ def build_memmap_semantic_cache(
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
-    positions = torch.arange(model.config.max_word_bytes, device=device).reshape(1, 1, model.config.max_word_bytes)
     context_radius = model.dil_config.context_radius
     for start in range(0, token_count, chunk_tokens):
         end = min(start + chunk_tokens, token_count)
         context_start = max(0, start - context_radius)
         context_end = min(token_count, end + context_radius)
-        ids = torch.from_numpy(np.asarray(byte_ids[context_start:context_end], dtype=np.int64)).to(
-            device,
-            non_blocking=True,
-        ).unsqueeze(0)
-        token_lengths = torch.from_numpy(np.asarray(lengths[context_start:context_end], dtype=np.int64)).to(
-            device,
-            non_blocking=True,
-        ).reshape(1, -1, 1)
-        masks = positions < token_lengths
-        unit_mask = torch.ones(ids.shape[:2], dtype=torch.bool, device=device)
+        rows = []
+        for token_idx in range(context_start, context_end):
+            piece_start = int(surface_offsets[token_idx])
+            piece_end = int(surface_offsets[token_idx + 1])
+            rows.append(np.asarray(surface_ids[piece_start:piece_end], dtype=np.int64).tolist())
+        from dilnaz.surface import pack_token_units
+        surface = pack_token_units(
+            [rows],
+            pad_token_id=model.dil_config.pad_token_id,
+            bucket_sizes=model.dil_config.surface_bucket_sizes,
+            max_pieces_per_unit=model.dil_config.max_surface_pieces_per_unit,
+            device=device,
+        )
+        unit_mask = torch.ones(surface.unit_lengths.shape, dtype=torch.bool, device=device)
         with autocast_context(autocast_enabled):
-            active_latents = model.encode_active_dil_latents(ids, masks, unit_mask)
+            active_latents = model.encode_sequence_latents(surface, unit_mask)
         local_start = start - context_start
         local_end = local_start + end - start
-        chunk_latents = active_latents.reshape(1, context_end - context_start, -1)[:, local_start:local_end]
+        chunk_latents = active_latents[:, local_start:local_end]
         semantic[start:end] = chunk_latents.squeeze(0).float().cpu().numpy()
     semantic.flush()
     with meta_path.open("w", encoding="utf-8") as handle:
@@ -618,7 +616,6 @@ def build_config(args, dil_config: DilConfig | None) -> NazConfig:
         vocab_size=dil_config.vocab_size,
         pad_token_id=dil_config.pad_token_id,
         eos_token_id=dil_config.eos_token_id,
-        max_word_bytes=dil_config.max_word_bytes,
         latent_size=dil_config.latent_size,
         reconstruction_loss_weight=args.reconstruction_loss_weight,
         num_semantic_candidates=args.num_semantic_candidates,
@@ -728,7 +725,7 @@ class NazBaseTrainer(BaseTrainer):
         train_cache = build_token_cache(
             self.args.train_file,
             self.tokenizer,
-            self.dil_config.max_word_bytes,
+            self.dil_config.max_surface_pieces_per_unit,
             self.dil_config.pad_token_id,
             self.args.text_read_chars,
             token_cache_dir,
@@ -760,7 +757,7 @@ class NazBaseTrainer(BaseTrainer):
             eval_cache = build_token_cache(
                 self.args.eval_file,
                 self.tokenizer,
-                self.dil_config.max_word_bytes,
+                self.dil_config.max_surface_pieces_per_unit,
                 self.dil_config.pad_token_id,
                 self.args.text_read_chars,
                 token_cache_dir,
@@ -797,7 +794,7 @@ class NazBaseTrainer(BaseTrainer):
         train_ids_path, train_lengths_path, train_token_count = build_token_cache(
             self.args.train_file,
             self.tokenizer,
-            self.dil_config.max_word_bytes,
+            self.dil_config.max_surface_pieces_per_unit,
             self.dil_config.pad_token_id,
             self.args.text_read_chars,
             token_cache_dir,
@@ -826,7 +823,7 @@ class NazBaseTrainer(BaseTrainer):
             eval_ids_path, eval_lengths_path, eval_token_count = build_token_cache(
                 self.args.eval_file,
                 self.tokenizer,
-                self.dil_config.max_word_bytes,
+                self.dil_config.max_surface_pieces_per_unit,
                 self.dil_config.pad_token_id,
                 self.args.text_read_chars,
                 token_cache_dir,

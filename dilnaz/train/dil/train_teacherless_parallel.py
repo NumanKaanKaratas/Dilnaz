@@ -21,6 +21,7 @@ from dilnaz.train.common.runtime import (
     validate_compile_environment,
 )
 from dilnaz.train.data.dil_data import context_offsets, load_hybrid_tokenizer, make_dil_batch_loader, segment_piece_ids, trainable_segments
+from dilnaz.surface import pack_context_segments, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
@@ -80,35 +81,6 @@ def iter_parallel_jsonl(path: Path, worker_id: int, worker_count: int) -> Iterat
                 yield pair
 
 
-def write_segment(
-    input_ids: np.ndarray,
-    word_masks: np.ndarray,
-    row_idx: int,
-    segment_idx: int,
-    context_idx: int,
-    segment: TokenSegment,
-    max_word_bytes: int,
-) -> None:
-    piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
-    width = piece_ids.shape[0]
-    if width <= 0 or width > max_word_bytes:
-        return
-    input_ids[row_idx, segment_idx, context_idx, :width] = piece_ids
-    word_masks[row_idx, segment_idx, context_idx, :width] = True
-
-
-def write_labels(
-    labels: np.ndarray,
-    row_idx: int,
-    segment_idx: int,
-    segment: TokenSegment,
-    writer_stop_token_id: int,
-) -> None:
-    piece_ids = np.asarray(segment_piece_ids(segment), dtype=np.int64)
-    labels[row_idx, segment_idx, : piece_ids.shape[0]] = piece_ids
-    labels[row_idx, segment_idx, piece_ids.shape[0]] = writer_stop_token_id
-
-
 class TeacherlessParallelJsonlDataset(IterableDataset):
     def __init__(
         self,
@@ -129,8 +101,9 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
         self.train_file = train_file
         self.context_radius = config.context_radius
         self.context_size = config.context_size
-        self.max_word_bytes = config.max_word_bytes
-        self.writer_max_positions = config.writer_max_positions
+        self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
+        self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
+        self.writer_output_buckets = tuple(config.writer_output_buckets)
         self.pad_token_id = config.pad_token_id
         self.writer_stop_token_id = config.writer_stop_token_id
         self.batch_size = batch_size
@@ -145,8 +118,8 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
         self.tokenizer = tokenizer
 
     def tokenized_pair(self, pair: JsonlParallelPair) -> TokenizedParallelPair | None:
-        tr_segments = trainable_segments(self.tokenizer, pair.tr, self.max_word_bytes)
-        en_segments = trainable_segments(self.tokenizer, pair.en, self.max_word_bytes)
+        tr_segments = trainable_segments(self.tokenizer, pair.tr, self.max_surface_pieces_per_unit)
+        en_segments = trainable_segments(self.tokenizer, pair.en, self.max_surface_pieces_per_unit)
         if len(tr_segments) < self.min_segments or len(en_segments) < self.min_segments:
             return None
         ratio = len(tr_segments) / max(len(en_segments), 1)
@@ -158,9 +131,52 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
             en_segments=en_segments[: self.max_segments],
         )
 
+    def side_packed(self, pairs: list[TokenizedParallelPair], prefix: str):
+        size = len(pairs)
+        context_rows: list[list[TokenSegment | None]] = []
+        target_rows: list[list[list[int]]] = []
+        unit_mask = torch.zeros((size, self.max_segments), dtype=torch.bool)
+        segment_counts = torch.zeros((size,), dtype=torch.long)
+        pair_segments = [pair.tr_segments if prefix == "tr" else pair.en_segments for pair in pairs]
+        for row_idx, segments in enumerate(pair_segments):
+            count = min(len(segments), self.max_segments)
+            unit_mask[row_idx, :count] = True
+            segment_counts[row_idx] = count
+            target_row: list[list[int]] = []
+            for segment_idx in range(self.max_segments):
+                if segment_idx >= count:
+                    context_rows.append([None for _ in context_offsets(self.context_radius)])
+                    target_row.append([])
+                    continue
+                context_row: list[TokenSegment | None] = []
+                for offset in context_offsets(self.context_radius):
+                    source_idx = segment_idx + offset
+                    context_row.append(segments[source_idx] if 0 <= source_idx < count else None)
+                context_rows.append(context_row)
+                target_row.append(segment_piece_ids(segments[segment_idx]))
+            target_rows.append(target_row)
+        return {
+            f"{prefix}_surface": pack_context_segments(
+                context_rows,
+                pad_token_id=self.pad_token_id,
+                bucket_sizes=self.surface_bucket_sizes,
+                max_pieces_per_unit=self.max_surface_pieces_per_unit,
+            ),
+            f"{prefix}_labels": pack_writer_targets(
+                target_rows,
+                pad_token_id=self.pad_token_id,
+                stop_token_id=self.writer_stop_token_id,
+                writer_output_buckets=self.writer_output_buckets,
+                surface_bucket_sizes=self.surface_bucket_sizes,
+                max_pieces_per_unit=self.max_surface_pieces_per_unit,
+            ),
+            f"{prefix}_unit_mask": unit_mask,
+            f"{prefix}_segment_counts": segment_counts,
+        }
+
     def fill_side(
         self,
-        batch: dict[str, np.ndarray],
+        batch: dict[str, torch.Tensor],
         prefix: str,
         row_idx: int,
         segments: list[TokenSegment],
@@ -168,63 +184,17 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
         count = min(len(segments), self.max_segments)
         batch[f"{prefix}_unit_mask"][row_idx, :count] = True
         batch[f"{prefix}_segment_counts"][row_idx] = count
-        for segment_idx in range(count):
-            for context_idx, offset in enumerate(context_offsets(self.context_radius)):
-                source_idx = segment_idx + offset
-                if 0 <= source_idx < count:
-                    write_segment(
-                        batch[f"{prefix}_input_ids"],
-                        batch[f"{prefix}_word_masks"],
-                        row_idx,
-                        segment_idx,
-                        context_idx,
-                        segments[source_idx],
-                        self.max_word_bytes,
-                    )
-            write_labels(
-                batch[f"{prefix}_labels"],
-                row_idx,
-                segment_idx,
-                segments[segment_idx],
-                self.writer_stop_token_id,
-            )
 
     def make_batch(self, pairs: list[TokenizedParallelPair]) -> dict:
         size = len(pairs)
-
-        def side_arrays(prefix: str) -> dict[str, np.ndarray]:
-            return {
-                f"{prefix}_input_ids": np.full(
-                    (size, self.max_segments, self.context_size, self.max_word_bytes),
-                    self.pad_token_id,
-                    dtype=np.int64,
-                ),
-                f"{prefix}_word_masks": np.zeros(
-                    (size, self.max_segments, self.context_size, self.max_word_bytes),
-                    dtype=np.bool_,
-                ),
-                f"{prefix}_labels": np.full(
-                    (size, self.max_segments, self.writer_max_positions),
-                    -100,
-                    dtype=np.int64,
-                ),
-                f"{prefix}_unit_mask": np.zeros((size, self.max_segments), dtype=np.bool_),
-                f"{prefix}_segment_counts": np.zeros((size,), dtype=np.int64),
-            }
-
         batch = {
-            **side_arrays("tr"),
-            **side_arrays("en"),
-            "source_line_ids": np.zeros((size,), dtype=np.int64),
+            **self.side_packed(pairs, "tr"),
+            **self.side_packed(pairs, "en"),
+            "source_line_ids": torch.zeros((size,), dtype=torch.long),
         }
         for row_idx, pair in enumerate(pairs):
-            batch["source_line_ids"][row_idx] = pair.line_id
-            self.fill_side(batch, "tr", row_idx, pair.tr_segments)
-            self.fill_side(batch, "en", row_idx, pair.en_segments)
-        return {
-            key: torch.from_numpy(value)
-            for key, value in batch.items()
-        }
+            batch["source_line_ids"][row_idx] = int(pair.line_id)
+        return batch
 
     def __iter__(self):
         worker = get_worker_info()
@@ -337,11 +307,12 @@ def valid_label_mask(labels: torch.Tensor, writer_stop_token_id: int, pad_token_
 
 
 def batch_token_set_targets(
-    labels: torch.Tensor,
+    labels,
     writer_stop_token_id: int,
     pad_token_id: int,
     eos_token_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    labels = labels.labels if hasattr(labels, "labels") else labels
     flat = labels.reshape(labels.shape[0], -1)
     valid = valid_label_mask(flat, writer_stop_token_id, pad_token_id, eos_token_id)
     vocab_ids = torch.unique(flat[valid])
@@ -481,7 +452,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--num-encoder-layers", type=int, default=DIL_MODEL_DEFAULTS["num_encoder_layers"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
-    parser.add_argument("--max-word-bytes", type=int, default=DIL_MODEL_DEFAULTS["max_word_bytes"])
+    parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--context-radius", type=int, default=DIL_MODEL_DEFAULTS["context_radius"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -577,7 +548,7 @@ def build_config(args, tokenizer: HybridTokenizer) -> DilConfig:
         intermediate_size=args.intermediate_size,
         num_encoder_layers=args.num_encoder_layers,
         latent_size=args.latent_size,
-        max_word_bytes=args.max_word_bytes,
+        max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         context_radius=args.context_radius,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -801,14 +772,12 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
         return reduce_metric_sums(total)
 
     def encode_side(self, batch: dict, prefix: str) -> torch.Tensor:
-        input_ids = batch[f"{prefix}_input_ids"]
-        word_masks = batch[f"{prefix}_word_masks"]
+        surface = batch[f"{prefix}_surface"]
         unit_mask = batch[f"{prefix}_unit_mask"]
-        batch_size, segment_count, context_size, max_word_bytes = input_ids.shape
-        flat_ids = input_ids.reshape(batch_size * segment_count, context_size, max_word_bytes)
-        flat_masks = word_masks.reshape(batch_size * segment_count, context_size, max_word_bytes)
+        batch_size, segment_count = unit_mask.shape
         flat_active = unit_mask.reshape(batch_size * segment_count)
-        encoded = self.model.encode(flat_ids[flat_active], flat_masks[flat_active]).float()
+        encoded_all = self.model.encode(surface).float()
+        encoded = encoded_all[flat_active]
         latents = encoded.new_zeros((batch_size * segment_count, self.config.latent_size))
         latents[flat_active] = encoded
         return latents.reshape(batch_size, segment_count, self.config.latent_size)
@@ -816,14 +785,11 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
     def writer_side_loss(
         self,
         latents: torch.Tensor,
-        labels: torch.Tensor,
+        labels,
         unit_mask: torch.Tensor,
         step: int | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        active = unit_mask.reshape(-1)
-        flat_latents = latents.reshape(-1, latents.shape[-1])[active].detach()
-        flat_labels = labels.reshape(-1, labels.shape[-1])[active]
-        return self.model.writer_loss_and_metrics(flat_latents, flat_labels, step)
+        return self.model.writer_loss_and_metrics(latents.detach(), labels, step)
 
     def forward_batch(self, batch: dict, step: int | None) -> TeacherlessDilOutput:
         tr_latents = self.encode_side(batch, "tr")
@@ -926,13 +892,19 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
 
     def train_step(self, batch: dict, step: int) -> StepResult:
         outputs = self.forward_batch(batch, step)
-        token_count = int(batch["tr_labels"].ne(-100).sum().detach().cpu() + batch["en_labels"].ne(-100).sum().detach().cpu())
+        token_count = int(
+            batch["tr_labels"].label_mask.sum().detach().cpu()
+            + batch["en_labels"].label_mask.sum().detach().cpu()
+        )
         window_count = int(batch["tr_unit_mask"].sum().detach().cpu() + batch["en_unit_mask"].sum().detach().cpu())
         return StepResult(outputs.loss, outputs, token_count=token_count, window_count=window_count, batch=batch)
 
     def eval_step(self, batch: dict) -> StepResult:
         outputs = self.forward_batch(batch, self.completed_step)
-        token_count = int(batch["tr_labels"].ne(-100).sum().detach().cpu() + batch["en_labels"].ne(-100).sum().detach().cpu())
+        token_count = int(
+            batch["tr_labels"].label_mask.sum().detach().cpu()
+            + batch["en_labels"].label_mask.sum().detach().cpu()
+        )
         window_count = int(batch["tr_unit_mask"].sum().detach().cpu() + batch["en_unit_mask"].sum().detach().cpu())
         return StepResult(outputs.loss, outputs, token_count=token_count, window_count=window_count, batch=batch)
 

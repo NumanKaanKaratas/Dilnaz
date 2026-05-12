@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from dilnaz.models.dil import DilConfig
+from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer
 
 
@@ -108,11 +109,11 @@ def stream_text_lines(path: Path, read_chars: int):
         raise ValueError(f"{path} produced no text blocks")
 
 
-def stream_token_pieces(path: Path, tokenizer: HybridTokenizer, max_word_bytes: int, read_chars: int):
+def stream_token_pieces(path: Path, tokenizer: HybridTokenizer, max_surface_pieces_per_unit: int, read_chars: int):
     for line in stream_text_lines(path, read_chars):
         emitted = False
         for segment in tokenizer.encode_segments(line):
-            if segment.piece_len > max_word_bytes:
+            if segment.piece_len > max_surface_pieces_per_unit:
                 continue
             token_ids = [piece.token_id for piece in segment.pieces]
             if not token_ids:
@@ -137,7 +138,7 @@ def vocab_fingerprint(tokenizer: HybridTokenizer) -> str:
 def token_cache_key(
     path: Path,
     tokenizer: HybridTokenizer,
-    max_word_bytes: int,
+    max_surface_pieces_per_unit: int,
     read_chars: int,
 ) -> str:
     stat = path.stat()
@@ -145,7 +146,7 @@ def token_cache_key(
         "path": str(path.resolve()),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "max_word_bytes": max_word_bytes,
+        "max_surface_pieces_per_unit": max_surface_pieces_per_unit,
         "read_chars": read_chars,
         "vocab": vocab_fingerprint(tokenizer),
     }
@@ -155,8 +156,8 @@ def token_cache_key(
 
 def token_cache_paths(cache_dir: Path, key: str) -> tuple[Path, Path, Path]:
     return (
-        cache_dir / f"{key}.ids.npy",
-        cache_dir / f"{key}.lengths.npy",
+        cache_dir / f"{key}.surface_ids.npy",
+        cache_dir / f"{key}.surface_offsets.npy",
         cache_dir / f"{key}.json",
     )
 
@@ -164,32 +165,37 @@ def token_cache_paths(cache_dir: Path, key: str) -> tuple[Path, Path, Path]:
 def build_token_cache(
     path: Path,
     tokenizer: HybridTokenizer,
-    max_word_bytes: int,
+    max_surface_pieces_per_unit: int,
     pad_token_id: int,
     read_chars: int,
     cache_dir: Path,
 ) -> tuple[Path, Path, int]:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = token_cache_key(path, tokenizer, max_word_bytes, read_chars)
-    ids_path, lengths_path, meta_path = token_cache_paths(cache_dir, key)
-    if ids_path.exists() and lengths_path.exists() and meta_path.exists():
+    key = token_cache_key(path, tokenizer, max_surface_pieces_per_unit, read_chars)
+    ids_path, offsets_path, meta_path = token_cache_paths(cache_dir, key)
+    if ids_path.exists() and offsets_path.exists() and meta_path.exists():
         with meta_path.open("r", encoding="utf-8") as handle:
             meta = json.load(handle)
         if meta["format_version"] == TOKEN_CACHE_FORMAT_VERSION:
-            return ids_path, lengths_path, int(meta["token_count"])
+            return ids_path, offsets_path, int(meta["token_count"])
 
-    token_count = sum(1 for _ in stream_token_pieces(path, tokenizer, max_word_bytes, read_chars))
+    pieces = list(stream_token_pieces(path, tokenizer, max_surface_pieces_per_unit, read_chars))
+    token_count = len(pieces)
     if token_count < 2:
         raise ValueError(f"{path} needs at least two tokens for sequence training")
-    byte_ids = np.lib.format.open_memmap(ids_path, mode="w+", dtype=np.uint16, shape=(token_count, max_word_bytes))
-    lengths = np.lib.format.open_memmap(lengths_path, mode="w+", dtype=np.uint8, shape=(token_count,))
-    byte_ids[:] = pad_token_id
-    for token_idx, ids in enumerate(stream_token_pieces(path, tokenizer, max_word_bytes, read_chars)):
+    total_pieces = sum(len(ids) for ids in pieces)
+    surface_ids = np.lib.format.open_memmap(ids_path, mode="w+", dtype=np.uint32, shape=(total_pieces,))
+    offsets = np.lib.format.open_memmap(offsets_path, mode="w+", dtype=np.int64, shape=(token_count + 1,))
+    cursor = 0
+    offsets[0] = 0
+    for token_idx, ids in enumerate(pieces):
         width = len(ids)
-        byte_ids[token_idx, :width] = np.asarray(ids, dtype=np.uint16)
-        lengths[token_idx] = width
-    byte_ids.flush()
-    lengths.flush()
+        if width:
+            surface_ids[cursor : cursor + width] = np.asarray(ids, dtype=np.uint32)
+        cursor += width
+        offsets[token_idx + 1] = cursor
+    surface_ids.flush()
+    offsets.flush()
 
     stat = path.stat()
     meta = {
@@ -198,198 +204,21 @@ def build_token_cache(
         "source_size": stat.st_size,
         "source_mtime_ns": stat.st_mtime_ns,
         "token_count": token_count,
-        "max_word_bytes": max_word_bytes,
+        "max_surface_pieces_per_unit": max_surface_pieces_per_unit,
         "pad_token_id": pad_token_id,
         "read_chars": read_chars,
         "vocab_size": tokenizer.vocab_size,
+        "surface_piece_count": total_pieces,
     }
     with meta_path.open("w", encoding="utf-8") as handle:
         json.dump(meta, handle, indent=2)
-    return ids_path, lengths_path, token_count
-
-
-class RandomWindowNazDataset(IterableDataset):
-    def __init__(
-        self,
-        ids_path: Path,
-        lengths_path: Path,
-        token_count: int,
-        config: DilConfig,
-        sequence_length: int,
-        batch_size: int,
-        seed: int,
-    ):
-        super().__init__()
-        self.ids_path = ids_path
-        self.lengths_path = lengths_path
-        self.token_count = token_count
-        self.max_word_bytes = config.max_word_bytes
-        self.pad_token_id = config.pad_token_id
-        self.sequence_length = sequence_length
-        self.horizons = getattr(config, "mtp_horizons", 3)
-        self.batch_size = batch_size
-        self.seed = seed
-        self._byte_ids = None
-        self._lengths = None
-        self.offsets = np.arange(sequence_length, dtype=np.int64).reshape(1, sequence_length)
-        self.positions = torch.arange(self.max_word_bytes).reshape(1, 1, self.max_word_bytes)
-
-    @property
-    def byte_ids(self):
-        if self._byte_ids is None:
-            self._byte_ids = np.load(self.ids_path, mmap_mode="r")
-        return self._byte_ids
-
-    @property
-    def lengths(self):
-        if self._lengths is None:
-            self._lengths = np.load(self.lengths_path, mmap_mode="r")
-        return self._lengths
-
-    def make_batch(self, starts: list[int]):
-        starts_array = np.asarray(starts, dtype=np.int64).reshape(-1, 1)
-        source_idx = starts_array + self.offsets
-        unit_mask_np = source_idx < self.token_count
-        source_idx = np.minimum(source_idx, self.token_count - 1)
-        horizon_offsets = np.arange(1, self.horizons + 1, dtype=np.int64).reshape(1, 1, self.horizons)
-        target_idx = source_idx[..., None] + horizon_offsets
-        target_mask_np = target_idx < self.token_count
-        target_idx = np.minimum(target_idx, self.token_count - 1)
-
-        input_ids = torch.from_numpy(np.asarray(self.byte_ids[source_idx], dtype=np.int64))
-        target_input_ids = torch.from_numpy(np.asarray(self.byte_ids[target_idx], dtype=np.int64))
-        source_lengths = torch.from_numpy(np.asarray(self.lengths[source_idx], dtype=np.int64))
-        target_lengths = torch.from_numpy(np.asarray(self.lengths[target_idx], dtype=np.int64))
-        unit_mask = torch.from_numpy(unit_mask_np)
-        target_mask = torch.from_numpy(target_mask_np) & unit_mask.unsqueeze(-1)
-        word_masks = (self.positions < source_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
-        target_word_masks = (self.positions.unsqueeze(2) < target_lengths.unsqueeze(-1)) & target_mask.unsqueeze(-1)
-        return {
-            "input_ids": input_ids,
-            "word_masks": word_masks,
-            "target_input_ids": target_input_ids,
-            "target_word_masks": target_word_masks,
-            "unit_mask": unit_mask,
-            "target_mask": target_mask,
-        }
-
-    def sample_start(self, rng: random.Random) -> int:
-        if self.token_count <= self.sequence_length + self.horizons:
-            return 0
-        return rng.randint(0, self.token_count - self.sequence_length - self.horizons)
-
-    def iter_batches(self, rng: random.Random):
-        while True:
-            starts = [self.sample_start(rng) for _ in range(self.batch_size)]
-            yield self.make_batch(starts)
-
-    def __iter__(self):
-        worker = get_worker_info()
-        worker_id = 0 if worker is None else worker.id
-        rng = random.Random(self.seed + worker_id * 1_000_003)
-        yield from self.iter_batches(rng)
+    return ids_path, offsets_path, token_count
 
 
 class StreamingTextNazDataset(IterableDataset):
-    def __init__(
-        self,
-        train_file: Path,
-        tokenizer: HybridTokenizer,
-        config: DilConfig,
-        sequence_length: int,
-        batch_size: int,
-        read_chars: int,
-        repeat: bool,
-    ):
+    def __init__(self, *args, **kwargs):
         super().__init__()
-        self.train_file = train_file
-        self.tokenizer = tokenizer
-        self.max_word_bytes = config.max_word_bytes
-        self.pad_token_id = config.pad_token_id
-        self.sequence_length = sequence_length
-        self.horizons = getattr(config, "mtp_horizons", 3)
-        self.batch_size = batch_size
-        self.read_chars = read_chars
-        self.repeat = repeat
-        self.positions = torch.arange(self.max_word_bytes).reshape(1, 1, self.max_word_bytes)
-
-    def make_batch(self, windows: list[list[list[int]]]) -> dict:
-        batch_size = len(windows)
-        source = [window[: self.sequence_length] for window in windows]
-        input_ids = torch.full(
-            (batch_size, self.sequence_length, self.max_word_bytes),
-            self.pad_token_id,
-            dtype=torch.long,
-        )
-        target_input_ids = torch.full(
-            (batch_size, self.sequence_length, self.horizons, self.max_word_bytes),
-            self.pad_token_id,
-            dtype=torch.long,
-        )
-        source_lengths = torch.zeros((batch_size, self.sequence_length), dtype=torch.long)
-        target_lengths = torch.zeros((batch_size, self.sequence_length, self.horizons), dtype=torch.long)
-        for row_idx, source_window in enumerate(source):
-            for token_idx, token_ids in enumerate(source_window):
-                width = len(token_ids)
-                input_ids[row_idx, token_idx, :width] = torch.tensor(token_ids, dtype=torch.long)
-                source_lengths[row_idx, token_idx] = width
-            for token_idx in range(self.sequence_length):
-                for horizon_idx in range(self.horizons):
-                    target_ids = windows[row_idx][token_idx + horizon_idx + 1]
-                    width = len(target_ids)
-                    target_input_ids[row_idx, token_idx, horizon_idx, :width] = torch.tensor(target_ids, dtype=torch.long)
-                    target_lengths[row_idx, token_idx, horizon_idx] = width
-        unit_mask = source_lengths.gt(0)
-        word_masks = (self.positions < source_lengths.unsqueeze(-1)) & unit_mask.unsqueeze(-1)
-        target_mask = target_lengths.gt(0) & unit_mask.unsqueeze(-1)
-        target_word_masks = (
-            self.positions.unsqueeze(2) < target_lengths.unsqueeze(-1)
-        ) & target_mask.unsqueeze(-1)
-        return {
-            "input_ids": input_ids,
-            "word_masks": word_masks,
-            "target_input_ids": target_input_ids,
-            "target_word_masks": target_word_masks,
-            "unit_mask": unit_mask,
-            "target_mask": target_mask,
-            "attention_mask": None,
-        }
-
-    def iter_windows_once(self, worker_id: int, worker_count: int):
-        buffer: list[list[int]] = []
-        window_idx = 0
-        for token_ids in stream_token_pieces(
-            self.train_file,
-            self.tokenizer,
-            self.max_word_bytes,
-            self.read_chars,
-        ):
-            buffer.append(token_ids)
-            if len(buffer) == self.sequence_length + self.horizons:
-                if window_idx % worker_count == worker_id:
-                    yield list(buffer)
-                window_idx += 1
-                buffer.pop(0)
-
-    def __iter__(self):
-        worker = get_worker_info()
-        worker_id = 0 if worker is None else worker.id
-        worker_count = 1 if worker is None else worker.num_workers
-        while True:
-            emitted = False
-            batch: list[list[list[int]]] = []
-            for window in self.iter_windows_once(worker_id, worker_count):
-                emitted = True
-                batch.append(window)
-                if len(batch) == self.batch_size:
-                    yield self.make_batch(batch)
-                    batch = []
-            if batch:
-                yield self.make_batch(batch)
-            if not emitted:
-                raise ValueError(f"{self.train_file} produced no Naz streaming windows")
-            if not self.repeat:
-                return
+        raise ValueError("Naz streaming trains from semantic caches; use data_mode=cached or resident")
 
 
 def make_naz_loader(dataset, num_workers: int, pin_memory: bool, prefetch_factor: int):
@@ -404,7 +233,7 @@ class ResidentNazBatcher:
     def __init__(
         self,
         ids_path: Path,
-        lengths_path: Path,
+        offsets_path: Path,
         token_count: int,
         config: DilConfig,
         sequence_length: int,
@@ -412,18 +241,18 @@ class ResidentNazBatcher:
         device: torch.device,
         seed: int,
     ):
-        self.byte_ids = torch.from_numpy(np.array(np.load(ids_path, mmap_mode="r"), dtype=np.int64, copy=True)).to(device)
-        self.lengths = torch.from_numpy(np.array(np.load(lengths_path, mmap_mode="r"), dtype=np.int64, copy=True)).to(device)
+        self.surface_ids = torch.from_numpy(np.array(np.load(ids_path, mmap_mode="r"), dtype=np.int64, copy=True)).to(device)
+        self.surface_offsets = torch.from_numpy(np.array(np.load(offsets_path, mmap_mode="r"), dtype=np.int64, copy=True)).to(device)
         self.token_count = token_count
-        self.max_word_bytes = config.max_word_bytes
         self.pad_token_id = config.pad_token_id
+        self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
+        self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.sequence_length = sequence_length
         self.horizons = getattr(config, "mtp_horizons", 3)
         self.batch_size = batch_size
         self.device = device
         self.generator = torch.Generator(device=device)
         self.generator.manual_seed(seed)
-        self.positions = torch.arange(self.max_word_bytes, device=device).reshape(1, 1, self.max_word_bytes)
         self.offsets = torch.arange(sequence_length, device=device).reshape(1, sequence_length)
         if token_count <= self.horizons:
             raise ValueError("resident Naz data needs more tokens than MTP horizons")
@@ -442,45 +271,22 @@ class ResidentNazBatcher:
         return self.make_batch(starts)
 
     def make_batch(self, starts: torch.Tensor):
-        source_idx = starts + self.offsets
-        unit_mask = source_idx < self.token_count
-        source_idx = source_idx.clamp_max(self.token_count - 1)
-        horizon_offsets = torch.arange(1, self.horizons + 1, device=self.device).reshape(1, 1, self.horizons)
-        target_idx = source_idx.unsqueeze(-1) + horizon_offsets
-        target_mask = target_idx < self.token_count
-        target_idx = target_idx.clamp_max(self.token_count - 1)
-        batch_size = starts.shape[0]
+        raise ValueError("ResidentNazBatcher is only used to build semantic caches")
 
-        input_ids = self.byte_ids.index_select(0, source_idx.reshape(-1)).reshape(
-            batch_size,
-            self.sequence_length,
-            self.max_word_bytes,
+    def unit_piece_ids(self, token_idx: int) -> list[int]:
+        start = int(self.surface_offsets[token_idx].detach().cpu())
+        end = int(self.surface_offsets[token_idx + 1].detach().cpu())
+        return self.surface_ids[start:end].detach().cpu().tolist()
+
+    def surface_slice(self, start: int, end: int):
+        row = [self.unit_piece_ids(token_idx) for token_idx in range(start, end)]
+        return pack_token_units(
+            [row],
+            pad_token_id=self.pad_token_id,
+            bucket_sizes=self.surface_bucket_sizes,
+            max_pieces_per_unit=self.max_surface_pieces_per_unit,
+            device=self.device,
         )
-        target_input_ids = self.byte_ids.index_select(0, target_idx.reshape(-1)).reshape(
-            batch_size,
-            self.sequence_length,
-            self.horizons,
-            self.max_word_bytes,
-        )
-        source_lengths = self.lengths.index_select(0, source_idx.reshape(-1)).reshape(
-            batch_size,
-            self.sequence_length,
-            1,
-        )
-        target_lengths = self.lengths.index_select(0, target_idx.reshape(-1)).reshape(
-            batch_size,
-            self.sequence_length,
-            self.horizons,
-            1,
-        )
-        return {
-            "input_ids": input_ids,
-            "word_masks": (self.positions < source_lengths) & unit_mask.unsqueeze(-1),
-            "target_input_ids": target_input_ids,
-            "target_word_masks": (self.positions.unsqueeze(2) < target_lengths) & target_mask.unsqueeze(-1),
-            "unit_mask": unit_mask,
-            "target_mask": target_mask,
-        }
 
 
 class ResidentNazEvalLoader:
@@ -500,8 +306,6 @@ class ResidentNazSemanticBatcher:
         self,
         semantic_states: torch.Tensor,
         target_latents: torch.Tensor,
-        byte_ids: torch.LongTensor,
-        lengths: torch.LongTensor,
         sequence_length: int,
         batch_size: int,
         seed: int,
@@ -509,14 +313,9 @@ class ResidentNazSemanticBatcher:
     ):
         if semantic_states.shape != target_latents.shape:
             raise ValueError("semantic and target caches must have matching token dimensions")
-        if byte_ids.shape[0] != semantic_states.shape[0] or lengths.shape[0] != semantic_states.shape[0]:
-            raise ValueError("surface cache must match semantic token count")
         self.semantic_states = semantic_states
         self.target_latents = target_latents
-        self.byte_ids = byte_ids.long()
-        self.lengths = lengths.long()
         self.token_count = semantic_states.shape[0]
-        self.max_word_bytes = byte_ids.shape[1]
         self.sequence_length = sequence_length
         self.horizons = horizons
         self.batch_size = batch_size
@@ -525,7 +324,6 @@ class ResidentNazSemanticBatcher:
         self.generator.manual_seed(seed)
         self.offsets = torch.arange(sequence_length, device=self.device).reshape(1, sequence_length)
         self.horizon_offsets = torch.arange(1, horizons + 1, device=self.device).reshape(1, 1, horizons)
-        self.positions = torch.arange(self.max_word_bytes, device=self.device).reshape(1, 1, self.max_word_bytes)
         if self.token_count <= horizons:
             raise ValueError("resident semantic Naz data needs more tokens than MTP horizons")
 

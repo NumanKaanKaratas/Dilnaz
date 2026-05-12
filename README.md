@@ -153,7 +153,7 @@ The tokenizer provides:
 - compact surface pieces for common forms
 - leading-space variants for boundary-aware decoding
 - numeric, punctuation, common-word, contextual and character pieces
-- fixed-width segment tensors through `max_word_bytes`
+- packed variable-length surface tensors through `dilnaz.surface`
 - roundtrip decoding tests for Turkish text, digits, punctuation and JSONL newline escapes
 
 Default vocabulary:
