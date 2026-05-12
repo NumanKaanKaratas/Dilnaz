@@ -43,6 +43,7 @@ from train_dil_writer import (
     resolve_future_mode,
     sample_diffusion_step,
     writer_only_forward,
+    writer_only_metrics,
 )
 from interface_naz import SlidingWriterBuffer, stream_text as stream_naz_text
 
@@ -685,6 +686,97 @@ def test_dil_position_age_changes_writer_transition_output():
     assert not torch.allclose(fresh.token_logits, stale.token_logits)
 
 
+def test_dil_zone_condition_changes_writer_transition_output():
+    config = tiny_config()
+    model = Dil(config).eval()
+    semantic = torch.randn(1, config.writer_sliding_window_size, config.latent_size)
+    surface_state = torch.full(
+        (1, config.writer_sliding_window_size, config.writer_max_positions),
+        -100,
+        dtype=torch.long,
+    )
+    active_zone = torch.full((1, config.writer_sliding_window_size), model.writer.ZONE_ACTIVE, dtype=torch.long)
+    right_zone = torch.full((1, config.writer_sliding_window_size), model.writer.ZONE_RIGHT, dtype=torch.long)
+
+    active = model.writer_transition_outputs(semantic, surface_state=surface_state, zone_ids=active_zone)
+    right = model.writer_transition_outputs(semantic, surface_state=surface_state, zone_ids=right_zone)
+
+    assert not torch.allclose(active.token_logits, right.token_logits)
+
+
+def test_dil_byte_state_cross_attention_handles_empty_state_without_nan():
+    config = tiny_config()
+    model = Dil(config).eval()
+    semantic = torch.randn(2, config.writer_sliding_window_size, config.latent_size)
+    surface_state = torch.full(
+        (2, config.writer_sliding_window_size, config.writer_max_positions),
+        -100,
+        dtype=torch.long,
+    )
+    surface_state_mask = torch.zeros_like(surface_state)
+    frozen_mask = torch.zeros_like(surface_state, dtype=torch.bool)
+
+    output = model.writer_transition_outputs(
+        semantic,
+        surface_state=surface_state,
+        surface_state_mask=surface_state_mask,
+        frozen_mask=frozen_mask,
+    )
+
+    assert torch.isfinite(output.token_logits).all()
+    assert torch.isfinite(output.state_valid_logits).all()
+    assert torch.isfinite(output.emit_logits).all()
+
+
+def test_dil_known_byte_state_changes_writer_transition_output():
+    config = tiny_config()
+    model = Dil(config).eval()
+    semantic = torch.randn(1, config.writer_sliding_window_size, config.latent_size)
+    state_a = torch.full(
+        (1, config.writer_sliding_window_size, config.writer_max_positions),
+        -100,
+        dtype=torch.long,
+    )
+    state_b = state_a.clone()
+    state_a[:, config.writer_left_frozen, 0] = 5
+    state_b[:, config.writer_left_frozen, 0] = 6
+    surface_state_mask = torch.zeros_like(state_a)
+    surface_state_mask[:, config.writer_left_frozen, 0] = model.writer.STATE_KNOWN
+    frozen_mask = surface_state_mask.gt(0)
+
+    output_a = model.writer_transition_outputs(
+        semantic,
+        surface_state=state_a,
+        surface_state_mask=surface_state_mask,
+        frozen_mask=frozen_mask,
+    )
+    output_b = model.writer_transition_outputs(
+        semantic,
+        surface_state=state_b,
+        surface_state_mask=surface_state_mask,
+        frozen_mask=frozen_mask,
+    )
+
+    assert not torch.allclose(output_a.token_logits, output_b.token_logits)
+
+
+def test_dil_future_attention_accepts_short_horizon_inputs():
+    config = tiny_config()
+    model = Dil(config).eval()
+    semantic = torch.randn(1, config.writer_sliding_window_size, config.latent_size)
+    future_latents = torch.randn(1, config.writer_sliding_window_size, 2, config.latent_size)
+
+    output = model.writer_transition_outputs(semantic, future_latents=future_latents)
+
+    assert output.token_logits.shape == (
+        1,
+        config.writer_sliding_window_size,
+        config.writer_max_positions,
+        config.writer_vocab_size,
+    )
+    assert torch.isfinite(output.token_logits).all()
+
+
 def test_dil_forward_keeps_target_latent_shape():
     config = tiny_config()
     model = Dil(config)
@@ -887,6 +979,40 @@ def test_sliding_writer_only_step_keeps_online_encoder_frozen():
     assert model.writer.token_head.weight.grad is not None
     assert model.writer.state_valid_head.weight.grad is not None
     assert model.writer.emit_head.weight.grad is not None
+
+
+def test_sliding_writer_metrics_include_state_quality_ratios():
+    config = tiny_config()
+    model = Dil(config)
+    freeze_for_writer_only(model)
+    batch_size = 1
+    window_size = config.writer_sliding_window_size
+    input_ids = torch.full(
+        (batch_size, window_size, config.context_size, config.max_word_bytes),
+        config.pad_token_id,
+        dtype=torch.long,
+    )
+    input_ids[:, :, config.target_index, 0] = 2
+    labels = torch.full((batch_size, window_size, config.writer_max_positions), -100, dtype=torch.long)
+    labels[:, :, 0] = 2
+    labels[:, :, 1] = config.writer_stop_token_id
+    zone_ids = torch.full((batch_size, window_size), model.writer.ZONE_ACTIVE, dtype=torch.long)
+    zone_ids[:, : config.writer_left_frozen] = model.writer.ZONE_LEFT
+    zone_ids[:, config.writer_left_frozen + config.writer_active_size :] = model.writer.ZONE_RIGHT
+    batch = {
+        "input_ids": input_ids,
+        "word_masks": input_ids.ne(config.pad_token_id),
+        "labels": labels,
+        "zone_ids": zone_ids,
+        "window_mask": torch.ones((batch_size, window_size), dtype=torch.bool),
+    }
+
+    metrics = writer_only_metrics(model, batch, training_step=1)
+
+    for key in ("empty_ratio", "draft_ratio", "known_ratio", "frozen_ratio"):
+        assert key in metrics
+        assert torch.isfinite(metrics[key])
+        assert 0.0 <= float(metrics[key]) <= 1.0
 
 
 def test_writer_eval_diffusion_step_uses_low_noise_endpoint():

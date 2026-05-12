@@ -131,20 +131,115 @@ class DilConvSwiGLUBlock(nn.Module):
         return hidden_states
 
 
+class DilAdaLNModulation(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, hidden_size * 3)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, hidden_states: torch.Tensor, condition: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if condition.dim() == hidden_states.dim() - 1:
+            condition = condition.unsqueeze(-2)
+        shift, scale, gate = self.proj(condition).chunk(3, dim=-1)
+        return hidden_states * (1.0 + scale) + shift, gate
+
+
+class DilAdaLNConvSwiGLUBlock(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int, kernel_size: int, eps: float, bias: bool, dropout: float = 0.0):
+        super().__init__()
+        padding = kernel_size // 2
+        self.norm = DilRMSNorm(hidden_size, eps=eps)
+        self.adaln = DilAdaLNModulation(hidden_size)
+        self.depthwise = nn.Conv1d(
+            hidden_size,
+            hidden_size,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=hidden_size,
+            bias=bias,
+        )
+        self.gate_proj = nn.Conv1d(hidden_size, intermediate_size, kernel_size=1, bias=bias)
+        self.up_proj = nn.Conv1d(hidden_size, intermediate_size, kernel_size=1, bias=bias)
+        self.down_proj = nn.Conv1d(intermediate_size, hidden_size, kernel_size=1, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, hidden_states: torch.Tensor, condition: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states, residual_gate = self.adaln(self.norm(hidden_states), condition)
+        if mask is not None:
+            hidden_states = hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
+        hidden_states = hidden_states.transpose(1, 2)
+        hidden_states = self.depthwise(hidden_states)
+        hidden_states = F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        hidden_states = self.down_proj(hidden_states).transpose(1, 2)
+        hidden_states = residual + self.dropout(hidden_states) * residual_gate
+        if mask is not None:
+            hidden_states = hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
+        return hidden_states
+
+
+class DilByteStateCrossAttention(nn.Module):
+    def __init__(self, hidden_size: int, heads: int, eps: float, dropout: float):
+        super().__init__()
+        self.query_norm = DilRMSNorm(hidden_size, eps=eps)
+        self.state_norm = DilRMSNorm(hidden_size, eps=eps)
+        self.adaln = DilAdaLNModulation(hidden_size)
+        self.attn = nn.MultiheadAttention(hidden_size, heads, dropout=dropout, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        condition: torch.Tensor,
+        state_hidden: torch.Tensor,
+        state_mask: torch.Tensor,
+        byte_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        safe_state_mask = state_mask.bool().clone()
+        has_state = safe_state_mask.any(dim=1)
+        empty_rows = ~has_state
+        if empty_rows.any():
+            safe_state_mask[empty_rows, 0] = True
+        query, residual_gate = self.adaln(self.query_norm(hidden_states), condition)
+        key_value = self.state_norm(state_hidden) * safe_state_mask.unsqueeze(-1).to(state_hidden.dtype)
+        attn_output, _ = self.attn(
+            query,
+            key_value,
+            key_value,
+            key_padding_mask=~safe_state_mask,
+            need_weights=False,
+        )
+        attn_output = attn_output * has_state.view(-1, 1, 1).to(attn_output.dtype)
+        if byte_mask is not None:
+            attn_output = attn_output * byte_mask.unsqueeze(-1).to(attn_output.dtype)
+        hidden_states = hidden_states + self.dropout(attn_output) * residual_gate
+        if byte_mask is not None:
+            hidden_states = hidden_states * byte_mask.unsqueeze(-1).to(hidden_states.dtype)
+        return hidden_states
+
+
 class DilWriterWordMixerBlock(nn.Module):
     def __init__(self, hidden_size: int, heads: int, eps: float, bias: bool, dropout: float):
         super().__init__()
         self.attn_norm = DilRMSNorm(hidden_size, eps=eps)
+        self.attn_adaln = DilAdaLNModulation(hidden_size)
         self.attn = nn.MultiheadAttention(hidden_size, heads, dropout=dropout, batch_first=True)
         self.attn_dropout = nn.Dropout(dropout)
         self.ffn_norm = DilRMSNorm(hidden_size, eps=eps)
+        self.ffn_adaln = DilAdaLNModulation(hidden_size)
         intermediate_size = hidden_size * 4
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
         self.ffn_dropout = nn.Dropout(dropout)
 
-    def forward(self, hidden_states: torch.Tensor, window_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        condition: torch.Tensor,
+        window_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if window_mask is not None:
             safe_mask = window_mask.bool().clone()
             empty_rows = ~safe_mask.any(dim=1)
@@ -157,7 +252,7 @@ class DilWriterWordMixerBlock(nn.Module):
             key_padding_mask = None
 
         residual = hidden_states
-        attn_input = self.attn_norm(hidden_states)
+        attn_input, attn_gate = self.attn_adaln(self.attn_norm(hidden_states), condition)
         attn_output, _ = self.attn(
             attn_input,
             attn_input,
@@ -165,12 +260,12 @@ class DilWriterWordMixerBlock(nn.Module):
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
-        hidden_states = residual + self.attn_dropout(attn_output)
+        hidden_states = residual + self.attn_dropout(attn_output) * attn_gate
 
         residual = hidden_states
-        hidden_states = self.ffn_norm(hidden_states)
+        hidden_states, ffn_gate = self.ffn_adaln(self.ffn_norm(hidden_states), condition)
         hidden_states = F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
-        hidden_states = residual + self.ffn_dropout(self.down_proj(hidden_states))
+        hidden_states = residual + self.ffn_dropout(self.down_proj(hidden_states)) * ffn_gate
         if safe_mask is not None:
             hidden_states = hidden_states * safe_mask.unsqueeze(-1).to(hidden_states.dtype)
         return hidden_states
@@ -360,8 +455,15 @@ class DilConditionalWriter(nn.Module):
         self.gradient_checkpointing = config.writer_gradient_checkpointing
         self.commit_temperature = config.writer_commit_temperature
         self.semantic_proj = nn.Linear(config.latent_size, config.hidden_size)
-        self.future_proj = nn.Linear(config.latent_size, config.hidden_size, bias=False)
+        self.future_latent_proj = nn.Linear(config.latent_size, config.hidden_size, bias=False)
+        self.future_query_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.future_key_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.future_query_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.future_key_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.future_value_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.future_out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.future_gate = nn.Linear(config.hidden_size * 2, config.hidden_size)
+        self.future_horizon_embeddings = nn.Embedding(config.writer_max_window_size, config.hidden_size)
         self.state_token_embeddings = nn.Embedding(config.writer_state_vocab_size, config.hidden_size)
         self.state_kind_embeddings = nn.Embedding(3, config.hidden_size)
         self.frozen_embeddings = nn.Embedding(2, config.hidden_size)
@@ -369,6 +471,9 @@ class DilConditionalWriter(nn.Module):
         self.position_age_embeddings = nn.Embedding(config.writer_max_position_age + 1, config.hidden_size)
         self.word_position_embeddings = nn.Embedding(config.writer_max_window_size, config.hidden_size)
         self.position_embeddings = nn.Embedding(config.writer_max_positions, config.hidden_size)
+        self.state_quality_proj = nn.Linear(4, config.hidden_size, bias=False)
+        self.condition_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.condition_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.word_mixers = nn.ModuleList(
             [
                 DilWriterWordMixerBlock(
@@ -382,9 +487,15 @@ class DilConditionalWriter(nn.Module):
             ]
         )
         intermediate_size = config.hidden_size * config.writer_conv_expansion
+        self.byte_state_cross_attention = DilByteStateCrossAttention(
+            config.hidden_size,
+            config.writer_word_attention_heads,
+            config.rms_norm_eps,
+            config.writer_dropout,
+        )
         self.blocks = nn.ModuleList(
             [
-                DilConvSwiGLUBlock(
+                DilAdaLNConvSwiGLUBlock(
                     config.hidden_size,
                     intermediate_size,
                     config.writer_conv_kernel_size,
@@ -480,7 +591,7 @@ class DilConditionalWriter(nn.Module):
         surface_state: torch.Tensor,
         surface_state_mask: Optional[torch.Tensor],
         frozen_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         valid_token = surface_state.ge(0) & surface_state.lt(self.writer_vocab_size)
         input_ids = torch.where(valid_token, surface_state, torch.full_like(surface_state, self.writer_empty_token_id))
         if surface_state_mask is None:
@@ -499,9 +610,19 @@ class DilConditionalWriter(nn.Module):
             + self.state_kind_embeddings(state_kind)
             + self.frozen_embeddings(frozen_mask.to(dtype=torch.long))
         )
-        summary_weight = (valid_token | frozen_mask).unsqueeze(-1).to(state_hidden.dtype)
-        summary = (state_hidden * summary_weight).sum(dim=2) / summary_weight.sum(dim=2).clamp_min(1.0)
-        return state_hidden, summary
+        state_present = valid_token & state_kind.gt(0)
+        denom = torch.full(
+            state_present.shape[:2],
+            float(self.writer_max_positions),
+            device=state_hidden.device,
+            dtype=state_hidden.dtype,
+        )
+        empty_ratio = (~state_present).sum(dim=2).to(state_hidden.dtype) / denom
+        draft_ratio = (state_present & state_kind.eq(self.STATE_DRAFT)).sum(dim=2).to(state_hidden.dtype) / denom
+        known_ratio = (state_present & state_kind.eq(self.STATE_KNOWN)).sum(dim=2).to(state_hidden.dtype) / denom
+        frozen_ratio = (state_present & frozen_mask).sum(dim=2).to(state_hidden.dtype) / denom
+        state_quality = torch.stack((empty_ratio, draft_ratio, known_ratio, frozen_ratio), dim=-1)
+        return state_hidden, state_present, state_kind, state_quality
 
     def _refinement_step_embedding(self, refinement_step: int | torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         step = torch.as_tensor(refinement_step, device=device, dtype=torch.float32).reshape(())
@@ -511,6 +632,83 @@ class DilConditionalWriter(nn.Module):
         embedding[0::2] = torch.sin(angles)
         embedding[1::2] = torch.cos(angles[: embedding[1::2].shape[0]])
         return (embedding * self.refinement_step_scale).to(dtype=dtype)
+
+    def _future_attention_summary(
+        self,
+        future_latents: Optional[torch.Tensor],
+        semantic_hidden: torch.Tensor,
+        window_mask: torch.Tensor,
+        latent_size: int,
+    ) -> torch.Tensor:
+        batch_size, window_size, hidden_size = semantic_hidden.shape
+        if future_latents is None:
+            return semantic_hidden.new_zeros((batch_size, window_size, hidden_size))
+        if future_latents.dim() == 3:
+            future_latents = future_latents.unsqueeze(2)
+        if future_latents.shape[:2] != (batch_size, window_size) or future_latents.shape[-1] != latent_size:
+            raise ValueError("future_latents must be shaped [batch, window, horizons, latent]")
+        horizons = future_latents.shape[2]
+        if horizons == 0:
+            return semantic_hidden.new_zeros((batch_size, window_size, hidden_size))
+        if horizons > self.future_horizon_embeddings.num_embeddings:
+            raise ValueError("future_latents horizon count exceeds writer_max_window_size")
+        horizon_ids = torch.arange(horizons, device=future_latents.device)
+        future_hidden = self.future_latent_proj(future_latents) + self.future_horizon_embeddings(horizon_ids).view(
+            1,
+            1,
+            horizons,
+            hidden_size,
+        )
+        future_valid = future_latents.float().norm(dim=-1).gt(1e-6) & window_mask.unsqueeze(-1)
+        safe_valid = future_valid.clone()
+        has_future = safe_valid.any(dim=2)
+        empty_rows = ~has_future
+        if empty_rows.any():
+            safe_valid[empty_rows, 0] = True
+        query = self.future_query_proj(self.future_query_norm(semantic_hidden)).unsqueeze(2)
+        keys = self.future_key_proj(self.future_key_norm(future_hidden))
+        values = self.future_value_proj(future_hidden)
+        scores = (query * keys).sum(dim=-1) / math.sqrt(hidden_size)
+        scores = scores.masked_fill(~safe_valid, torch.finfo(scores.dtype).min)
+        attention = torch.softmax(scores.float(), dim=-1).to(scores.dtype).masked_fill(~safe_valid, 0.0)
+        summary = (attention.unsqueeze(-1) * values).sum(dim=2)
+        summary = self.future_out_proj(summary) * has_future.unsqueeze(-1).to(summary.dtype)
+        gate = torch.sigmoid(self.future_gate(torch.cat((semantic_hidden, summary), dim=-1)))
+        return gate * summary
+
+    def _writer_condition(
+        self,
+        semantic_window: torch.Tensor,
+        state_quality: torch.Tensor,
+        zone_ids: torch.Tensor,
+        position_age: torch.Tensor,
+        window_mask: torch.Tensor,
+        future_latents: Optional[torch.Tensor],
+        refinement_step: Optional[int | torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, window_size, latent_size = semantic_window.shape
+        semantic_hidden = self.semantic_proj(semantic_window.reshape(batch_size * window_size, latent_size)).reshape(
+            batch_size,
+            window_size,
+            -1,
+        )
+        condition = (
+            semantic_hidden
+            + self.zone_embeddings(zone_ids)
+            + self.position_age_embeddings(position_age)
+            + self.state_quality_proj(state_quality)
+        )
+        condition = condition + self._future_attention_summary(future_latents, semantic_hidden, window_mask, latent_size)
+        if refinement_step is not None and self.use_step_embedding:
+            condition = condition + self._refinement_step_embedding(refinement_step, semantic_hidden.device, semantic_hidden.dtype).view(
+                1,
+                1,
+                -1,
+            )
+        condition = self.condition_proj(self.condition_norm(condition))
+        word_positions = torch.arange(window_size, device=semantic_window.device)
+        word_hidden = semantic_hidden + condition + self.word_position_embeddings(word_positions).unsqueeze(0)
+        return word_hidden, condition
 
     def transition(
         self,
@@ -558,55 +756,53 @@ class DilConditionalWriter(nn.Module):
         window_mask = self._canonical_window_mask(window_mask, batch_size, window_size, device)
         position_age = self._canonical_position_age(position_age, batch_size, window_size, device)
 
-        state_hidden, state_summary = self._state_embeddings(surface_state, surface_state_mask, frozen_mask)
-        word_positions = torch.arange(window_size, device=device)
-        word_hidden = (
-            self.semantic_proj(semantic_window.reshape(batch_size * window_size, latent_size)).reshape(
-                batch_size,
-                window_size,
-                -1,
-            )
-            + state_summary
-            + self.zone_embeddings(zone_ids)
-            + self.position_age_embeddings(position_age)
-            + self.word_position_embeddings(word_positions).unsqueeze(0)
+        state_hidden, state_present, _, state_quality = self._state_embeddings(surface_state, surface_state_mask, frozen_mask)
+        word_hidden, condition = self._writer_condition(
+            semantic_window,
+            state_quality,
+            zone_ids,
+            position_age,
+            window_mask,
+            future_latents,
+            refinement_step,
         )
-        if future_latents is not None:
-            if future_latents.dim() == 3:
-                future_latents = future_latents.unsqueeze(2)
-            if future_latents.shape[:2] != (batch_size, window_size) or future_latents.shape[-1] != latent_size:
-                raise ValueError("future_latents must be shaped [batch, window, horizons, latent]")
-            future_hidden = self.future_proj(future_latents).mean(dim=2)
-            future_gate = torch.sigmoid(self.future_gate(torch.cat((word_hidden, future_hidden), dim=-1)))
-            word_hidden = word_hidden + future_gate * future_hidden
-        if refinement_step is not None and self.use_step_embedding:
-            word_hidden = word_hidden + self._refinement_step_embedding(
-                refinement_step,
-                device,
-                word_hidden.dtype,
-            ).view(1, 1, -1)
 
         word_hidden = self.dropout(word_hidden)
         for mixer in self.word_mixers:
             if self.gradient_checkpointing and self.training and word_hidden.requires_grad:
-                word_hidden = checkpoint(mixer, word_hidden, window_mask, use_reentrant=False)
+                word_hidden = checkpoint(mixer, word_hidden, condition, window_mask, use_reentrant=False)
             else:
-                word_hidden = mixer(word_hidden, window_mask)
+                word_hidden = mixer(word_hidden, condition, window_mask)
 
         positions = torch.arange(self.writer_max_positions, device=semantic.device)
         hidden_states = word_hidden.unsqueeze(2) + self.position_embeddings(positions).view(1, 1, -1, word_hidden.shape[-1])
         hidden_states = hidden_states + state_hidden
         hidden_states = hidden_states.reshape(batch_size * window_size, self.writer_max_positions, -1)
+        state_hidden = state_hidden.reshape(batch_size * window_size, self.writer_max_positions, -1)
+        state_present = state_present.reshape(batch_size * window_size, self.writer_max_positions)
+        byte_condition = condition.reshape(batch_size * window_size, -1)
         hidden_states = self.dropout(hidden_states)
         byte_mask = window_mask.unsqueeze(-1).expand(-1, -1, self.writer_max_positions).reshape(
             batch_size * window_size,
             self.writer_max_positions,
         )
+        if self.gradient_checkpointing and self.training and hidden_states.requires_grad:
+            hidden_states = checkpoint(
+                self.byte_state_cross_attention,
+                hidden_states,
+                byte_condition,
+                state_hidden,
+                state_present,
+                byte_mask,
+                use_reentrant=False,
+            )
+        else:
+            hidden_states = self.byte_state_cross_attention(hidden_states, byte_condition, state_hidden, state_present, byte_mask)
         for block in self.blocks:
             if self.gradient_checkpointing and self.training and hidden_states.requires_grad:
-                hidden_states = checkpoint(block, hidden_states, byte_mask, use_reentrant=False)
+                hidden_states = checkpoint(block, hidden_states, byte_condition, byte_mask, use_reentrant=False)
             else:
-                hidden_states = block(hidden_states, byte_mask)
+                hidden_states = block(hidden_states, byte_condition, byte_mask)
         hidden_states = self.final_norm(hidden_states)
         token_logits = self.token_head(hidden_states).reshape(
             batch_size,

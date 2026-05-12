@@ -79,6 +79,10 @@ WRITER_METRIC_KEYS = (
     "future_mode",
     "diffusion_step",
     "diffusion_mask_ratio",
+    "empty_ratio",
+    "draft_ratio",
+    "known_ratio",
+    "frozen_ratio",
 )
 
 
@@ -541,12 +545,18 @@ def sliding_writer_metrics(
     )
     valid = labels.ne(-100) & window_mask.unsqueeze(-1)
     filled = surface_state_mask.gt(0) & valid
+    state_present = filled & surface_state.ge(0)
+    denom = valid.sum().clamp_min(1).to(metrics["loss"].dtype)
     metrics["self_conditioning_ratio"] = metrics["loss"].new_tensor(float(self_conditioned))
-    metrics["mean_mask_ratio"] = 1.0 - filled.sum().to(metrics["loss"].dtype) / valid.sum().clamp_min(1).to(metrics["loss"].dtype)
+    metrics["mean_mask_ratio"] = 1.0 - filled.sum().to(metrics["loss"].dtype) / denom
     metrics["future_horizons"] = metrics["loss"].new_tensor(0.0 if future_latents is None else float(future_latents.shape[2]))
     metrics["future_mode"] = metrics["loss"].new_tensor(future_mode_id)
     metrics["diffusion_step"] = metrics["loss"].new_tensor(float(diffusion_step))
     metrics["diffusion_mask_ratio"] = metrics["loss"].new_tensor(float(mask_ratio))
+    metrics["empty_ratio"] = 1.0 - state_present.sum().to(metrics["loss"].dtype) / denom
+    metrics["draft_ratio"] = (state_present & surface_state_mask.eq(1)).sum().to(metrics["loss"].dtype) / denom
+    metrics["known_ratio"] = (state_present & surface_state_mask.eq(2)).sum().to(metrics["loss"].dtype) / denom
+    metrics["frozen_ratio"] = (state_present & frozen_mask).sum().to(metrics["loss"].dtype) / denom
     return metrics
 
 
@@ -608,6 +618,10 @@ def writer_only_metrics(
         "future_mode": zero,
         "diffusion_step": zero,
         "diffusion_mask_ratio": zero,
+        "empty_ratio": zero,
+        "draft_ratio": zero,
+        "known_ratio": zero,
+        "frozen_ratio": zero,
     }
 
 
@@ -859,6 +873,10 @@ def format_log(step: int, metrics: dict) -> str:
         f"future_mode={metrics['future_mode']:.0f}",
         f"diff_step={metrics['diffusion_step']:.1f}",
         f"diff_mask={metrics['diffusion_mask_ratio']:.3f}",
+        f"empty={metrics['empty_ratio']:.4f}",
+        f"draft={metrics['draft_ratio']:.4f}",
+        f"known={metrics['known_ratio']:.4f}",
+        f"frozen={metrics['frozen_ratio']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
