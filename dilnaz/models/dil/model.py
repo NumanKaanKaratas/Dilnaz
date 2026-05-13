@@ -20,8 +20,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 25:
-            raise ValueError("DIL exact-length writer checkpoints require checkpoint_format_version=25")
+        if config.checkpoint_format_version != 24:
+            raise ValueError("DIL block diffusion writer checkpoints require checkpoint_format_version=24")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
@@ -93,17 +93,12 @@ class Dil(PreTrainedModel):
         )
         if isinstance(output, DilWriterOutput):
             return output
-        values = output.to_tuple() if hasattr(output, "to_tuple") else output
-        if len(values) == 3:
-            token_logits, state_valid_logits, emit_logits = values
-            query_surface = writer_kwargs.get("query_surface")
-        else:
-            token_logits, state_valid_logits, emit_logits, query_surface = values
+        token_logits, state_valid_logits, emit_logits, length_bucket_logits = output
         return DilWriterOutput(
             token_logits=token_logits,
             state_valid_logits=state_valid_logits,
             emit_logits=emit_logits,
-            query_surface=query_surface,
+            length_bucket_logits=length_bucket_logits,
         )
 
     def _refined_transition_outputs(
@@ -249,6 +244,17 @@ class Dil(PreTrainedModel):
                 noised[mask] = angular_noise_like(noised[mask], min_tensor, max_tensor)
         return noised.to(semantic.dtype)
 
+    def length_bucket_loss(self, logits: torch.Tensor, target: PackedWriterTarget, unit_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        targets = target.length_bucket_targets.to(logits.device)
+        mask = target.query.unit_mask.to(logits.device) if unit_mask is None else unit_mask.to(logits.device)
+        per_unit = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            targets.reshape(-1),
+            reduction="none",
+        ).reshape_as(targets)
+        weights = mask.to(per_unit.dtype)
+        return (per_unit * weights).sum() / weights.sum().clamp_min(1.0)
+
     def writer_loss_and_metrics(
         self,
         semantic: torch.Tensor,
@@ -263,7 +269,8 @@ class Dil(PreTrainedModel):
             target.labels.reshape(-1),
             ignore_index=-100,
         )
-        loss = token_loss
+        length_loss = self.length_bucket_loss(output.length_bucket_logits, target)
+        loss = token_loss + length_loss
         byte_acc, token_exact, stop_acc = self.writer_metrics(output.token_logits, target)
         return loss, token_loss, byte_acc, token_exact, stop_acc
 
@@ -334,6 +341,9 @@ class Dil(PreTrainedModel):
         right_guard_token_loss = (per_token_loss * right_weights).sum() / right_weights.sum().clamp_min(1.0)
         left_weights = left.to(logits.dtype)
         left_loss = (per_token_loss * left_weights).sum() / left_weights.sum().clamp_min(1.0)
+        length_unit_weights = (zone_ids.eq(DilConditionalWriter.ZONE_ACTIVE) | zone_ids.eq(DilConditionalWriter.ZONE_RIGHT)) & window_mask
+        length_loss = self.length_bucket_loss(output.length_bucket_logits, target, length_unit_weights)
+
         state_matches = surface_state.ids.eq(labels) & valid
         state_present = surface_state.mask & surface_state.state_kind.gt(0)
         state_valid_scope = (left | active) & valid & state_present
@@ -360,6 +370,7 @@ class Dil(PreTrainedModel):
         commit_loss = state_valid_loss + emit_loss
         loss = (
             token_loss
+            + length_loss
             + left_loss * self.config.writer_left_consistency_weight
             + commit_loss * self.config.writer_commit_loss_weight
         )
@@ -387,6 +398,7 @@ class Dil(PreTrainedModel):
             return {
                 "loss": loss,
                 "token_loss": token_loss,
+                "length_bucket_loss": length_loss,
                 "active_token_loss": active_token_loss,
                 "right_guard_token_loss": right_guard_token_loss,
                 "left_consistency_loss": left_loss,

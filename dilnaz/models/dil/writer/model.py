@@ -39,6 +39,8 @@ class DilConditionalWriter(nn.Module):
         self.writer_empty_token_id = config.writer_empty_token_id
         self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
+        self.writer_output_buckets = tuple(config.writer_output_buckets)
+        self.writer_initial_output_bucket = int(config.writer_initial_output_bucket)
         self.max_window_size = config.writer_max_window_size
         self.hidden_size = config.hidden_size
         self.refinement_step_scale = config.initializer_range
@@ -47,7 +49,6 @@ class DilConditionalWriter(nn.Module):
         self.max_position_age = config.writer_max_position_age
         self.gradient_checkpointing = config.writer_gradient_checkpointing
         self.commit_temperature = config.writer_commit_temperature
-        self.last_decode_missing_stop_count = 0
         self.semantic_proj = nn.Linear(config.latent_size, config.hidden_size)
         self.future_latent_proj = nn.Linear(config.latent_size, config.hidden_size, bias=False)
         self.future_query_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -104,6 +105,7 @@ class DilConditionalWriter(nn.Module):
         self.token_head = nn.Linear(config.hidden_size, config.writer_vocab_size, bias=False)
         self.state_valid_head = nn.Linear(config.hidden_size, 1, bias=True)
         self.emit_head = nn.Linear(config.hidden_size, 1, bias=True)
+        self.length_bucket_head = nn.Linear(config.hidden_size, len(self.writer_output_buckets), bias=True)
         self.dropout = nn.Dropout(config.writer_dropout)
 
     def _canonical_semantic(self, semantic: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -161,8 +163,7 @@ class DilConditionalWriter(nn.Module):
         return position_age.to(device=device, dtype=torch.long).clamp(0, self.max_position_age)
 
     def _default_query(self, window_mask: torch.Tensor) -> PackedSurface:
-        max_writer_length = self.max_surface_pieces_per_unit + 1
-        lengths = torch.full_like(window_mask, max_writer_length, dtype=torch.long)
+        lengths = torch.full_like(window_mask, self.writer_initial_output_bucket, dtype=torch.long)
         lengths = torch.where(window_mask, lengths, torch.zeros_like(lengths))
         return writer_query_from_lengths(
             lengths,
@@ -183,12 +184,6 @@ class DilConditionalWriter(nn.Module):
         if state.ids.shape[0] != batch_size or state.unit_count != window_size:
             raise ValueError("writer packed state must share semantic batch and window dimensions")
         return state
-
-    def _missing_stop_mask(self, generated: torch.Tensor, query: PackedSurface) -> torch.BoolTensor:
-        stop_hits = generated.eq(self.writer_stop_token_id) & query.mask
-        counts = torch.zeros_like(query.unit_lengths, dtype=torch.long)
-        counts.scatter_add_(1, query.unit_ids, stop_hits.to(dtype=torch.long))
-        return query.unit_mask & counts.eq(0)
 
     def _state_embeddings(self, state: PackedSurfaceState) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         valid_token = state.mask & state.ids.ge(0) & state.ids.lt(self.writer_vocab_size)
@@ -352,6 +347,7 @@ class DilConditionalWriter(nn.Module):
             else:
                 word_hidden = mixer(word_hidden, condition, window_mask)
 
+        length_bucket_logits = self.length_bucket_head(word_hidden)
         byte_condition = gather_unit_values(condition, query_surface.unit_ids)
         hidden_states = gather_unit_values(word_hidden, query_surface.unit_ids)
         pos_ids = query_surface.pos_in_unit.clamp_max(self.max_surface_pieces_per_unit)
@@ -395,6 +391,7 @@ class DilConditionalWriter(nn.Module):
             token_logits=token_logits,
             state_valid_logits=state_valid_logits,
             emit_logits=emit_logits,
+            length_bucket_logits=length_bucket_logits,
             query_surface=query_surface,
         )
 
@@ -420,12 +417,35 @@ class DilConditionalWriter(nn.Module):
             position_age=position_age,
         ).token_logits
 
+    def _bucket_values(self, device: torch.device) -> torch.Tensor:
+        return torch.tensor(self.writer_output_buckets, dtype=torch.long, device=device)
+
     @torch.no_grad()
     def generate(self, semantic: torch.Tensor) -> tuple[torch.LongTensor, torch.Tensor, torch.LongTensor]:
         token_ids, token_mask, lengths, _ = self.generate_window(semantic)
         if token_ids.shape[1] == 1:
             return token_ids[:, 0], token_mask[:, 0], lengths[:, 0]
         return token_ids, token_mask, lengths
+
+    @torch.no_grad()
+    def _promote_missing_stop(
+        self,
+        generated: torch.Tensor,
+        query: PackedSurface,
+        bucket_indices: torch.Tensor,
+        window_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        stop_found = torch.zeros_like(bucket_indices, dtype=torch.bool)
+        for row_idx in range(query.batch_size):
+            for unit_idx in range(query.unit_count):
+                width = int(query.unit_lengths[row_idx, unit_idx].detach().cpu())
+                if width <= 0:
+                    continue
+                start = int(query.unit_offsets[row_idx, unit_idx].detach().cpu())
+                stop_found[row_idx, unit_idx] = bool(generated[row_idx, start : start + width].eq(self.writer_stop_token_id).any().detach().cpu())
+        max_bucket = len(self.writer_output_buckets) - 1
+        promote = (~stop_found) & window_mask & bucket_indices.lt(max_bucket)
+        return torch.where(promote, bucket_indices + 1, bucket_indices), promote
 
     @torch.no_grad()
     def generate_window(
@@ -442,11 +462,28 @@ class DilConditionalWriter(nn.Module):
         batch_size, window_size, _ = semantic_window.shape
         device = semantic_window.device
         window_mask = self._canonical_window_mask(window_mask, batch_size, window_size, device)
-        query = self._default_query(window_mask)
+        probe = self.transition(
+            semantic_window,
+            surface_state=surface_state,
+            zone_ids=zone_ids,
+            window_mask=window_mask,
+            future_latents=future_latents,
+            position_age=position_age,
+        )
+        bucket_indices = probe.length_bucket_logits.argmax(dim=-1).to(dtype=torch.long)
+        max_bucket = len(self.writer_output_buckets) - 1
+        bucket_indices = bucket_indices.clamp(0, max_bucket)
+        bucket_values = self._bucket_values(device)
+        output = probe
+        query = probe.query_surface
         steps = int(self.writer_refinement_steps if refinement_steps is None else refinement_steps)
-        if steps <= 0:
-            raise ValueError("refinement_steps must be > 0")
         for step_idx in range(steps):
+            query_lengths = torch.where(window_mask, bucket_values[bucket_indices], torch.zeros_like(bucket_indices))
+            query = writer_query_from_lengths(
+                query_lengths,
+                pad_token_id=self.pad_token_id,
+                surface_bucket_sizes=self.surface_bucket_sizes,
+            )
             output = self.transition(
                 semantic_window,
                 query_surface=query,
@@ -457,15 +494,25 @@ class DilConditionalWriter(nn.Module):
                 refinement_step=step_idx if step_idx > 0 else None,
                 position_age=position_age,
             )
-            if step_idx + 1 < steps:
+            generated = output.token_logits.argmax(dim=-1)
+            next_bucket_indices, promoted = self._promote_missing_stop(generated, query, bucket_indices, window_mask)
+            if not bool(promoted.any().detach().cpu()):
+                if step_idx + 1 >= steps:
+                    break
+                token_ids, token_masks, _ = generated_unit_tensors(
+                    generated,
+                    query,
+                    stop_token_id=self.writer_stop_token_id,
+                    pad_token_id=self.pad_token_id,
+                )
                 surface_state = merge_frozen_state(
                     empty_surface_state(query, self.writer_empty_token_id),
                     output.token_logits.argmax(dim=-1),
                     query.mask,
                 )
+                continue
+            bucket_indices = next_bucket_indices
         generated = output.token_logits.argmax(dim=-1)
-        missing_stop = self._missing_stop_mask(generated, query)
-        self.last_decode_missing_stop_count = int(missing_stop.sum().detach().cpu().item())
         token_ids, token_mask, lengths = generated_unit_tensors(
             generated,
             query,

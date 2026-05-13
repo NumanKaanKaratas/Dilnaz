@@ -12,4 +12,5 @@ class DilWriterOutput(ModelOutput):
     token_logits: Optional[torch.FloatTensor] = None
     state_valid_logits: Optional[torch.FloatTensor] = None
     emit_logits: Optional[torch.FloatTensor] = None
+    length_bucket_logits: Optional[torch.FloatTensor] = None
     query_surface: Optional[PackedSurface] = None
