@@ -10,7 +10,7 @@ from dilnaz.train.common.runtime import COMPILE_MODE_CHOICES, compile_forward, v
 from dilnaz.train.data.dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add, context_offsets
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
-from dilnaz.surface import decode_packed_units, empty_surface_state, generated_unit_tensors, pack_context_segments, writer_query_from_lengths
+from dilnaz.surface import pack_context_segments
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
@@ -136,25 +136,12 @@ def encode_tokens(model: Dil, surface):
 
 
 @torch.no_grad()
-def decode_tokens(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor, byte_lengths: list[int]) -> list[str]:
-    query_lengths = torch.tensor([[length + 1] for length in byte_lengths], dtype=torch.long, device=latents.device)
-    query = writer_query_from_lengths(
-        query_lengths,
-        pad_token_id=model.config.pad_token_id,
-        surface_bucket_sizes=model.config.surface_bucket_sizes,
-    )
-    output = model.writer.transition(
-        latents,
-        query_surface=query,
-        surface_state=empty_surface_state(query, model.config.writer_empty_token_id),
-    )
-    token_ids, token_mask, _ = generated_unit_tensors(
-        output.token_logits.argmax(dim=-1),
-        query,
-        stop_token_id=model.config.writer_stop_token_id,
-        pad_token_id=model.config.pad_token_id,
-    )
-    return [row[0] for row in decode_packed_units(tokenizer, token_ids, token_mask)]
+def decode_tokens(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor) -> list[str]:
+    token_ids, _, _ = model.decode_semantic(latents)
+    return [
+        tokenizer.decode([int(token_id) for token_id in row.tolist()])
+        for row in token_ids
+    ]
 
 
 def similarity_matrix(latents: torch.Tensor) -> list[list[float]]:
@@ -253,7 +240,7 @@ def main():
     decoded_tokens = [tokenizer.decode(segment.token_ids) for segment in segments]
     surface, byte_lengths = make_batch(segments, tokenizer, config, device)
     latents = encode_tokens(model, surface)
-    roundtrip_tokens = decode_tokens(model, tokenizer, latents, byte_lengths)
+    roundtrip_tokens = decode_tokens(model, tokenizer, latents)
     similarities = similarity_matrix(latents)
     mapping = build_auto_mapping(tokens, similarities)
 
