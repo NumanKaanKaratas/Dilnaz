@@ -51,6 +51,7 @@ def test_writer_targets_use_causal_inputs_and_stop_labels():
     cfg = tiny_config()
     comma = make_writer_target(cfg, [[[7]]])
     araba = make_writer_target(cfg, [[[2, 3, 4, 5, 6]]])
+    eos = make_writer_target(cfg, [[[cfg.eos_token_id]]])
     padded = make_writer_target(cfg, [[[2, 3], []]])
     assert comma.query.unit_lengths.item() == 2
     assert araba.query.unit_lengths.item() == 6
@@ -60,6 +61,10 @@ def test_writer_targets_use_causal_inputs_and_stop_labels():
     assert comma.query.ids[0, 1].item() == 7
     assert comma.labels[0, 0].item() == 7
     assert comma.labels[0, 1].item() == cfg.writer_stop_token_id
+    assert eos.query.ids[0, 0].item() == cfg.writer_bos_token_id
+    assert eos.query.ids[0, 1].item() == cfg.eos_token_id
+    assert eos.labels[0, 0].item() == cfg.eos_token_id
+    assert eos.labels[0, 1].item() == cfg.writer_stop_token_id
 
 
 def test_dil_packed_encoder_output_shape():

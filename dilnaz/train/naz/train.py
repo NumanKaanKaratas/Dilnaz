@@ -40,7 +40,7 @@ from dilnaz.tokenization import HybridTokenizer
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 26
+CHECKPOINT_FORMAT_VERSION = 27
 OBJECTIVE = "semantic_dynamics_moe_mtp_v1"
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 SEMANTIC_CACHE_FORMAT_VERSION = 1

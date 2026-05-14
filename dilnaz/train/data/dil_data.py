@@ -214,9 +214,20 @@ def stream_teacher_text_items(
     tokenizer=None,
     max_tokens: int = NLLB_DEFAULT_MAX_ENCODER_TOKENS,
 ):
+    for line_idx, text, _ in stream_teacher_text_items_with_eos(path, read_chars, tokenizer, max_tokens):
+        yield line_idx, text
+
+
+def stream_teacher_text_items_with_eos(
+    path: Path,
+    read_chars: int,
+    tokenizer=None,
+    max_tokens: int = NLLB_DEFAULT_MAX_ENCODER_TOKENS,
+):
     for line_idx, line in stream_text_line_items(path, read_chars):
-        for text in split_text_for_nllb(line, tokenizer, max_tokens):
-            yield line_idx, text
+        chunks = split_text_for_nllb(line, tokenizer, max_tokens)
+        for chunk_idx, text in enumerate(chunks):
+            yield line_idx, text, chunk_idx == len(chunks) - 1
 
 
 def overlaps(left_start: int, left_end: int, right_start: int, right_end: int) -> bool:
@@ -248,16 +259,22 @@ def context_offsets(context_radius: int) -> range:
     return range(-context_radius, context_radius + 1)
 
 
-def trainable_segments(tokenizer: HybridTokenizer, text: str, max_surface_pieces_per_unit: int) -> list[TokenSegment]:
+def trainable_segments(
+    tokenizer: HybridTokenizer,
+    text: str,
+    max_surface_pieces_per_unit: int,
+    *,
+    add_eos: bool,
+) -> list[TokenSegment]:
     return [
         segment
-        for segment in tokenizer.encode_segments(text)
+        for segment in tokenizer.encode_segments(text, add_eos=add_eos)
         if 0 < segment.piece_len <= max_surface_pieces_per_unit
     ]
 
 
 def teacher_distill_segment(segment: TokenSegment) -> bool:
-    return not segment.text.isspace()
+    return segment.kind != "eos" and not segment.text.isspace()
 
 
 def apply_teacher_centered_add(
@@ -395,8 +412,8 @@ class HybridDilBatchDataset(IterableDataset):
         self._carry_segments_by_text = []
         self._carry_refs = []
 
-        for text_idx, (source_line_id, text) in enumerate(
-            stream_teacher_text_items(
+        for text_idx, (source_line_id, text, add_eos) in enumerate(
+            stream_teacher_text_items_with_eos(
                 self.train_file,
                 self.read_chars,
                 self.teacher_tokenizer,
@@ -405,7 +422,12 @@ class HybridDilBatchDataset(IterableDataset):
         ):
             if text_idx % worker_count != worker_id:
                 continue
-            segments = trainable_segments(self.tokenizer, text, self.max_surface_pieces_per_unit)
+            segments = trainable_segments(
+                self.tokenizer,
+                text,
+                self.max_surface_pieces_per_unit,
+                add_eos=add_eos,
+            )
             if not segments:
                 continue
 

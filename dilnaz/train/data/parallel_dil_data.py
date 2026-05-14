@@ -322,8 +322,18 @@ class ParallelDilBatchDataset(IterableDataset):
         for pair in iter_parallel_pairs(self.train_file):
             if pair.index % worker_count != worker_id:
                 continue
-            source_segments = trainable_segments(self.tokenizer, pair.source_text, self.max_surface_pieces_per_unit)
-            target_segments = trainable_segments(self.tokenizer, pair.target_text, self.max_surface_pieces_per_unit)
+            source_segments = trainable_segments(
+                self.tokenizer,
+                pair.source_text,
+                self.max_surface_pieces_per_unit,
+                add_eos=True,
+            )
+            target_segments = trainable_segments(
+                self.tokenizer,
+                pair.target_text,
+                self.max_surface_pieces_per_unit,
+                add_eos=True,
+            )
             if not source_segments or not target_segments:
                 continue
 

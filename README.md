@@ -82,6 +82,13 @@ label         = [piece_0, piece_1, ..., STOP]
 
 `writer_stop_token_id` is part of the output vocabulary. `writer_bos_token_id` and `writer_empty_token_id` are input-only decoder tokens and are never emitted. Length is not predicted by a learned bucket/head; inference runs until STOP or the `max_surface_pieces_per_unit` safety limit. `surface_bucket_sizes` is only used for packed tensor memory layout.
 
+Global text EOS and Writer unit STOP are separate:
+
+- `tokenizer.eos_token_id`: the real document/text EOS unit. When NAZ predicts that semantic unit, the Writer emits this token as the first surface piece and the interface stops the full text stream.
+- `writer_stop_token_id`: only means the current surface unit has finished causal writing. It is never decoded into text.
+
+DIL/Writer and NAZ training data share the same global EOS contract. Each JSONL/text record receives a tokenizer EOS unit; the EOS unit is taught as a Writer target, but it is excluded from NLLB teacher geometry distillation.
+
 ## DIL Writer-Only Training
 
 `python -m dilnaz.train.writer.train` loads an existing DIL checkpoint, freezes the encoder, and trains only the writer on plain text. This is used when surface rendering needs improvement without changing the semantic trunk.
@@ -96,8 +103,31 @@ loss = writer token cross entropy
 This path uses the same checkpoint family as DIL:
 
 ```text
-DIL checkpoint format_version = 26
+DIL checkpoint format_version = 27
 ```
+
+## Next Writer Experiment: Buffer-Level Surface Refiner
+
+The current primary Writer contract remains causal. The next experiment is not to replace the causal Writer with diffusion; it is to add a second-stage refiner over the `SlidingWriterBuffer` window after the causal Writer has produced a draft surface.
+
+Purpose:
+
+- Let NAZ produce semantic latents and let the causal Writer render the first surface draft.
+- Keep STOP and surface length owned by the causal Writer.
+- Use the buffer's `[left context] [active] [right guard]` semantic window together with the draft surface grid to repair active surface errors.
+- Improve window-level decisions such as spacing, suffixes, punctuation, boundaries, and multi-piece surface forms.
+- Avoid bringing back old bucket/head, commit-score, or learned length-prediction complexity.
+
+Proposed research contract:
+
+```text
+NAZ semantic window
+-> causal Writer draft: token_ids + token_mask + STOP length
+-> optional SurfaceRefiner/DiffusionRefiner
+-> active surface commit
+```
+
+The first version should not change length. `token_mask` comes from the causal Writer; the refiner only corrects hybrid surface piece ids inside the existing mask. The right guard remains the commit boundary. This places the diffusion idea over the multi-unit surface area in the buffer, not inside a single word.
 
 ## NAZ
 
@@ -315,8 +345,8 @@ The NAZ interface streams generated surface text by batching pending semantic la
 Current checkpoint families:
 
 ```text
-DIL format_version = 26
-NAZ format_version = 26
+DIL format_version = 27
+NAZ format_version = 27
 NAZ objective = semantic_dynamics_moe_mtp_v1
 DIL writer-only objective = causal_surface_writer_v1
 semantic_space = dil_normalized_latent

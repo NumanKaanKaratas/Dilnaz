@@ -67,7 +67,7 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=26,
+        checkpoint_format_version=27,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:

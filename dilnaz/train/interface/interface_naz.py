@@ -13,7 +13,7 @@ from dilnaz.train.interface.writer_buffer import SlidingWriterBuffer
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 26
+CHECKPOINT_FORMAT_VERSION = 27
 OBJECTIVE = "semantic_dynamics_moe_mtp_v1"
 
 

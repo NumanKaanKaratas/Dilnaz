@@ -82,6 +82,13 @@ label         = [piece_0, piece_1, ..., STOP]
 
 `writer_stop_token_id` output vocab içindedir. `writer_bos_token_id` ve `writer_empty_token_id` sadece decoder input tarafında kullanılır, output olarak üretilmez. Uzunluk learned bucket/head ile tahmin edilmez; inference STOP gelene kadar veya `max_surface_pieces_per_unit` güvenlik limitine kadar ilerler. `surface_bucket_sizes` yalnızca packed tensor memory layout seçimi için kullanılır.
 
+Global metin sonu ile Writer unit sonu ayrı tutulur:
+
+- `tokenizer.eos_token_id`: gerçek document/text EOS unit'idir. NAZ bu semantic unit'i tahmin ettiğinde Writer ilk surface parça olarak bu tokenı üretir ve interface tüm metin üretimini durdurur.
+- `writer_stop_token_id`: sadece mevcut surface unit'in causal yazımı bitti anlamına gelir. Decode edilen metne yazılmaz.
+
+DIL/Writer ve NAZ eğitim datası aynı global EOS kontratını paylaşır. Her JSONL/text record sonuna tokenizer EOS unit'i eklenir; EOS unit'i Writer hedefi olarak öğretilir, ancak NLLB teacher geometry distillation'a dahil edilmez.
+
 ## DIL Writer-Only Eğitimi
 
 `python -m dilnaz.train.writer.train` mevcut DIL checkpointini yükler, encoder'ı freeze eder ve yalnızca writer'ı plain text üzerinde eğitir. Amaç surface rendering kalitesini artırırken semantic trunk'ı değiştirmemektir.
@@ -96,8 +103,31 @@ loss = writer token cross entropy
 Bu yol aynı DIL checkpoint ailesini kullanır:
 
 ```text
-DIL checkpoint format_version = 26
+DIL checkpoint format_version = 27
 ```
+
+## Sonraki Writer Denemesi: Buffer-Level Surface Refiner
+
+Mevcut ana Writer kontratı causal kalır. Sonraki deney fikri, bu Writer'ın yerine diffusion koymak değil; causal Writer'ın ürettiği taslak surface çıktısını `SlidingWriterBuffer` window'u üzerinde ikinci bir katmanla düzeltmektir.
+
+Amaç:
+
+- NAZ'ın ürettiği semantic latentleri yine önce causal Writer ile yazıya dökmek.
+- STOP ve surface uzunluğunu causal Writer'a bırakmak.
+- Buffer içindeki `[left context] [active] [right guard]` semantic window'u ve causal draft surface grid'ini birlikte kullanarak active bölgenin yüzey hatalarını düzeltmek.
+- Özellikle boşluk, ek, noktalama, boundary ve çok parçalı yüzey kararlarını window seviyesinde iyileştirmek.
+- Eski bucket/head, commit score veya learned length prediction karmaşasını geri getirmemek.
+
+Önerilen araştırma kontratı:
+
+```text
+NAZ semantic window
+-> causal Writer draft: token_ids + token_mask + STOP length
+-> optional SurfaceRefiner/DiffusionRefiner
+-> active surface commit
+```
+
+İlk denemede refiner uzunluk değiştirmez. `token_mask` causal Writer'dan gelir; refiner sadece mevcut mask içindeki hybrid surface parça ID'lerini düzeltir. Right guard, commit sınırı olmaya devam eder. Böylece diffusion fikri tek kelimenin içine değil, buffer'daki çoklu semantic unit surface alanına uygulanır.
 
 ## NAZ
 
@@ -315,8 +345,8 @@ NAZ interface'i pending semantic latentleri DIL writer'dan batch halinde geçire
 Güncel checkpoint aileleri:
 
 ```text
-DIL format_version = 26
-NAZ format_version = 26
+DIL format_version = 27
+NAZ format_version = 27
 NAZ objective = semantic_dynamics_moe_mtp_v1
 DIL writer-only objective = causal_surface_writer_v1
 semantic_space = dil_normalized_latent

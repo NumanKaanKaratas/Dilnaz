@@ -119,8 +119,18 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
         self.tokenizer = tokenizer
 
     def tokenized_pair(self, pair: JsonlParallelPair) -> TokenizedParallelPair | None:
-        tr_segments = trainable_segments(self.tokenizer, pair.tr, self.max_surface_pieces_per_unit)
-        en_segments = trainable_segments(self.tokenizer, pair.en, self.max_surface_pieces_per_unit)
+        tr_segments = trainable_segments(
+            self.tokenizer,
+            pair.tr,
+            self.max_surface_pieces_per_unit,
+            add_eos=True,
+        )
+        en_segments = trainable_segments(
+            self.tokenizer,
+            pair.en,
+            self.max_surface_pieces_per_unit,
+            add_eos=True,
+        )
         if len(tr_segments) < self.min_segments or len(en_segments) < self.min_segments:
             return None
         ratio = len(tr_segments) / max(len(en_segments), 1)

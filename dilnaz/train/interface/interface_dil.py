@@ -14,7 +14,7 @@ from dilnaz.surface import pack_context_segments
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 26
+CHECKPOINT_FORMAT_VERSION = 27
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:

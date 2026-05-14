@@ -21,8 +21,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 26:
-            raise ValueError("DIL causal surface writer checkpoints require checkpoint_format_version=26")
+        if config.checkpoint_format_version != 27:
+            raise ValueError("DIL global EOS surface writer checkpoints require checkpoint_format_version=27")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:

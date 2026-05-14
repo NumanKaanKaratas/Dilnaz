@@ -30,7 +30,7 @@ from dilnaz.train.data.dil_data import (
     load_hybrid_tokenizer,
     make_dil_batch_loader,
     segment_piece_ids,
-    stream_teacher_text_items,
+    stream_teacher_text_items_with_eos,
     trainable_segments,
 )
 from dilnaz.surface import pack_context_segments, pack_writer_targets
@@ -42,7 +42,7 @@ from dilnaz.models.naz import Naz
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 26
+CHECKPOINT_FORMAT_VERSION = 27
 WRITER_OBJECTIVE = "causal_surface_writer_v1"
 WRITER_METRIC_KEYS = (
     "loss",
@@ -178,10 +178,17 @@ class HybridDilSlidingWindowDataset(IterableDataset):
         self._carry_segments = []
         self._carry_refs = []
 
-        for text_idx, (source_line_id, text) in enumerate(stream_teacher_text_items(self.train_file, self.read_chars)):
+        for text_idx, (source_line_id, text, add_eos) in enumerate(
+            stream_teacher_text_items_with_eos(self.train_file, self.read_chars)
+        ):
             if text_idx % worker_count != worker_id:
                 continue
-            segments = trainable_segments(self.tokenizer, text, self.config.max_surface_pieces_per_unit)
+            segments = trainable_segments(
+                self.tokenizer,
+                text,
+                self.config.max_surface_pieces_per_unit,
+                add_eos=add_eos,
+            )
             if not segments:
                 continue
             local_text_idx = len(texts)

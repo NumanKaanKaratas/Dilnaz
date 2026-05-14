@@ -83,5 +83,5 @@ def test_teacherless_parallel_dataset_uses_packed_surface(tmp_path: Path):
 
 def test_trainable_segments_filters_by_surface_piece_limit():
     tokenizer = tiny_tokenizer()
-    segments = trainable_segments(tokenizer, "kirmizi araba", max_surface_pieces_per_unit=16)
+    segments = trainable_segments(tokenizer, "kirmizi araba", max_surface_pieces_per_unit=16, add_eos=False)
     assert [segment.text for segment in segments if not segment.text.isspace()] == ["kirmizi", "araba"]

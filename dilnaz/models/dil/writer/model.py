@@ -156,8 +156,8 @@ class DilConditionalWriter(nn.Module):
         query = query.to(device)
         if query.ids.shape[0] != batch_size or query.unit_count != window_size:
             raise ValueError("writer query must share semantic batch and window dimensions")
-        if int(query.pos_in_unit.max().detach().cpu()) > self.max_surface_pieces_per_unit:
-            raise ValueError("writer query position exceeds max_surface_pieces_per_unit")
+        if query.ids.shape != query.mask.shape or query.ids.shape != query.unit_ids.shape or query.ids.shape != query.pos_in_unit.shape:
+            raise ValueError("writer query packed tensors must share shape")
         return query
 
     def _future_attention_summary(
