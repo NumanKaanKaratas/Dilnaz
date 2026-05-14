@@ -18,10 +18,15 @@ def tiny_config() -> DilConfig:
         hidden_size=32,
         intermediate_size=64,
         latent_size=16,
-        num_encoder_layers=2,
         max_surface_pieces_per_unit=16,
         surface_bucket_sizes=(8, 16, 32, 64),
-        context_radius=1,
+        encoder_context_layers=2,
+        encoder_layer_pattern=("sliding", "global"),
+        encoder_attention_heads=4,
+        encoder_key_value_heads=2,
+        encoder_head_dim=8,
+        encoder_intermediate_size=64,
+        encoder_attention_window=4,
         byte_conv_layers=1,
         writer_num_layers=1,
         writer_word_mixer_layers=1,
@@ -77,9 +82,15 @@ def test_dil_packed_encoder_output_shape():
         max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
     )
     semantic, layers = model.encode(surface, output_hidden_states=True)
-    assert semantic.shape == (1, cfg.latent_size)
-    assert len(layers) == cfg.num_encoder_layers
+    assert semantic.shape == (1, 3, cfg.latent_size)
+    assert len(layers) == cfg.encoder_context_layers
     assert torch.isfinite(semantic).all()
+    assert torch.allclose(
+        semantic.norm(dim=-1),
+        torch.full((1, 3), cfg.latent_size**0.5),
+        atol=1e-4,
+        rtol=1e-4,
+    )
 
 
 def test_writer_packed_logits_no_nan():

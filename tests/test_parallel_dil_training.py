@@ -30,10 +30,15 @@ def tiny_config(tokenizer: HybridTokenizer) -> DilConfig:
         hidden_size=32,
         intermediate_size=64,
         latent_size=16,
-        num_encoder_layers=2,
         max_surface_pieces_per_unit=16,
         surface_bucket_sizes=(8, 16, 32),
-        context_radius=1,
+        encoder_context_layers=2,
+        encoder_layer_pattern=("sliding", "global"),
+        encoder_attention_heads=4,
+        encoder_key_value_heads=2,
+        encoder_head_dim=8,
+        encoder_intermediate_size=64,
+        encoder_attention_window=4,
         writer_num_layers=1,
         writer_word_mixer_layers=1,
         writer_word_attention_heads=4,
@@ -49,8 +54,12 @@ def test_parallel_dil_dataset_uses_packed_surface(tmp_path: Path):
     batch = next(dataset.iter_once(worker_id=0, worker_count=1))
     assert isinstance(batch["surface"], PackedSurface)
     assert isinstance(batch["labels"], PackedWriterTarget)
-    assert batch["surface"].unit_count == config.context_size
-    assert batch["labels"].query.unit_count == 1
+    assert batch["surface"].batch_size == 2
+    assert batch["surface"].unit_count == batch["labels"].query.unit_count
+    assert batch["teacher_starts"].shape == batch["surface"].unit_mask.shape
+    assert batch["row_batch_indices"].numel() == int(batch["surface"].unit_mask.sum())
+    assert batch["writer_labels"].query.unit_count == config.writer_sliding_window_size
+    assert batch["writer_window_mask"].shape == batch["writer_unit_indices"].shape
     assert batch["labels"].label_mask.any()
 
 

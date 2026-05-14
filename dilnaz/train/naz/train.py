@@ -303,7 +303,6 @@ def reduce_output_metrics(total: dict[str, float]) -> dict[str, float]:
 def semantic_cache_spans(
     token_count: int,
     chunk_tokens: int,
-    context_radius: int,
     max_surface_width: int,
     span_width,
 ):
@@ -314,17 +313,13 @@ def semantic_cache_spans(
         best = 0
         while low <= high:
             mid = (low + high) // 2
-            context_start = max(0, start - context_radius)
-            context_end = min(token_count, mid + context_radius)
-            if span_width(context_start, context_end) <= max_surface_width:
+            if span_width(start, mid) <= max_surface_width:
                 best = mid
                 low = mid + 1
             else:
                 high = mid - 1
         if best <= start:
-            context_start = max(0, start - context_radius)
-            context_end = min(token_count, start + 1 + context_radius)
-            width = span_width(context_start, context_end)
+            width = span_width(start, start + 1)
             raise ValueError(
                 f"single semantic cache span width {width} exceeds largest DIL surface bucket {max_surface_width}"
             )
@@ -341,26 +336,19 @@ def build_resident_semantic_cache(
 ):
     model.eval()
     token_count = surface_batcher.token_count
-    context_radius = model.dil_config.context_radius
     max_surface_width = max(model.dil_config.surface_bucket_sizes)
     latent_chunks = []
     spans = semantic_cache_spans(
         token_count,
         chunk_tokens,
-        context_radius,
         max_surface_width,
         surface_batcher.surface_span_width,
     )
     for start, end in spans:
-        context_start = max(0, start - context_radius)
-        context_end = min(token_count, end + context_radius)
-        surface = surface_batcher.surface_slice(context_start, context_end)
+        surface = surface_batcher.surface_slice(start, end)
         unit_mask = torch.ones(surface.unit_lengths.shape, dtype=torch.bool, device=surface.ids.device)
         with autocast_context(autocast_enabled):
-            active_latents = model.encode_sequence_latents(surface, unit_mask)
-        local_start = start - context_start
-        local_end = local_start + end - start
-        latents = active_latents[:, local_start:local_end]
+            latents = model.encode_sequence_latents(surface, unit_mask)
         latent_chunks.append(latents.squeeze(0).float())
     semantic_states = torch.cat(latent_chunks, dim=0)
     model.train()
@@ -412,20 +400,16 @@ def build_memmap_semantic_cache(
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
-    context_radius = model.dil_config.context_radius
     max_surface_width = max(model.dil_config.surface_bucket_sizes)
     spans = semantic_cache_spans(
         token_count,
         chunk_tokens,
-        context_radius,
         max_surface_width,
         lambda start, end: int(surface_offsets[end] - surface_offsets[start]),
     )
     for start, end in spans:
-        context_start = max(0, start - context_radius)
-        context_end = min(token_count, end + context_radius)
         rows = []
-        for token_idx in range(context_start, context_end):
+        for token_idx in range(start, end):
             piece_start = int(surface_offsets[token_idx])
             piece_end = int(surface_offsets[token_idx + 1])
             rows.append(np.asarray(surface_ids[piece_start:piece_end], dtype=np.int64).tolist())
@@ -439,10 +423,7 @@ def build_memmap_semantic_cache(
         )
         unit_mask = torch.ones(surface.unit_lengths.shape, dtype=torch.bool, device=device)
         with autocast_context(autocast_enabled):
-            active_latents = model.encode_sequence_latents(surface, unit_mask)
-        local_start = start - context_start
-        local_end = local_start + end - start
-        chunk_latents = active_latents[:, local_start:local_end]
+            chunk_latents = model.encode_sequence_latents(surface, unit_mask)
         semantic[start:end] = chunk_latents.squeeze(0).float().cpu().numpy()
     semantic.flush()
     with meta_path.open("w", encoding="utf-8") as handle:

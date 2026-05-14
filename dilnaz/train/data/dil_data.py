@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import re
 import hashlib
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -13,9 +12,10 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from dilnaz.models.dil import DilConfig
-from dilnaz.surface import pack_context_segments, pack_writer_targets
+from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.tokenization import HybridTokenizer, TokenSegment, default_vocab_path
 from dilnaz.train.common.runtime import move_to_device
+from dilnaz.train.dil.writer_windows import build_writer_window_view
 
 
 SENTENCE_CHUNK_PATTERN = re.compile(r".+?(?:[.!?]+(?:\s+|$)|\n+|$)", re.UNICODE | re.DOTALL)
@@ -30,12 +30,6 @@ DILNAZ_READY_REQUIRED_COLUMNS = [
     "teacher_layers",
     "teacher_mask",
 ]
-
-
-@dataclass(frozen=True)
-class BatchSampleRef:
-    text_idx: int
-    token_idx: int
 
 
 def stream_text_lines(path: Path, read_chars: int):
@@ -140,9 +134,6 @@ def validate_dilnaz_ready_parquet(path: Path, config: DilConfig, vocab_path: Pat
         "pad_token_id": config.pad_token_id,
         "eos_token_id": config.eos_token_id,
         "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
-        "context_radius": config.context_radius,
-        "context_size": config.context_size,
-        "target_index": config.target_index,
         "teacher_dim": 1024,
         "teacher_layer_count": len(NLLB_LAYER_GROUPS),
     }
@@ -255,10 +246,6 @@ def segment_piece_ids(segment: TokenSegment) -> list[int]:
     return [piece.token_id for piece in segment.pieces]
 
 
-def context_offsets(context_radius: int) -> range:
-    return range(-context_radius, context_radius + 1)
-
-
 def trainable_segments(
     tokenizer: HybridTokenizer,
     text: str,
@@ -321,8 +308,7 @@ class HybridDilBatchDataset(IterableDataset):
     ):
         super().__init__()
         self.train_file = train_file
-        self.context_radius = config.context_radius
-        self.context_size = config.context_size
+        self.config = config
         self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
         self.pad_token_id = config.pad_token_id
@@ -339,7 +325,6 @@ class HybridDilBatchDataset(IterableDataset):
         self._carry_texts: list[str] = []
         self._carry_line_ids: list[int] = []
         self._carry_segments_by_text: list[list[TokenSegment]] = []
-        self._carry_refs: list[BatchSampleRef] = []
         self._produced = 0
 
     def make_batch(
@@ -347,40 +332,39 @@ class HybridDilBatchDataset(IterableDataset):
         texts: list[str],
         line_ids: list[int],
         segments_by_text: list[list[TokenSegment]],
-        refs: list[BatchSampleRef],
     ):
-        size = len(refs)
-        context_rows: list[list[TokenSegment | None]] = []
+        size = len(segments_by_text)
+        max_units = max(len(segments) for segments in segments_by_text)
+        surface_rows: list[list[list[int]]] = []
         target_rows: list[list[list[int]]] = []
-        teacher_text_indices = np.zeros((size,), dtype=np.int64)
-        teacher_starts = np.zeros((size,), dtype=np.int64)
-        teacher_ends = np.zeros((size,), dtype=np.int64)
-        teacher_distill_mask = np.zeros((size,), dtype=np.bool_)
+        teacher_text_indices = np.zeros((size, max_units), dtype=np.int64)
+        teacher_starts = np.zeros((size, max_units), dtype=np.int64)
+        teacher_ends = np.zeros((size, max_units), dtype=np.int64)
+        teacher_distill_mask = np.zeros((size, max_units), dtype=np.bool_)
         source_line_ids = np.zeros((size,), dtype=np.int64)
 
-        for row_idx, ref in enumerate(refs):
-            segments = segments_by_text[ref.text_idx]
-            token_idx = ref.token_idx
-            segment = segments[token_idx]
-            source_line_ids[row_idx] = line_ids[ref.text_idx]
-            context_row: list[TokenSegment | None] = []
-            for context_idx, offset in enumerate(context_offsets(self.context_radius)):
-                source_idx = token_idx + offset
-                if 0 <= source_idx < len(segments):
-                    context_row.append(segments[source_idx])
-                else:
-                    context_row.append(None)
-            context_rows.append(context_row)
-
-            target_rows.append([segment_piece_ids(segment)])
-            teacher_text_indices[row_idx] = ref.text_idx
-            teacher_starts[row_idx] = segment.start
-            teacher_ends[row_idx] = segment.end
-            teacher_distill_mask[row_idx] = teacher_distill_segment(segment)
+        for row_idx, segments in enumerate(segments_by_text):
+            source_line_ids[row_idx] = line_ids[row_idx]
+            surface_row: list[list[int]] = []
+            target_row: list[list[int]] = []
+            for unit_idx in range(max_units):
+                if unit_idx >= len(segments):
+                    surface_row.append([])
+                    target_row.append([])
+                    continue
+                segment = segments[unit_idx]
+                surface_row.append(segment_piece_ids(segment))
+                target_row.append(segment_piece_ids(segment))
+                teacher_text_indices[row_idx, unit_idx] = row_idx
+                teacher_starts[row_idx, unit_idx] = segment.start
+                teacher_ends[row_idx, unit_idx] = segment.end
+                teacher_distill_mask[row_idx, unit_idx] = teacher_distill_segment(segment)
+            surface_rows.append(surface_row)
+            target_rows.append(target_row)
 
         return {
-            "surface": pack_context_segments(
-                context_rows,
+            "surface": pack_token_units(
+                surface_rows,
                 pad_token_id=self.pad_token_id,
                 bucket_sizes=self.surface_bucket_sizes,
                 max_pieces_per_unit=self.max_surface_pieces_per_unit,
@@ -400,17 +384,16 @@ class HybridDilBatchDataset(IterableDataset):
             "teacher_ends": torch.from_numpy(teacher_ends),
             "teacher_distill_mask": torch.from_numpy(teacher_distill_mask),
             "source_line_ids": torch.from_numpy(source_line_ids),
+            **build_writer_window_view(target_rows, self.config),
         }
 
     def iter_once(self, worker_id: int, worker_count: int):
         texts = self._carry_texts
         line_ids = self._carry_line_ids
         segments_by_text = self._carry_segments_by_text
-        refs = self._carry_refs
         self._carry_texts = []
         self._carry_line_ids = []
         self._carry_segments_by_text = []
-        self._carry_refs = []
 
         for text_idx, (source_line_id, text, add_eos) in enumerate(
             stream_teacher_text_items_with_eos(
@@ -431,33 +414,24 @@ class HybridDilBatchDataset(IterableDataset):
             if not segments:
                 continue
 
-            local_text_idx = len(texts)
             texts.append(text)
             line_ids.append(source_line_id)
             segments_by_text.append(segments)
-            for token_idx in range(len(segments)):
-                refs.append(BatchSampleRef(local_text_idx, token_idx))
-                self._produced += 1
-                if len(refs) == self.batch_size:
-                    yield self.make_batch(texts, line_ids, segments_by_text, refs)
-                    texts, line_ids, segments_by_text, refs = [], [], [], []
-                    if token_idx + 1 < len(segments):
-                        local_text_idx = 0
-                        texts.append(text)
-                        line_ids.append(source_line_id)
-                        segments_by_text.append(segments)
-                if self.max_samples > 0 and self._produced >= self.max_samples:
-                    if refs:
-                        yield self.make_batch(texts, line_ids, segments_by_text, refs)
-                    return
+            self._produced += 1
+            if len(texts) == self.batch_size:
+                yield self.make_batch(texts, line_ids, segments_by_text)
+                texts, line_ids, segments_by_text = [], [], []
+            if self.max_samples > 0 and self._produced >= self.max_samples:
+                if texts:
+                    yield self.make_batch(texts, line_ids, segments_by_text)
+                return
 
-        if refs and not self.repeat:
-            yield self.make_batch(texts, line_ids, segments_by_text, refs)
-        elif refs:
+        if texts and not self.repeat:
+            yield self.make_batch(texts, line_ids, segments_by_text)
+        elif texts:
             self._carry_texts = texts
             self._carry_line_ids = line_ids
             self._carry_segments_by_text = segments_by_text
-            self._carry_refs = refs
 
     def __iter__(self):
         worker = get_worker_info()
@@ -468,7 +442,7 @@ class HybridDilBatchDataset(IterableDataset):
             for batch in self.iter_once(worker_id, worker_count):
                 yielded = True
                 yield batch
-            if not yielded and not self._carry_refs:
+            if not yielded and not self._carry_texts:
                 raise ValueError(f"{self.train_file} produced no trainable tokenizer segments")
             if not self.repeat:
                 return
@@ -518,12 +492,11 @@ class ResidentDilBatcher:
         batches = []
         for batch in dataset.iter_once(worker_id=0, worker_count=1):
             batches.append(cls.materialize_hybrid_batch(dataset, batch, teacher))
-        if dataset._carry_refs:
+        if dataset._carry_texts:
             batch = dataset.make_batch(
                 dataset._carry_texts,
                 dataset._carry_line_ids,
                 dataset._carry_segments_by_text,
-                dataset._carry_refs,
             )
             batches.append(cls.materialize_hybrid_batch(dataset, batch, teacher))
         return cls(batches, batch_size=batch_size, device=device, seed=seed)
@@ -553,7 +526,6 @@ class ReadyParquetDilBatchDataset(IterableDataset):
         super().__init__()
         raise ValueError("Dilnaz-ready fixed surface parquet is not supported; regenerate packed surface streaming data")
         self.parquet_path = parquet_path
-        self.context_size = config.context_size
         self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.teacher_layer_count = len(NLLB_LAYER_GROUPS)
         self.teacher_dim = 1024
@@ -695,11 +667,18 @@ class NllbTeacher:
 
     def teacher_layers(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
         texts = batch["teacher_texts"]
-        text_indices = batch["teacher_text_indices"].detach().cpu().tolist()
-        starts = batch["teacher_starts"].detach().cpu().tolist()
-        ends = batch["teacher_ends"].detach().cpu().tolist()
-        distill_mask = batch["teacher_distill_mask"].detach().cpu().tolist()
-        sample_count = len(starts)
+        text_indices_tensor = batch["teacher_text_indices"].detach().cpu()
+        starts_tensor = batch["teacher_starts"].detach().cpu()
+        ends_tensor = batch["teacher_ends"].detach().cpu()
+        distill_mask_tensor = batch["teacher_distill_mask"].detach().cpu()
+        if starts_tensor.dim() != 2:
+            raise ValueError("sequence DIL batches must provide teacher_starts shaped [batch, units]")
+        batch_size, unit_count = starts_tensor.shape
+        text_indices = text_indices_tensor.reshape(-1).tolist()
+        starts = starts_tensor.reshape(-1).tolist()
+        ends = ends_tensor.reshape(-1).tolist()
+        distill_mask = distill_mask_tensor.reshape(-1).tolist()
+        sample_count = batch_size * unit_count
         teacher = torch.zeros(
             (sample_count, len(NLLB_LAYER_GROUPS), self.model.config.d_model),
             dtype=torch.float32,
@@ -760,9 +739,9 @@ class NllbTeacher:
                         ]
                         teacher[row_idx, group_idx] = torch.stack(layer_vectors).mean(dim=0)
 
-        group_ids = batch["teacher_text_indices"].to(self.device, dtype=torch.long)
+        group_ids = batch["teacher_text_indices"].reshape(-1).to(self.device, dtype=torch.long)
         teacher = apply_teacher_centered_add_by_group(teacher, teacher_mask, group_ids)
-        return teacher, teacher_mask
+        return teacher.reshape(batch_size, unit_count, len(NLLB_LAYER_GROUPS), self.model.config.d_model), teacher_mask.reshape(batch_size, unit_count)
 
 
 def load_hybrid_tokenizer(vocab_path: Path | None = None) -> HybridTokenizer:

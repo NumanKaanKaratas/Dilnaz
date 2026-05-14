@@ -16,15 +16,15 @@ from dilnaz.train.data.dil_data import (
     NLLB_LAYER_GROUPS,
     align_spans_to_pieces,
     apply_teacher_centered_add_by_group,
-    context_offsets,
     overlaps,
     segment_piece_ids,
     teacher_distill_segment,
     trainable_segments,
 )
 from dilnaz.models.dil import DilConfig
-from dilnaz.surface import pack_context_segments, pack_writer_targets
+from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
+from dilnaz.train.dil.writer_windows import build_writer_window_view
 
 
 ALIGN_THRESHOLD = 1e-4
@@ -90,13 +90,6 @@ class ParallelPairSegments:
     pair: ParallelTextPair
     source_segments: list[TokenSegment]
     target_segments: list[TokenSegment]
-
-
-@dataclass(frozen=True)
-class ParallelBatchRow:
-    item: ParallelPairSegments
-    side_id: int
-    token_idx: int
 
 
 @dataclass(frozen=True)
@@ -188,6 +181,13 @@ def row_positions(batch: dict) -> dict[int, int]:
     }
 
 
+def row_teacher_values(batch: dict, key: str) -> list:
+    batch_indices = batch["row_batch_indices"].detach().cpu().long()
+    unit_indices = batch["row_unit_indices"].detach().cpu().long()
+    values = batch[key].detach().cpu()
+    return values[batch_indices, unit_indices].tolist()
+
+
 class ParallelDilBatchDataset(IterableDataset):
     def __init__(
         self,
@@ -200,8 +200,7 @@ class ParallelDilBatchDataset(IterableDataset):
     ):
         super().__init__()
         self.train_file = train_file
-        self.context_radius = config.context_radius
-        self.context_size = config.context_size
+        self.config = config
         self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
         self.pad_token_id = config.pad_token_id
@@ -212,82 +211,69 @@ class ParallelDilBatchDataset(IterableDataset):
         self.repeat = repeat
         self.max_samples = max_samples
         self.tokenizer = tokenizer
-        self._carry_rows: list[ParallelBatchRow] = []
+        self._carry_items: list[ParallelPairSegments] = []
         self._produced_pairs = 0
 
-    def pair_rows(self, item: ParallelPairSegments) -> Iterator[ParallelBatchRow]:
-        source_count = len(item.source_segments)
-        target_count = len(item.target_segments)
-        for token_idx in range(max(source_count, target_count)):
-            if token_idx < source_count:
-                yield ParallelBatchRow(item, SOURCE_SIDE, token_idx)
-            if token_idx < target_count:
-                yield ParallelBatchRow(item, TARGET_SIDE, token_idx)
-
-    def make_batch(self, rows: list[ParallelBatchRow]) -> dict:
-        size = len(rows)
-        context_rows: list[list[TokenSegment | None]] = []
-        target_rows: list[list[list[int]]] = []
-        teacher_text_indices = np.zeros((size,), dtype=np.int64)
-        teacher_starts = np.zeros((size,), dtype=np.int64)
-        teacher_ends = np.zeros((size,), dtype=np.int64)
-        teacher_distill_mask = np.zeros((size,), dtype=np.bool_)
-        row_pair_indices = np.zeros((size,), dtype=np.int64)
-        row_side_ids = np.zeros((size,), dtype=np.int64)
-        row_token_indices = np.zeros((size,), dtype=np.int64)
-        source_line_ids = np.zeros((size,), dtype=np.int64)
+    def make_batch(self, items: list[ParallelPairSegments]) -> dict:
         teacher_texts: list[str] = []
-        row_texts: list[str] = []
-        pair_slots: dict[int, int] = {}
-        pair_items: list[ParallelPairSegments] = []
-
-        for row in rows:
-            item_key = id(row.item)
-            if item_key in pair_slots:
-                continue
-            pair_slots[item_key] = len(pair_items)
-            pair_items.append(row.item)
-
-        pair_text_indices = np.zeros((len(pair_items), 2), dtype=np.int64)
-        for pair_idx, item in enumerate(pair_items):
+        sequence_specs: list[tuple[int, int, int, list[TokenSegment]]] = []
+        pair_text_indices = np.zeros((len(items), 2), dtype=np.int64)
+        for pair_idx, item in enumerate(items):
             source_text_idx = len(teacher_texts)
             teacher_texts.append(item.pair.source_text)
             target_text_idx = len(teacher_texts)
             teacher_texts.append(item.pair.target_text)
             pair_text_indices[pair_idx] = (source_text_idx, target_text_idx)
+            sequence_specs.append((pair_idx, SOURCE_SIDE, source_text_idx, item.source_segments))
+            sequence_specs.append((pair_idx, TARGET_SIDE, target_text_idx, item.target_segments))
 
-        for row_idx, row in enumerate(rows):
-            pair_idx = pair_slots[id(row.item)]
-            segments = row.item.source_segments if row.side_id == SOURCE_SIDE else row.item.target_segments
-            text_idx = pair_text_indices[pair_idx, row.side_id]
-            segment = segments[row.token_idx]
-            context_row: list[TokenSegment | None] = []
-            for context_idx, offset in enumerate(context_offsets(self.context_radius)):
-                source_idx = row.token_idx + offset
-                if 0 <= source_idx < len(segments):
-                    context_row.append(segments[source_idx])
-                else:
-                    context_row.append(None)
-            context_rows.append(context_row)
+        size = len(sequence_specs)
+        max_units = max(len(segments) for _, _, _, segments in sequence_specs)
+        surface_rows: list[list[list[int]]] = []
+        target_rows: list[list[list[int]]] = []
+        teacher_text_indices = np.zeros((size, max_units), dtype=np.int64)
+        teacher_starts = np.zeros((size, max_units), dtype=np.int64)
+        teacher_ends = np.zeros((size, max_units), dtype=np.int64)
+        teacher_distill_mask = np.zeros((size, max_units), dtype=np.bool_)
+        row_batch_indices: list[int] = []
+        row_unit_indices: list[int] = []
+        row_pair_indices: list[int] = []
+        row_side_ids: list[int] = []
+        row_token_indices: list[int] = []
+        row_texts: list[str] = []
 
-            target_rows.append([segment_piece_ids(segment)])
-            teacher_text_indices[row_idx] = text_idx
-            teacher_starts[row_idx] = segment.start
-            teacher_ends[row_idx] = segment.end
-            teacher_distill_mask[row_idx] = teacher_distill_segment(segment)
-            row_pair_indices[row_idx] = pair_idx
-            row_side_ids[row_idx] = row.side_id
-            row_token_indices[row_idx] = row.token_idx
-            source_line_ids[row_idx] = row.item.pair.index
-            row_texts.append(segment.text)
+        for batch_idx, (pair_idx, side_id, text_idx, segments) in enumerate(sequence_specs):
+            surface_row: list[list[int]] = []
+            target_row: list[list[int]] = []
+            for unit_idx in range(max_units):
+                if unit_idx >= len(segments):
+                    surface_row.append([])
+                    target_row.append([])
+                    continue
+                segment = segments[unit_idx]
+                pieces = segment_piece_ids(segment)
+                surface_row.append(pieces)
+                target_row.append(pieces)
+                teacher_text_indices[batch_idx, unit_idx] = text_idx
+                teacher_starts[batch_idx, unit_idx] = segment.start
+                teacher_ends[batch_idx, unit_idx] = segment.end
+                teacher_distill_mask[batch_idx, unit_idx] = teacher_distill_segment(segment)
+                row_batch_indices.append(batch_idx)
+                row_unit_indices.append(unit_idx)
+                row_pair_indices.append(pair_idx)
+                row_side_ids.append(side_id)
+                row_token_indices.append(unit_idx)
+                row_texts.append(segment.text)
+            surface_rows.append(surface_row)
+            target_rows.append(target_row)
 
         teacher_text_side_ids = np.asarray(
-            [side_id for _ in pair_items for side_id in (SOURCE_SIDE, TARGET_SIDE)],
+            [side_id for _ in items for side_id in (SOURCE_SIDE, TARGET_SIDE)],
             dtype=np.int64,
         )
         return {
-            "surface": pack_context_segments(
-                context_rows,
+            "surface": pack_token_units(
+                surface_rows,
                 pad_token_id=self.pad_token_id,
                 bucket_sizes=self.surface_bucket_sizes,
                 max_pieces_per_unit=self.max_surface_pieces_per_unit,
@@ -308,16 +294,19 @@ class ParallelDilBatchDataset(IterableDataset):
             "teacher_ends": torch.from_numpy(teacher_ends),
             "teacher_distill_mask": torch.from_numpy(teacher_distill_mask),
             "pair_text_indices": torch.from_numpy(pair_text_indices),
-            "row_pair_indices": torch.from_numpy(row_pair_indices),
-            "row_side_ids": torch.from_numpy(row_side_ids),
-            "row_token_indices": torch.from_numpy(row_token_indices),
+            "row_batch_indices": torch.tensor(row_batch_indices, dtype=torch.long),
+            "row_unit_indices": torch.tensor(row_unit_indices, dtype=torch.long),
+            "row_pair_indices": torch.tensor(row_pair_indices, dtype=torch.long),
+            "row_side_ids": torch.tensor(row_side_ids, dtype=torch.long),
+            "row_token_indices": torch.tensor(row_token_indices, dtype=torch.long),
             "row_texts": row_texts,
-            "source_line_ids": torch.from_numpy(source_line_ids),
+            "source_line_ids": torch.tensor([item.pair.index for item in items], dtype=torch.long),
+            **build_writer_window_view(target_rows, self.config),
         }
 
     def iter_once(self, worker_id: int, worker_count: int):
-        rows = self._carry_rows
-        self._carry_rows = []
+        items = self._carry_items
+        self._carry_items = []
 
         for pair in iter_parallel_pairs(self.train_file):
             if pair.index % worker_count != worker_id:
@@ -338,21 +327,20 @@ class ParallelDilBatchDataset(IterableDataset):
                 continue
 
             pair_item = ParallelPairSegments(pair, source_segments, target_segments)
-            for row in self.pair_rows(pair_item):
-                rows.append(row)
-                if len(rows) == self.batch_size:
-                    yield self.make_batch(rows)
-                    rows = []
+            items.append(pair_item)
+            if len(items) == self.batch_size:
+                yield self.make_batch(items)
+                items = []
             self._produced_pairs += 1
             if self.max_samples > 0 and self._produced_pairs >= self.max_samples:
-                if rows:
-                    yield self.make_batch(rows)
+                if items:
+                    yield self.make_batch(items)
                 return
 
-        if rows and not self.repeat:
-            yield self.make_batch(rows)
-        elif rows:
-            self._carry_rows = rows
+        if items and not self.repeat:
+            yield self.make_batch(items)
+        elif items:
+            self._carry_items = items
 
     def __iter__(self):
         worker = get_worker_info()
@@ -363,7 +351,7 @@ class ParallelDilBatchDataset(IterableDataset):
             for batch in self.iter_once(worker_id, worker_count):
                 yielded = True
                 yield batch
-            if not yielded and not self._carry_rows:
+            if not yielded and not self._carry_items:
                 raise ValueError(f"{self.train_file} produced no trainable parallel segments")
             if not self.repeat:
                 return
@@ -381,9 +369,9 @@ def piece_positions(tokenizer, input_ids: list[int], offsets: list[list[int]]) -
 def piece_to_rows(row_indices: list[int], batch: dict, pieces: list[EncoderPiece]) -> list[list[int]]:
     max_piece_index = max((piece.encoder_index for piece in pieces), default=-1)
     mapping: list[list[int]] = [[] for _ in range(max_piece_index + 1)]
-    starts = batch["teacher_starts"].detach().cpu().tolist()
-    ends = batch["teacher_ends"].detach().cpu().tolist()
-    distill_mask = batch["teacher_distill_mask"].detach().cpu().tolist()
+    starts = row_teacher_values(batch, "teacher_starts")
+    ends = row_teacher_values(batch, "teacher_ends")
+    distill_mask = row_teacher_values(batch, "teacher_distill_mask")
     for row_idx in row_indices:
         if not distill_mask[row_idx]:
             continue
@@ -488,7 +476,7 @@ def build_alignment_group(
     score: float,
     batch: dict,
 ) -> ParallelAlignmentGroup | None:
-    distill_mask = batch["teacher_distill_mask"].detach().cpu().tolist()
+    distill_mask = row_teacher_values(batch, "teacher_distill_mask")
     source = tuple(row_idx for row_idx in source_rows if distill_mask[row_idx])
     target = tuple(row_idx for row_idx in target_rows if distill_mask[row_idx])
     if not source or not target:
@@ -608,19 +596,25 @@ def group_row_alignments(
 def apply_one_to_one_shared_teacher(
     teacher: torch.Tensor,
     teacher_mask: torch.Tensor,
+    batch: dict,
     groups: list[ParallelAlignmentGroup],
 ) -> torch.Tensor:
     result = teacher.clone()
+    flat_result = result.reshape(-1, result.shape[-2], result.shape[-1])
+    flat_mask = teacher_mask.reshape(-1)
+    row_batch_indices = batch["row_batch_indices"].to(teacher.device, dtype=torch.long)
+    row_unit_indices = batch["row_unit_indices"].to(teacher.device, dtype=torch.long)
+    flat_indices = row_batch_indices * teacher.shape[1] + row_unit_indices
     for group in groups:
         if len(group.source_rows) != 1 or len(group.target_rows) != 1:
             continue
-        source_row = group.source_rows[0]
-        target_row = group.target_rows[0]
-        if not bool(teacher_mask[source_row]) or not bool(teacher_mask[target_row]):
+        source_row = int(flat_indices[group.source_rows[0]].item())
+        target_row = int(flat_indices[group.target_rows[0]].item())
+        if not bool(flat_mask[source_row]) or not bool(flat_mask[target_row]):
             continue
-        shared = (teacher[source_row] + teacher[target_row]) * 0.5
-        result[source_row] = shared
-        result[target_row] = shared
+        shared = (flat_result[source_row] + flat_result[target_row]) * 0.5
+        flat_result[source_row] = shared
+        flat_result[target_row] = shared
     return result
 
 
@@ -655,13 +649,24 @@ def grouped_mean(vectors: torch.Tensor, row_indices: torch.Tensor, row_mask: tor
     return (gathered * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
 
 
+def semantic_row_vectors(semantic: torch.Tensor, batch: dict) -> torch.Tensor:
+    if semantic.dim() == 2:
+        return semantic
+    if semantic.dim() != 3:
+        raise ValueError("parallel DIL semantic output must be shaped [rows, latent] or [batch, units, latent]")
+    batch_indices = batch["row_batch_indices"].to(semantic.device, dtype=torch.long)
+    unit_indices = batch["row_unit_indices"].to(semantic.device, dtype=torch.long)
+    return semantic[batch_indices, unit_indices]
+
+
 def parallel_alignment_loss(mean: torch.Tensor, batch: dict) -> torch.Tensor:
-    source_rows = batch["parallel_source_rows"].to(mean.device)
-    target_rows = batch["parallel_target_rows"].to(mean.device)
+    row_vectors = semantic_row_vectors(mean, batch)
+    source_rows = batch["parallel_source_rows"].to(row_vectors.device)
+    target_rows = batch["parallel_target_rows"].to(row_vectors.device)
     if source_rows.shape[0] == 0:
-        return mean.new_zeros(())
-    source_vectors = grouped_mean(mean, source_rows, batch["parallel_source_mask"].to(mean.device))
-    target_vectors = grouped_mean(mean, target_rows, batch["parallel_target_mask"].to(mean.device))
+        return row_vectors.new_zeros(())
+    source_vectors = grouped_mean(row_vectors, source_rows, batch["parallel_source_mask"].to(row_vectors.device))
+    target_vectors = grouped_mean(row_vectors, target_rows, batch["parallel_target_mask"].to(row_vectors.device))
     return (1.0 - F.cosine_similarity(source_vectors.float(), target_vectors.float(), dim=-1)).mean()
 
 
@@ -747,11 +752,18 @@ class ParallelNllbTeacher:
         return encoded_texts
 
     def raw_teacher_layers(self, batch: dict, encoded_texts: dict[int, EncodedText]) -> tuple[torch.Tensor, torch.Tensor]:
-        text_indices = batch["teacher_text_indices"].detach().cpu().tolist()
-        starts = batch["teacher_starts"].detach().cpu().tolist()
-        ends = batch["teacher_ends"].detach().cpu().tolist()
-        distill_mask = batch["teacher_distill_mask"].detach().cpu().tolist()
-        sample_count = len(starts)
+        text_indices_tensor = batch["teacher_text_indices"].detach().cpu()
+        starts_tensor = batch["teacher_starts"].detach().cpu()
+        ends_tensor = batch["teacher_ends"].detach().cpu()
+        distill_mask_tensor = batch["teacher_distill_mask"].detach().cpu()
+        if starts_tensor.dim() != 2:
+            raise ValueError("parallel sequence DIL batches must provide teacher_starts shaped [batch, units]")
+        batch_size, unit_count = starts_tensor.shape
+        text_indices = text_indices_tensor.reshape(-1).tolist()
+        starts = starts_tensor.reshape(-1).tolist()
+        ends = ends_tensor.reshape(-1).tolist()
+        distill_mask = distill_mask_tensor.reshape(-1).tolist()
+        sample_count = batch_size * unit_count
         teacher = torch.zeros(
             (sample_count, len(NLLB_LAYER_GROUPS), self.model.config.d_model),
             dtype=torch.float32,
@@ -785,8 +797,9 @@ class ParallelNllbTeacher:
                     ]
                     teacher[row_idx, group_idx] = torch.stack(layer_vectors).mean(dim=0)
 
-        group_ids = batch["teacher_text_indices"].to(self.device, dtype=torch.long)
-        return apply_teacher_centered_add_by_group(teacher, teacher_mask, group_ids), teacher_mask
+        group_ids = batch["teacher_text_indices"].reshape(-1).to(self.device, dtype=torch.long)
+        teacher = apply_teacher_centered_add_by_group(teacher, teacher_mask, group_ids)
+        return teacher.reshape(batch_size, unit_count, len(NLLB_LAYER_GROUPS), self.model.config.d_model), teacher_mask.reshape(batch_size, unit_count)
 
     def alignment_candidates(
         self,
@@ -836,7 +849,7 @@ class ParallelNllbTeacher:
         pair_text_indices = batch["pair_text_indices"].detach().cpu().tolist()
         rows = rows_by_pair_side(batch)
         positions = row_positions(batch)
-        distill_mask = batch["teacher_distill_mask"].detach().cpu().tolist()
+        distill_mask = row_teacher_values(batch, "teacher_distill_mask")
         groups = []
         for pair_idx, (source_text_idx, target_text_idx) in enumerate(pair_text_indices):
             source_rows = rows.get((pair_idx, SOURCE_SIDE), [])
@@ -856,7 +869,7 @@ class ParallelNllbTeacher:
         encoded_texts = self.encode_batch_texts(batch)
         teacher_layers, teacher_mask = self.raw_teacher_layers(batch, encoded_texts)
         groups = self.alignment_groups(batch, encoded_texts)
-        batch["teacher_layers"] = apply_one_to_one_shared_teacher(teacher_layers, teacher_mask, groups)
+        batch["teacher_layers"] = apply_one_to_one_shared_teacher(teacher_layers, teacher_mask, batch, groups)
         batch["teacher_mask"] = teacher_mask
         batch.update(alignment_groups_to_tensors(groups, self.device))
         return batch

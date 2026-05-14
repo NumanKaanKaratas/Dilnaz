@@ -33,12 +33,14 @@ from dilnaz.train.data.parallel_dil_data import (
 )
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.dil.train import (
+    apply_writer_window_loss,
     is_dataloader_worker_exit,
     make_scheduler,
     model_inputs,
     restore_checkpoint,
     save_checkpoint,
 )
+from dilnaz.train.dil.writer_windows import writer_window_counts
 
 
 class ParallelAsyncTeacherBatchSource:
@@ -115,10 +117,8 @@ def parse_args():
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
-    parser.add_argument("--num-encoder-layers", type=int, default=DIL_MODEL_DEFAULTS["num_encoder_layers"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
-    parser.add_argument("--context-radius", type=int, default=DIL_MODEL_DEFAULTS["context_radius"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
     parser.add_argument("--byte-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_expansion"])
@@ -150,8 +150,6 @@ def validate_args(args):
         raise ValueError("--max-batch-reuse must be > 0")
     if args.parallel_alignment_weight < 0:
         raise ValueError("--parallel-alignment-weight must be >= 0")
-    if args.context_radius < 0:
-        raise ValueError("--context-radius must be >= 0")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
@@ -188,10 +186,8 @@ def build_config(args, tokenizer):
         eos_token_id=tokenizer.eos_token_id,
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
-        num_encoder_layers=args.num_encoder_layers,
         latent_size=args.latent_size,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
-        context_radius=args.context_radius,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
         byte_conv_expansion=args.byte_conv_expansion,
@@ -295,7 +291,7 @@ def evaluate_parallel(
         teacher.materialize(batch)
         cudagraph_step_begin(device, compile_mode)
         with autocast_context(autocast_enabled):
-            outputs = model(**model_inputs(batch))
+            outputs = apply_writer_window_loss(model, model(**model_inputs(batch)), batch, None)
             loss, parallel_loss = parallel_total_loss(outputs, batch, parallel_alignment_weight)
         accumulate_metrics(total, loss, outputs, parallel_loss, batch, model.config, parallel_alignment_weight)
         batches += 1
@@ -438,6 +434,7 @@ def main():
             model_batch["training_step"] = step
             with autocast_context(autocast_enabled):
                 outputs = model(**model_batch)
+                outputs = apply_writer_window_loss(model, outputs, batch, step)
                 loss, parallel_loss = parallel_total_loss(outputs, batch, args.parallel_alignment_weight)
 
             loss.backward()
@@ -453,8 +450,9 @@ def main():
             )
             data_seconds += wait_seconds
 
-            log_tokens += int(batch["labels"].label_mask.sum().detach().cpu())
-            log_windows += int(batch["labels"].true_lengths.gt(0).sum().detach().cpu())
+            token_count, window_count = writer_window_counts(batch["writer_labels"])
+            log_tokens += token_count
+            log_windows += window_count
             log_steps += 1
             source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
             accumulate_metrics(

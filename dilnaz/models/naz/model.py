@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_utils import PreTrainedModel
 
-from dilnaz.surface import PackedSurface, pack_token_units
+from dilnaz.surface import PackedSurface
 
 from ..common.latents import angular_noise_like
 from ..dil import Dil, DilConfig
@@ -119,68 +119,16 @@ class Naz(PreTrainedModel):
         raise ValueError("Naz uses semantic inputs_embeds and has no token embedding table")
 
     @torch.no_grad()
-    def dil_context_surface(
-        self,
-        surface: PackedSurface,
-        unit_mask: torch.Tensor,
-    ) -> tuple[PackedSurface, torch.Tensor]:
-        surface = surface.to(unit_mask.device)
-        batch_size, sequence_length = unit_mask.shape
-        if surface.ids.shape[0] != batch_size or surface.unit_count != sequence_length:
-            raise ValueError("surface must be packed as [batch, sequence_units]")
-        context_radius = self.dil_config.context_radius
-        context_size = self.dil_config.context_size
-        rows: list[list[list[int]]] = []
-        active_indices: list[int] = []
-        surface_cpu = surface.cpu()
-        unit_mask_cpu = unit_mask.detach().cpu()
-        for batch_idx in range(batch_size):
-            for unit_idx in range(sequence_length):
-                if not bool(unit_mask_cpu[batch_idx, unit_idx]):
-                    continue
-                row = []
-                for offset in range(-context_radius, context_radius + 1):
-                    source_idx = unit_idx + offset
-                    if 0 <= source_idx < sequence_length and bool(unit_mask_cpu[batch_idx, source_idx]):
-                        start = int(surface_cpu.unit_offsets[batch_idx, source_idx])
-                        length = int(surface_cpu.unit_lengths[batch_idx, source_idx])
-                        row.append(surface_cpu.ids[batch_idx, start : start + length].tolist())
-                    else:
-                        row.append([])
-                if len(row) != context_size:
-                    raise RuntimeError("internal context packing error")
-                rows.append(row)
-                active_indices.append(batch_idx * sequence_length + unit_idx)
-        if not rows:
-            raise ValueError("surface has no active units to encode")
-        active = torch.zeros((batch_size * sequence_length,), dtype=torch.bool, device=unit_mask.device)
-        active[torch.tensor(active_indices, dtype=torch.long, device=unit_mask.device)] = True
-        packed = pack_token_units(
-            rows,
-            pad_token_id=self.pad_token_id,
-            bucket_sizes=self.dil_config.surface_bucket_sizes,
-            max_pieces_per_unit=self.dil_config.max_surface_pieces_per_unit,
-            device=unit_mask.device,
-        )
-        return packed, active
-
-    @torch.no_grad()
     def encode_sequence_latents(
         self,
         surface: PackedSurface,
         unit_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         unit_mask = surface.unit_mask if unit_mask is None else unit_mask.to(surface.ids.device, dtype=torch.bool)
-        batch_size, sequence_length = unit_mask.shape
-        context_surface, active = self.dil_context_surface(surface, unit_mask)
-        active_latents = self.dil_model.encode(surface=context_surface).float()
-        semantic_states = torch.zeros(
-            (batch_size * sequence_length, self.config.latent_size),
-            dtype=active_latents.dtype,
-            device=active_latents.device,
-        )
-        semantic_states[active] = active_latents
-        return semantic_states.reshape(batch_size, sequence_length, -1)
+        semantic_states = self.dil_model.encode(surface=surface).float()
+        if semantic_states.shape[:2] != unit_mask.shape:
+            raise ValueError("DIL sequence latents must match surface unit_mask shape")
+        return semantic_states * unit_mask.unsqueeze(-1).to(semantic_states.dtype)
 
     def embed_sequence_latents(
         self,

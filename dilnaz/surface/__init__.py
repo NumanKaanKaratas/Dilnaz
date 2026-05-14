@@ -2,7 +2,6 @@ from .buckets import choose_bucket_size
 from .decode import decode_packed_units, generated_unit_tensors
 from .ops import gather_unit_values, scatter_mean_by_unit, scatter_sum_by_unit
 from .packing import (
-    pack_context_segments,
     pack_segment_units,
     pack_token_units,
     pack_writer_targets,
@@ -17,7 +16,6 @@ __all__ = [
     "decode_packed_units",
     "gather_unit_values",
     "generated_unit_tensors",
-    "pack_context_segments",
     "pack_segment_units",
     "pack_token_units",
     "pack_writer_targets",

@@ -35,9 +35,10 @@ from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
+from dilnaz.train.dil.writer_windows import gather_writer_semantic, writer_window_counts
 
 
-CHECKPOINT_FORMAT_VERSION = 27
+CHECKPOINT_FORMAT_VERSION = 28
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -96,8 +97,8 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "pad_token_id": config.pad_token_id,
         "eos_token_id": config.eos_token_id,
         "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
-        "context_radius": config.context_radius,
-        "target_index": config.target_index,
+        "max_sequence_units": config.max_sequence_units,
+        "encoder_context_layers": config.encoder_context_layers,
         "latent_size": config.latent_size,
         "distillation_weight": config.distillation_weight,
         "writer_loss_weight": config.writer_loss_weight,
@@ -187,10 +188,35 @@ def is_dataloader_worker_exit(error: RuntimeError) -> bool:
 def model_inputs(batch: dict) -> dict:
     return {
         "surface": batch["surface"],
-        "labels": batch["labels"],
         "teacher_layers": batch["teacher_layers"],
         "teacher_mask": batch["teacher_mask"],
     }
+
+
+def apply_writer_window_loss(model: Dil, outputs, batch: dict, training_step: int | None):
+    if model.config.writer_loss_weight <= 0.0 or "writer_labels" not in batch:
+        return outputs
+    writer_window_mask = batch["writer_window_mask"].to(outputs.semantic.device, dtype=torch.bool)
+    writer_semantic = gather_writer_semantic(
+        outputs.semantic.detach(),
+        batch["writer_source_rows"],
+        batch["writer_unit_indices"],
+        writer_window_mask,
+    )
+    writer_loss, writer_token_loss, byte_acc, token_exact, stop_acc = model.writer_transition_loss_and_metrics(
+        writer_semantic,
+        batch["writer_labels"],
+        batch["writer_zone_ids"],
+        writer_window_mask,
+        training_step=training_step,
+    )
+    outputs.loss = outputs.loss + writer_loss * model.config.writer_loss_weight
+    outputs.writer_loss = writer_loss
+    outputs.writer_token_loss = writer_token_loss
+    outputs.byte_acc = byte_acc
+    outputs.token_exact = token_exact
+    outputs.stop_acc = stop_acc
+    return outputs
 
 
 class AsyncTeacherIterator:
@@ -323,10 +349,8 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
-    parser.add_argument("--num-encoder-layers", type=int, default=DIL_MODEL_DEFAULTS["num_encoder_layers"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
-    parser.add_argument("--context-radius", type=int, default=DIL_MODEL_DEFAULTS["context_radius"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
     parser.add_argument("--byte-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_expansion"])
@@ -355,8 +379,6 @@ def validate_args(args):
         raise ValueError("--max-batch-reuse must be > 0")
     if args.text_read_chars <= 0:
         raise ValueError("--text-read-chars must be > 0")
-    if args.context_radius < 0:
-        raise ValueError("--context-radius must be >= 0")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
@@ -399,10 +421,8 @@ def build_config(args, tokenizer):
         eos_token_id=tokenizer.eos_token_id,
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
-        num_encoder_layers=args.num_encoder_layers,
         latent_size=args.latent_size,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
-        context_radius=args.context_radius,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
         byte_conv_expansion=args.byte_conv_expansion,
@@ -613,26 +633,28 @@ class DilBaseTrainer(BaseTrainer):
         if training_step is not None:
             model_batch["training_step"] = training_step
         outputs = self.model(**model_batch)
-        return outputs
+        return apply_writer_window_loss(self.model, outputs, batch, training_step)
 
     def train_step(self, batch: dict, step: int) -> StepResult:
         outputs = self.forward_batch(batch, step)
+        token_count, window_count = writer_window_counts(batch["writer_labels"])
         return StepResult(
             loss=outputs.loss,
             outputs=outputs,
-            token_count=int(batch["labels"].label_mask.sum().detach().cpu()),
-            window_count=int(batch["labels"].true_lengths.gt(0).sum().detach().cpu()),
+            token_count=token_count,
+            window_count=window_count,
             batch=batch,
         )
 
     def eval_step(self, batch: dict) -> StepResult:
         self.materialize_eval_teacher(batch)
         outputs = self.forward_batch(batch, None)
+        token_count, window_count = writer_window_counts(batch["writer_labels"])
         return StepResult(
             loss=outputs.loss,
             outputs=outputs,
-            token_count=int(batch["labels"].label_mask.sum().detach().cpu()),
-            window_count=int(batch["labels"].true_lengths.gt(0).sum().detach().cpu()),
+            token_count=token_count,
+            window_count=window_count,
             batch=batch,
         )
 

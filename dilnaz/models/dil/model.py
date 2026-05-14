@@ -21,8 +21,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 27:
-            raise ValueError("DIL global EOS surface writer checkpoints require checkpoint_format_version=27")
+        if config.checkpoint_format_version != 28:
+            raise ValueError("DIL sequence semantic encoder checkpoints require checkpoint_format_version=28")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
@@ -122,6 +122,26 @@ class Dil(PreTrainedModel):
         teacher_sim = F.normalize(teacher_vectors, dim=-1) @ F.normalize(teacher_vectors, dim=-1).T
         off_diagonal = ~torch.eye(model_sim.shape[0], dtype=torch.bool, device=model_sim.device)
         return F.mse_loss(model_sim[off_diagonal], teacher_sim[off_diagonal])
+
+    def sequence_geometry_loss(
+        self,
+        semantic: torch.Tensor,
+        teacher_vectors: torch.Tensor,
+        teacher_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if semantic.dim() == 2:
+            return self.geometry_loss(semantic, teacher_vectors, teacher_mask)
+        if semantic.dim() != 3:
+            raise ValueError("semantic must be shaped [batch, latent] or [batch, units, latent]")
+        if teacher_vectors.dim() != 3:
+            raise ValueError("sequence teacher vectors must be shaped [batch, units, teacher_dim]")
+        if teacher_vectors.shape[:2] != semantic.shape[:2]:
+            raise ValueError("sequence teacher vectors must match semantic batch/unit dimensions")
+        if teacher_mask is None:
+            teacher_mask = torch.ones(semantic.shape[:2], dtype=torch.bool, device=semantic.device)
+        else:
+            teacher_mask = teacher_mask.to(semantic.device, dtype=torch.bool)
+        return self.geometry_loss(semantic[teacher_mask], teacher_vectors[teacher_mask], None)
 
     def variance_regularizer(self, model_vectors: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if mask is not None:
@@ -337,10 +357,10 @@ class Dil(PreTrainedModel):
         if teacher_layers is not None:
             teacher_layers = teacher_layers.to(semantic.device, dtype=torch.float32)
             if teacher_mask is None:
-                teacher_mask = torch.ones(teacher_layers.shape[0], dtype=torch.bool, device=semantic.device)
+                teacher_mask = torch.ones(teacher_layers.shape[:-2], dtype=torch.bool, device=semantic.device)
             else:
                 teacher_mask = teacher_mask.to(semantic.device, dtype=torch.bool)
-            mean_geometry_loss = self.geometry_loss(semantic, teacher_layers[:, -1], teacher_mask)
+            mean_geometry_loss = self.sequence_geometry_loss(semantic, teacher_layers[..., -1, :], teacher_mask)
             variance_loss = self.variance_regularizer(semantic, teacher_mask)
             distill_loss = (
                 mean_geometry_loss * self.mean_geometry_weight

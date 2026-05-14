@@ -97,23 +97,6 @@ def pack_segment_units(
     )
 
 
-def pack_context_segments(
-    rows: Sequence[Sequence[TokenSegment | None]],
-    *,
-    pad_token_id: int,
-    bucket_sizes: Sequence[int],
-    max_pieces_per_unit: int,
-    device: torch.device | None = None,
-) -> PackedSurface:
-    return pack_segment_units(
-        rows,
-        pad_token_id=pad_token_id,
-        bucket_sizes=bucket_sizes,
-        max_pieces_per_unit=max_pieces_per_unit,
-        device=device,
-    )
-
-
 def writer_query_from_lengths(
     unit_lengths: torch.LongTensor,
     *,

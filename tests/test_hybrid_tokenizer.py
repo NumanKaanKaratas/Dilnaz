@@ -1,7 +1,6 @@
 from pathlib import Path
 
-from dilnaz.models.dil import DilConfig
-from dilnaz.surface import pack_context_segments, pack_token_units
+from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer
 from dilnaz.train.data.dil_data import stream_teacher_text_items_with_eos, teacher_distill_segment, trainable_segments
 from dilnaz.train.data.naz_data import build_token_cache, stream_token_pieces
@@ -31,26 +30,17 @@ def test_trainable_segments_can_append_global_eos():
     assert not teacher_distill_segment(segments[-1])
 
 
-def test_pack_context_segments_keeps_one_semantic_unit_per_token():
+def test_pack_token_units_keeps_one_semantic_unit_per_token():
     tokenizer = tiny_tokenizer()
     segments = trainable_segments(tokenizer, "araba car", max_surface_pieces_per_unit=8, add_eos=False)
-    cfg = DilConfig(
-        vocab_size=tokenizer.vocab_size,
+    surface = pack_token_units(
+        [[segment.token_ids for segment in segments]],
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        decoder_start_token_id=tokenizer.eos_token_id,
-        max_surface_pieces_per_unit=8,
-        surface_bucket_sizes=(8, 16),
-        context_radius=1,
+        bucket_sizes=(8, 16),
+        max_pieces_per_unit=8,
     )
-    surface = pack_context_segments(
-        [[None, segments[0], segments[1]]],
-        pad_token_id=cfg.pad_token_id,
-        bucket_sizes=cfg.surface_bucket_sizes,
-        max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
-    )
-    assert surface.unit_count == cfg.context_size
-    assert surface.unit_mask.tolist() == [[False, True, True]]
+    assert surface.unit_count == 2
+    assert surface.unit_mask.tolist() == [[True, True]]
 
 
 def test_naz_token_cache_is_flat_ids_plus_offsets(tmp_path: Path):

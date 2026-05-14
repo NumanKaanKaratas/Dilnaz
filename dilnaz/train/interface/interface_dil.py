@@ -7,14 +7,14 @@ import torch.nn.functional as F
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from dilnaz.train.common.runtime import COMPILE_MODE_CHOICES, compile_forward, validate_compile_environment
-from dilnaz.train.data.dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add, context_offsets
+from dilnaz.train.data.dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
-from dilnaz.surface import pack_context_segments
+from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 27
+CHECKPOINT_FORMAT_VERSION = 28
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -29,7 +29,7 @@ def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
 
 
 def make_batch(segments: list[TokenSegment], tokenizer: HybridTokenizer, config: DilConfig, device: torch.device):
-    rows: list[list[TokenSegment | None]] = []
+    rows: list[list[list[int]]] = [[]]
     byte_lengths = []
 
     for row_idx, segment in enumerate(segments):
@@ -40,20 +40,9 @@ def make_batch(segments: list[TokenSegment], tokenizer: HybridTokenizer, config:
                 f"max_surface_pieces_per_unit={config.max_surface_pieces_per_unit}"
             )
         byte_lengths.append(len(token_ids))
-        row: list[TokenSegment | None] = []
-        for context_idx, offset in enumerate(context_offsets(config.context_radius)):
-            source_idx = row_idx + offset
-            if source_idx < 0 or source_idx >= len(segments):
-                row.append(None)
-                continue
-            context_ids = segments[source_idx].token_ids
-            if len(context_ids) > config.max_surface_pieces_per_unit:
-                row.append(None)
-                continue
-            row.append(segments[source_idx])
-        rows.append(row)
+        rows[0].append(list(token_ids))
 
-    return pack_context_segments(
+    return pack_token_units(
         rows,
         pad_token_id=config.pad_token_id,
         bucket_sizes=config.surface_bucket_sizes,
@@ -132,15 +121,17 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
 
 @torch.no_grad()
 def encode_tokens(model: Dil, surface):
-    return model.encode(surface=surface).float()
+    return model.encode(surface=surface).float()[0]
 
 
 @torch.no_grad()
 def decode_tokens(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor) -> list[str]:
-    generation = model.decode_semantic(latents)
+    generation = model.decode_semantic(latents.unsqueeze(0))
+    token_ids = generation.token_ids[0] if generation.token_ids.dim() == 3 else generation.token_ids
+    token_mask = generation.token_mask[0] if generation.token_mask.dim() == 3 else generation.token_mask
     return [
-        tokenizer.decode([int(token_id) for token_id in row.tolist()])
-        for row in generation.token_ids
+        tokenizer.decode([int(token_id) for token_id, keep in zip(row.tolist(), mask.tolist()) if keep])
+        for row, mask in zip(token_ids, token_mask)
     ]
 
 

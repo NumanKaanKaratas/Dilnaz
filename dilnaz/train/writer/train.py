@@ -26,14 +26,13 @@ from dilnaz.train.common.runtime import (
 from dilnaz.train.data.dil_data import (
     ResidentDilBatcher,
     ResidentDilEvalLoader,
-    context_offsets,
     load_hybrid_tokenizer,
     make_dil_batch_loader,
     segment_piece_ids,
     stream_teacher_text_items_with_eos,
     trainable_segments,
 )
-from dilnaz.surface import pack_context_segments, pack_writer_targets
+from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_TRAIN_DEFAULTS
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.naz import NazConfig
@@ -42,7 +41,7 @@ from dilnaz.models.naz import Naz
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 27
+CHECKPOINT_FORMAT_VERSION = 28
 WRITER_OBJECTIVE = "causal_surface_writer_v1"
 WRITER_METRIC_KEYS = (
     "loss",
@@ -108,7 +107,6 @@ class HybridDilSlidingWindowDataset(IterableDataset):
 
     def make_batch(self, texts: list[str], line_ids: list[int], segments_by_text: list, refs: list[tuple[int, int]]):
         batch_size = len(refs)
-        context_rows = []
         target_rows = []
         window_mask = torch.zeros((batch_size, self.window_size), dtype=torch.bool)
         source_line_ids = torch.zeros((batch_size,), dtype=torch.long)
@@ -121,25 +119,16 @@ class HybridDilSlidingWindowDataset(IterableDataset):
             for window_idx in range(self.window_size):
                 token_idx = window_start + window_idx
                 if token_idx < 0 or token_idx >= len(segments):
-                    context_rows.append([None for _ in context_offsets(self.config.context_radius)])
                     target_row.append([])
                     continue
                 window_mask[batch_idx, window_idx] = True
                 segment = segments[token_idx]
-                context_row = []
-                for context_idx, offset in enumerate(context_offsets(self.config.context_radius)):
-                    source_idx = token_idx + offset
-                    if 0 <= source_idx < len(segments):
-                        context_row.append(segments[source_idx])
-                    else:
-                        context_row.append(None)
-                context_rows.append(context_row)
                 target_row.append(segment_piece_ids(segment))
             target_rows.append(target_row)
 
         return {
-            "surface": pack_context_segments(
-                context_rows,
+            "surface": pack_token_units(
+                target_rows,
                 pad_token_id=self.config.pad_token_id,
                 bucket_sizes=self.config.surface_bucket_sizes,
                 max_pieces_per_unit=self.config.max_surface_pieces_per_unit,
@@ -366,8 +355,9 @@ def sliding_writer_metrics(
     window_mask = batch["window_mask"].to(surface.ids.device, dtype=torch.bool)
     batch_size, window_size = window_mask.shape
     with torch.no_grad():
-        flat_semantic = model.encode(surface).float()
-        semantic = flat_semantic.reshape(batch_size, window_size, -1)
+        semantic = model.encode(surface).float()
+        if semantic.shape[:2] != window_mask.shape:
+            raise ValueError("writer-only DIL encode output must match the sliding window shape")
 
     true_future_latents = None
     if use_future_latents:
@@ -504,8 +494,8 @@ def save_checkpoint(
         "pad_token_id": config.pad_token_id,
         "eos_token_id": config.eos_token_id,
         "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
-        "context_radius": config.context_radius,
-        "target_index": config.target_index,
+        "max_sequence_units": config.max_sequence_units,
+        "encoder_context_layers": config.encoder_context_layers,
         "latent_size": config.latent_size,
         "writer_window_size": config.writer_sliding_window_size,
         "writer_left_frozen": config.writer_left_frozen,
