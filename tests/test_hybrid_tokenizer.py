@@ -33,7 +33,6 @@ def test_pack_context_segments_keeps_one_semantic_unit_per_token():
         decoder_start_token_id=tokenizer.eos_token_id,
         max_surface_pieces_per_unit=8,
         surface_bucket_sizes=(8, 16),
-        writer_output_buckets=(2, 4, 8),
         context_radius=1,
     )
     surface = pack_context_segments(

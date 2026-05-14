@@ -5,14 +5,15 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_utils import PreTrainedModel
 
-from dilnaz.surface import PackedSurface, PackedSurfaceState, PackedWriterTarget, empty_surface_state, merge_frozen_state
+from dilnaz.surface import PackedSurface, PackedWriterTarget
 
 from ..common.latents import angular_noise_like, normalize_semantic_latents
 from .configuration import DilConfig
 from .encoder import DilEncoderCore
 from .layers import DilPackedDepthwiseConv
 from .outputs import DilOutput
-from .writer import DilConditionalWriter, DilWriterOutput
+from .writer import DilConditionalWriter, DilWriterGeneration, DilWriterOutput
+from .writer.blocks import DilPackedCausalDepthwiseConv
 
 
 class Dil(PreTrainedModel):
@@ -20,8 +21,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 24:
-            raise ValueError("DIL block diffusion writer checkpoints require checkpoint_format_version=24")
+        if config.checkpoint_format_version != 26:
+            raise ValueError("DIL causal surface writer checkpoints require checkpoint_format_version=26")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
@@ -30,6 +31,8 @@ class Dil(PreTrainedModel):
             raise ValueError("decoder_start_token_id must be inside the tokenizer vocabulary")
         if config.writer_stop_token_id != config.vocab_size or config.writer_vocab_size != config.vocab_size + 1:
             raise ValueError("Writer stop token contract must be writer_stop_token_id=vocab_size")
+        if config.writer_bos_token_id != config.vocab_size + 1 or config.writer_empty_token_id != config.vocab_size + 2:
+            raise ValueError("Writer input-only token contract must be BOS=vocab_size+1 and EMPTY=vocab_size+2")
 
         self.encoder = DilEncoderCore(config)
         self.writer = DilConditionalWriter(config)
@@ -51,7 +54,7 @@ class Dil(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, DilPackedDepthwiseConv):
+        elif isinstance(module, (DilPackedDepthwiseConv, DilPackedCausalDepthwiseConv)):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -93,47 +96,10 @@ class Dil(PreTrainedModel):
         )
         if isinstance(output, DilWriterOutput):
             return output
-        token_logits, state_valid_logits, emit_logits, length_bucket_logits = output
-        return DilWriterOutput(
-            token_logits=token_logits,
-            state_valid_logits=state_valid_logits,
-            emit_logits=emit_logits,
-            length_bucket_logits=length_bucket_logits,
-        )
-
-    def _refined_transition_outputs(
-        self,
-        semantic: torch.Tensor,
-        refinement_steps: int,
-        return_step0: bool = False,
-        **writer_kwargs,
-    ):
-        if refinement_steps <= 0:
-            raise ValueError("refinement_steps must be > 0")
-        output = self._transition_output(semantic, **writer_kwargs)
-        step0_output = output
-        if refinement_steps == 1:
-            return (output, step0_output) if return_step0 else output
-        for step_idx in range(1, refinement_steps):
-            generated = output.token_logits.argmax(dim=-1)
-            draft_state = merge_frozen_state(
-                empty_surface_state(output.query_surface, self.config.writer_empty_token_id),
-                generated,
-                output.query_surface.mask,
-            )
-            writer_kwargs = {
-                **writer_kwargs,
-                "query_surface": output.query_surface,
-                "surface_state": draft_state,
-                "refinement_step": step_idx,
-            }
-            output = self._transition_output(semantic, **writer_kwargs)
-        return (output, step0_output) if return_step0 else output
+        return DilWriterOutput(token_logits=output)
 
     def writer_transition_outputs(self, semantic: torch.Tensor, **writer_kwargs) -> DilWriterOutput:
-        return_step0 = bool(writer_kwargs.pop("return_step0", False))
-        refinement_steps = int(writer_kwargs.pop("refinement_steps", self.config.writer_refinement_steps))
-        return self._refined_transition_outputs(semantic, refinement_steps, return_step0=return_step0, **writer_kwargs)
+        return self._transition_output(semantic, **writer_kwargs)
 
     def set_compiled_forwards(self, encoder_forward=None, writer_forward=None, transition_forward=None):
         object.__setattr__(self, "_compiled_encoder_forward", encoder_forward)
@@ -244,17 +210,6 @@ class Dil(PreTrainedModel):
                 noised[mask] = angular_noise_like(noised[mask], min_tensor, max_tensor)
         return noised.to(semantic.dtype)
 
-    def length_bucket_loss(self, logits: torch.Tensor, target: PackedWriterTarget, unit_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        targets = target.length_bucket_targets.to(logits.device)
-        mask = target.query.unit_mask.to(logits.device) if unit_mask is None else unit_mask.to(logits.device)
-        per_unit = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
-            targets.reshape(-1),
-            reduction="none",
-        ).reshape_as(targets)
-        weights = mask.to(per_unit.dtype)
-        return (per_unit * weights).sum() / weights.sum().clamp_min(1.0)
-
     def writer_loss_and_metrics(
         self,
         semantic: torch.Tensor,
@@ -263,36 +218,29 @@ class Dil(PreTrainedModel):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target = target.to(semantic.device)
         semantic = self.writer_training_semantic(semantic, training_step)
-        output = self.writer.transition(semantic, query_surface=target.query)
+        output = self.writer_transition_outputs(semantic, query_surface=target.query)
         token_loss = F.cross_entropy(
             output.token_logits.reshape(-1, self.config.writer_vocab_size),
             target.labels.reshape(-1),
             ignore_index=-100,
         )
-        length_loss = self.length_bucket_loss(output.length_bucket_logits, target)
-        loss = token_loss + length_loss
         byte_acc, token_exact, stop_acc = self.writer_metrics(output.token_logits, target)
-        return loss, token_loss, byte_acc, token_exact, stop_acc
+        return token_loss, token_loss, byte_acc, token_exact, stop_acc
 
     def writer_transition_loss_and_metrics(
         self,
         semantic: torch.Tensor,
         target: PackedWriterTarget,
-        surface_state: PackedSurfaceState,
         zone_ids: torch.LongTensor,
         window_mask: torch.Tensor,
         future_latents: Optional[torch.Tensor] = None,
         position_age: Optional[torch.Tensor] = None,
-        training_refinement_step: Optional[int] = None,
         training_step: int | None = None,
         return_metrics: bool = False,
     ):
         target = target.to(semantic.device)
-        surface_state = surface_state.to(semantic.device)
         zone_ids = zone_ids.to(semantic.device, dtype=torch.long)
         window_mask = window_mask.to(semantic.device, dtype=torch.bool)
-        if surface_state.ids.shape != target.labels.shape:
-            raise ValueError("writer transition loss expects surface_state packed on target.query")
         if future_latents is not None:
             future_latents = future_latents.to(semantic.device)
         if position_age is not None:
@@ -306,19 +254,11 @@ class Dil(PreTrainedModel):
         output = self.writer_transition_outputs(
             semantic,
             query_surface=target.query,
-            surface_state=surface_state,
             zone_ids=zone_ids,
             window_mask=window_mask,
             future_latents=future_latents,
             position_age=position_age,
-            refinement_step=training_refinement_step,
-            refinement_steps=1 if training_refinement_step is not None else self.config.writer_refinement_steps,
-            return_step0=return_metrics,
         )
-        if return_metrics:
-            output, step0_output = output
-        else:
-            step0_output = None
         logits = output.token_logits
         labels = target.labels
         zone_per_pos = zone_ids.gather(1, target.query.unit_ids.clamp_max(zone_ids.shape[1] - 1))
@@ -341,95 +281,30 @@ class Dil(PreTrainedModel):
         right_guard_token_loss = (per_token_loss * right_weights).sum() / right_weights.sum().clamp_min(1.0)
         left_weights = left.to(logits.dtype)
         left_loss = (per_token_loss * left_weights).sum() / left_weights.sum().clamp_min(1.0)
-        length_unit_weights = (zone_ids.eq(DilConditionalWriter.ZONE_ACTIVE) | zone_ids.eq(DilConditionalWriter.ZONE_RIGHT)) & window_mask
-        length_loss = self.length_bucket_loss(output.length_bucket_logits, target, length_unit_weights)
-
-        state_matches = surface_state.ids.eq(labels) & valid
-        state_present = surface_state.mask & surface_state.state_kind.gt(0)
-        state_valid_scope = (left | active) & valid & state_present
-        state_valid_target = state_matches & state_valid_scope
-        state_valid_weights = state_valid_scope.to(logits.dtype)
-        state_valid_per_pos = F.binary_cross_entropy_with_logits(
-            output.state_valid_logits.float(),
-            state_valid_target.to(dtype=torch.float32),
-            reduction="none",
-        ).to(logits.dtype)
-        state_valid_loss = (state_valid_per_pos * state_valid_weights).sum() / state_valid_weights.sum().clamp_min(1.0)
-
-        predictions = logits.argmax(dim=-1)
-        output_matches = predictions.eq(labels) & valid
-        emit_scope = (left | active) & valid
-        emit_target = output_matches & emit_scope
-        emit_weights = emit_scope.to(logits.dtype)
-        emit_per_pos = F.binary_cross_entropy_with_logits(
-            output.emit_logits.float(),
-            emit_target.to(dtype=torch.float32),
-            reduction="none",
-        ).to(logits.dtype)
-        emit_loss = (emit_per_pos * emit_weights).sum() / emit_weights.sum().clamp_min(1.0)
-        commit_loss = state_valid_loss + emit_loss
         loss = (
             token_loss
-            + length_loss
             + left_loss * self.config.writer_left_consistency_weight
-            + commit_loss * self.config.writer_commit_loss_weight
         )
         byte_acc, token_exact, stop_acc = self.writer_metrics(logits, target, active)
         if return_metrics:
             right_byte_acc, right_token_exact, right_stop_acc = self.writer_metrics(logits, target, right)
-            commit_scope = emit_scope
-            commit_scores = torch.sigmoid(output.emit_logits.float() / float(self.config.writer_commit_temperature))
-            commit_pred = commit_scores.ge(float(self.config.writer_commit_threshold)) & commit_scope
-            commit_positive = emit_target & commit_scope
-            true_positive = (commit_pred & commit_positive).sum().float()
-            predicted_positive = commit_pred.sum().float()
-            actual_positive = commit_positive.sum().float()
-            commit_precision = true_positive / predicted_positive.clamp_min(1.0)
-            commit_recall = true_positive / actual_positive.clamp_min(1.0)
-            commit_f1 = 2.0 * commit_precision * commit_recall / (commit_precision + commit_recall).clamp_min(1e-6)
-            false_commit_rate = (commit_pred & ~commit_positive).sum().float() / predicted_positive.clamp_min(1.0)
-            mean_commit_score = (
-                (commit_scores * commit_scope.to(commit_scores.dtype)).sum()
-                / commit_scope.sum().clamp_min(1).to(commit_scores.dtype)
-            )
-            step0_byte_acc, step0_token_exact, step0_stop_acc = self.writer_metrics(step0_output.token_logits, target, active)
-            state_quality = self.writer._state_embeddings(surface_state)[3]
-            valid_units = window_mask.to(state_quality.dtype).sum().clamp_min(1.0)
             return {
                 "loss": loss,
                 "token_loss": token_loss,
-                "length_bucket_loss": length_loss,
                 "active_token_loss": active_token_loss,
                 "right_guard_token_loss": right_guard_token_loss,
                 "left_consistency_loss": left_loss,
-                "commit_loss": commit_loss,
-                "state_valid_loss": state_valid_loss,
-                "emit_loss": emit_loss,
                 "byte_acc": byte_acc,
                 "token_exact": token_exact,
                 "stop_acc": stop_acc,
                 "right_guard_byte_acc": right_byte_acc,
                 "right_guard_token_exact": right_token_exact,
                 "right_guard_stop_acc": right_stop_acc,
-                "commit_precision": commit_precision,
-                "commit_recall": commit_recall,
-                "commit_f1": commit_f1,
-                "false_commit_rate": false_commit_rate,
-                "mean_commit_score": mean_commit_score,
-                "step0_byte_acc": step0_byte_acc,
-                "step0_token_exact": step0_token_exact,
-                "step0_stop_acc": step0_stop_acc,
                 "stepT_byte_acc": byte_acc,
                 "stepT_token_exact": token_exact,
                 "stepT_stop_acc": stop_acc,
-                "empty_ratio": (state_quality[..., 0] * window_mask).sum() / valid_units,
-                "draft_ratio": (state_quality[..., 1] * window_mask).sum() / valid_units,
-                "known_ratio": (state_quality[..., 2] * window_mask).sum() / valid_units,
-                "frozen_ratio": (state_quality[..., 3] * window_mask).sum() / valid_units,
-                "emit_calibration_logits": output.emit_logits.detach().float()[commit_scope],
-                "emit_calibration_targets": commit_positive.detach()[commit_scope].float(),
             }
-        return loss, token_loss, commit_loss, byte_acc, token_exact, stop_acc
+        return loss, token_loss, byte_acc, token_exact, stop_acc
 
     def forward(
         self,
@@ -477,7 +352,6 @@ class Dil(PreTrainedModel):
         byte_acc = semantic.new_zeros(())
         token_exact = semantic.new_zeros(())
         writer_token_loss = semantic.new_zeros(())
-        writer_commit_loss = semantic.new_zeros(())
         stop_acc = semantic.new_zeros(())
         if labels is not None and self.writer_loss_weight > 0.0:
             writer_semantic = semantic.detach()
@@ -494,7 +368,6 @@ class Dil(PreTrainedModel):
             distill_loss=distill_loss,
             writer_loss=writer_loss,
             writer_token_loss=writer_token_loss,
-            writer_commit_loss=writer_commit_loss,
             mean_geometry_loss=mean_geometry_loss,
             variance_loss=variance_loss,
             byte_acc=byte_acc,
@@ -503,7 +376,7 @@ class Dil(PreTrainedModel):
         )
 
     @torch.no_grad()
-    def decode_semantic(self, semantic: torch.Tensor) -> tuple[torch.LongTensor, torch.Tensor, torch.LongTensor]:
+    def decode_semantic(self, semantic: torch.Tensor) -> DilWriterGeneration:
         return self.writer.generate(semantic)
 
     @torch.no_grad()

@@ -8,7 +8,6 @@ def make_buffer():
         "Config",
         (),
         {
-            "writer_commit_threshold": 0.5,
             "writer_sliding_window_size": 4,
             "writer_left_frozen": 1,
             "writer_active_size": 2,
@@ -20,17 +19,20 @@ def make_buffer():
     return SlidingWriterBuffer(model=object(), config=config, tokenizer=object())
 
 
-def test_ready_values_force_commits_all_slots():
+def test_emission_limit_waits_for_right_guard():
     buffer = make_buffer()
-    buffer.pending_ages = [0, 0]
-    ready = torch.tensor([False, False])
+    latent = torch.zeros(1, 4)
+    buffer.append(latent, None, False)
+    buffer.append(latent, None, False)
 
-    assert buffer._ready_values(ready, commit_limit=2, force=True) == [True, True]
+    assert buffer._emission_limit(force=False) == 0
 
 
-def test_ready_values_commits_stale_oldest_slot():
+def test_emission_limit_releases_active_prefix_when_guard_exists():
     buffer = make_buffer()
-    buffer.pending_ages = [3, 0]
-    ready = torch.tensor([False, False])
+    latent = torch.zeros(1, 4)
+    for _ in range(3):
+        buffer.append(latent, None, False)
 
-    assert buffer._ready_values(ready, commit_limit=2, force=False) == [True, False]
+    assert buffer._emission_limit(force=False) == 2
+    assert buffer._emission_limit(force=True) == 2

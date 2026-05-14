@@ -37,7 +37,7 @@ from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 24
+CHECKPOINT_FORMAT_VERSION = 26
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -462,6 +462,7 @@ class DilBaseTrainer(BaseTrainer):
         self.model.set_compiled_forwards(
             encoder_forward=compile_forward(self.model.encoder.forward, self.compile_mode, "DilEncoderCore"),
             writer_forward=compile_forward(self.model.writer.forward, self.compile_mode, "DilConditionalWriter"),
+            transition_forward=compile_forward(self.model.writer.transition, self.compile_mode, "DilConditionalWriterTransition"),
         )
         self.train_iterator = None
         self.eval_loader = None

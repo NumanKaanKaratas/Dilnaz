@@ -6,7 +6,7 @@ import torch
 
 from dilnaz.tokenization import TokenSegment
 
-from .buckets import bucketize_lengths, choose_bucket_size
+from .buckets import choose_bucket_size
 from .types import PackedSurface, PackedWriterTarget
 
 
@@ -115,17 +115,17 @@ def pack_context_segments(
 
 
 def writer_query_from_lengths(
-    bucket_lengths: torch.LongTensor,
+    unit_lengths: torch.LongTensor,
     *,
     pad_token_id: int,
     surface_bucket_sizes: Sequence[int],
 ) -> PackedSurface:
-    if bucket_lengths.dim() != 2:
-        raise ValueError("bucket_lengths must be shaped [batch, units]")
-    batch_size, unit_count = bucket_lengths.shape
-    required_width = int(bucket_lengths.sum(dim=1).max().detach().cpu())
+    if unit_lengths.dim() != 2:
+        raise ValueError("unit_lengths must be shaped [batch, units]")
+    batch_size, unit_count = unit_lengths.shape
+    required_width = int(unit_lengths.sum(dim=1).max().detach().cpu())
     width = choose_bucket_size(max(required_width, 1), tuple(surface_bucket_sizes))
-    device = bucket_lengths.device
+    device = unit_lengths.device
     ids = torch.full((batch_size, width), pad_token_id, dtype=torch.long, device=device)
     mask = torch.zeros((batch_size, width), dtype=torch.bool, device=device)
     unit_ids = torch.zeros((batch_size, width), dtype=torch.long, device=device)
@@ -134,7 +134,7 @@ def writer_query_from_lengths(
     for row_idx in range(batch_size):
         cursor = 0
         for unit_idx in range(unit_count):
-            length = int(bucket_lengths[row_idx, unit_idx].detach().cpu())
+            length = int(unit_lengths[row_idx, unit_idx].detach().cpu())
             offsets[row_idx, unit_idx] = cursor
             if length:
                 end = cursor + length
@@ -148,9 +148,9 @@ def writer_query_from_lengths(
         mask=mask,
         unit_ids=unit_ids,
         pos_in_unit=pos_in_unit,
-        unit_lengths=bucket_lengths.long(),
+        unit_lengths=unit_lengths.long(),
         unit_offsets=offsets,
-        unit_mask=bucket_lengths.gt(0),
+        unit_mask=unit_lengths.gt(0),
     )
 
 
@@ -159,7 +159,8 @@ def pack_writer_targets(
     *,
     pad_token_id: int,
     stop_token_id: int,
-    writer_output_buckets: Sequence[int],
+    bos_token_id: int,
+    empty_token_id: int,
     surface_bucket_sizes: Sequence[int],
     max_pieces_per_unit: int,
     device: torch.device | None = None,
@@ -172,16 +173,14 @@ def pack_writer_targets(
     for row_idx, row in enumerate(rows):
         for unit_idx, ids in enumerate(row):
             _validate_unit(ids, max_pieces_per_unit)
-            true_lengths[row_idx, unit_idx] = len(ids) + 1
-    bucket_targets = bucketize_lengths(true_lengths.clamp_min(1), tuple(writer_output_buckets))
-    bucket_values = torch.tensor(tuple(writer_output_buckets), dtype=torch.long)
-    bucket_lengths = bucket_values[bucket_targets]
-    bucket_lengths = torch.where(true_lengths.gt(0), bucket_lengths, torch.zeros_like(bucket_lengths))
+            if ids:
+                true_lengths[row_idx, unit_idx] = len(ids) + 1
     query = writer_query_from_lengths(
-        bucket_lengths,
+        true_lengths,
         pad_token_id=pad_token_id,
         surface_bucket_sizes=surface_bucket_sizes,
     )
+    query_ids = torch.full_like(query.ids, empty_token_id)
     labels = torch.full_like(query.ids, -100)
     label_mask = torch.zeros_like(query.mask)
     for row_idx, row in enumerate(rows):
@@ -189,15 +188,26 @@ def pack_writer_targets(
             start = int(query.unit_offsets[row_idx, unit_idx])
             if not ids:
                 continue
+            query_ids[row_idx, start] = int(bos_token_id)
+            end_input = start + 1 + len(ids)
+            query_ids[row_idx, start + 1 : end_input] = torch.tensor(ids, dtype=torch.long)
             ids_with_stop = list(ids) + [stop_token_id]
             end = start + len(ids_with_stop)
             labels[row_idx, start:end] = torch.tensor(ids_with_stop, dtype=torch.long)
             label_mask[row_idx, start:end] = True
+    query = PackedSurface(
+        ids=query_ids,
+        mask=query.mask,
+        unit_ids=query.unit_ids,
+        pos_in_unit=query.pos_in_unit,
+        unit_lengths=query.unit_lengths,
+        unit_offsets=query.unit_offsets,
+        unit_mask=query.unit_mask,
+    )
     target = PackedWriterTarget(
         query=query,
         labels=labels,
         label_mask=label_mask,
-        length_bucket_targets=bucket_targets,
         true_lengths=true_lengths,
     )
     return target if device is None else target.to(device)

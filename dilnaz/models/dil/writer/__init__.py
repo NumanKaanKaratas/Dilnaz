@@ -1,4 +1,4 @@
 from .model import DilConditionalWriter
-from .outputs import DilWriterOutput
+from .outputs import DilWriterGeneration, DilWriterOutput
 
-__all__ = ["DilConditionalWriter", "DilWriterOutput"]
+__all__ = ["DilConditionalWriter", "DilWriterGeneration", "DilWriterOutput"]

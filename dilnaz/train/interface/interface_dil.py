@@ -14,7 +14,7 @@ from dilnaz.surface import pack_context_segments
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 24
+CHECKPOINT_FORMAT_VERSION = 26
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -137,10 +137,10 @@ def encode_tokens(model: Dil, surface):
 
 @torch.no_grad()
 def decode_tokens(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor) -> list[str]:
-    token_ids, _, _ = model.decode_semantic(latents)
+    generation = model.decode_semantic(latents)
     return [
         tokenizer.decode([int(token_id) for token_id in row.tolist()])
-        for row in token_ids
+        for row in generation.token_ids
     ]
 
 

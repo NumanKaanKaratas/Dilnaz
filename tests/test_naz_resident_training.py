@@ -34,13 +34,11 @@ def test_resident_source_uses_dil_surface_config(monkeypatch, tmp_path: Path):
         latent_size=16,
         num_encoder_layers=1,
         max_surface_pieces_per_unit=16,
-        surface_bucket_sizes=(8, 16),
+        surface_bucket_sizes=(8, 32),
         context_radius=1,
         writer_num_layers=1,
         writer_word_mixer_layers=1,
         writer_word_attention_heads=4,
-        writer_output_buckets=(2, 4, 8, 16),
-        writer_initial_output_bucket=8,
     )
     naz_config = NazConfig(latent_size=dil_config.latent_size, mtp_horizons=2)
     seen = {}

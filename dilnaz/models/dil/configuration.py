@@ -29,8 +29,6 @@ class DilConfig(PretrainedConfig):
         writer_conv_kernel_size=5,
         writer_conv_expansion=4,
         writer_dropout=0.1,
-        writer_output_buckets=(2, 4, 8, 16, 32, 64, 128, 256),
-        writer_initial_output_bucket=8,
         writer_max_window_size=32,
         writer_word_mixer_layers=2,
         writer_word_attention_heads=8,
@@ -41,9 +39,6 @@ class DilConfig(PretrainedConfig):
         writer_stride=20,
         writer_right_guard_loss_weight=0.2,
         writer_left_consistency_weight=0.5,
-        writer_commit_loss_weight=0.25,
-        writer_self_conditioning_start=0.2,
-        writer_self_conditioning_final=0.6,
         writer_noise_warmup_steps=1000,
         writer_noise_clean_ratio=0.10,
         writer_noise_easy_ratio=0.70,
@@ -55,18 +50,9 @@ class DilConfig(PretrainedConfig):
         writer_noise_mid_max_cos=0.985,
         writer_noise_hard_min_cos=0.950,
         writer_noise_hard_max_cos=0.970,
-        writer_refinement_steps=1,
-        writer_use_step_embedding=True,
         writer_max_position_age=32,
         writer_use_zone_noise=True,
         writer_gradient_checkpointing=False,
-        writer_commit_temperature=1.0,
-        writer_commit_threshold=0.5,
-        writer_commit_min_precision=0.98,
-        writer_diffusion_steps=4,
-        writer_diffusion_min_mask_ratio=0.05,
-        writer_diffusion_max_mask_ratio=0.95,
-        writer_state_corruption_max_ratio=0.35,
         writer_future_noise_min_cos=0.970,
         writer_future_noise_max_cos=0.995,
         writer_future_noised_start_step=2000,
@@ -81,11 +67,30 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=24,
+        checkpoint_format_version=26,
         **kwargs,
     ):
         if "context_left_radius" in kwargs:
             raise ValueError("context_left_radius is not supported; use context_radius")
+        legacy_writer_keys = {
+            "writer_output_buckets",
+            "writer_initial_output_bucket",
+            "writer_commit_loss_weight",
+            "writer_self_conditioning_start",
+            "writer_self_conditioning_final",
+            "writer_refinement_steps",
+            "writer_use_step_embedding",
+            "writer_commit_temperature",
+            "writer_commit_threshold",
+            "writer_commit_min_precision",
+            "writer_diffusion_steps",
+            "writer_diffusion_min_mask_ratio",
+            "writer_diffusion_max_mask_ratio",
+            "writer_state_corruption_max_ratio",
+        }
+        unsupported = legacy_writer_keys.intersection(kwargs)
+        if unsupported:
+            raise ValueError(f"legacy writer config fields are not supported: {sorted(unsupported)}")
         kwargs.pop("context_size", None)
         kwargs.pop("target_index", None)
         if ("max_" + "word_bytes") in kwargs or ("writer_max_" + "positions") in kwargs:
@@ -99,17 +104,8 @@ class DilConfig(PretrainedConfig):
             raise ValueError("surface_bucket_sizes must be a non-empty positive tuple")
         if tuple(sorted(self.surface_bucket_sizes)) != self.surface_bucket_sizes:
             raise ValueError("surface_bucket_sizes must be sorted ascending")
-        if self.surface_bucket_sizes[-1] < max_surface_pieces_per_unit:
-            raise ValueError("largest surface_bucket_sizes entry must cover max_surface_pieces_per_unit")
-        self.writer_output_buckets = tuple(int(bucket) for bucket in writer_output_buckets)
-        if not self.writer_output_buckets or self.writer_output_buckets[0] < 2:
-            raise ValueError("writer_output_buckets must start at >= 2 to include STOP")
-        if tuple(sorted(self.writer_output_buckets)) != self.writer_output_buckets:
-            raise ValueError("writer_output_buckets must be sorted ascending")
-        if self.writer_output_buckets[-1] > max_surface_pieces_per_unit + 1:
-            raise ValueError("writer output buckets cannot exceed max_surface_pieces_per_unit + STOP")
-        if writer_initial_output_bucket not in self.writer_output_buckets:
-            raise ValueError("writer_initial_output_bucket must be one of writer_output_buckets")
+        if self.surface_bucket_sizes[-1] < max_surface_pieces_per_unit + 1:
+            raise ValueError("largest surface_bucket_sizes entry must cover max_surface_pieces_per_unit + STOP")
         if byte_conv_layers < 0 or writer_num_layers < 0:
             raise ValueError("conv layer counts must be >= 0")
         if byte_conv_kernel_size <= 0 or byte_conv_kernel_size % 2 == 0:
@@ -138,12 +134,6 @@ class DilConfig(PretrainedConfig):
             raise ValueError("writer_right_guard_loss_weight must be >= 0")
         if writer_left_consistency_weight < 0.0:
             raise ValueError("writer_left_consistency_weight must be >= 0")
-        if writer_commit_loss_weight < 0.0:
-            raise ValueError("writer_commit_loss_weight must be >= 0")
-        if not (0.0 <= writer_self_conditioning_start <= 1.0):
-            raise ValueError("writer_self_conditioning_start must be in [0, 1]")
-        if not (0.0 <= writer_self_conditioning_final <= 1.0):
-            raise ValueError("writer_self_conditioning_final must be in [0, 1]")
         writer_noise_ratios = (
             writer_noise_clean_ratio,
             writer_noise_easy_ratio,
@@ -163,22 +153,8 @@ class DilConfig(PretrainedConfig):
         )
         if any(min_cos <= 0.0 or max_cos > 1.0 or min_cos > max_cos for min_cos, max_cos in cosine_ranges):
             raise ValueError("writer noise cosine ranges must satisfy 0 < min <= max <= 1")
-        if writer_refinement_steps <= 0:
-            raise ValueError("writer_refinement_steps must be > 0")
         if writer_max_position_age <= 0:
             raise ValueError("writer_max_position_age must be > 0")
-        if writer_commit_temperature <= 0.0:
-            raise ValueError("writer_commit_temperature must be > 0")
-        if not (0.0 <= writer_commit_threshold <= 1.0):
-            raise ValueError("writer_commit_threshold must be in [0, 1]")
-        if not (0.0 < writer_commit_min_precision <= 1.0):
-            raise ValueError("writer_commit_min_precision must be in (0, 1]")
-        if writer_diffusion_steps <= 0:
-            raise ValueError("writer_diffusion_steps must be > 0")
-        if not (0.0 <= writer_diffusion_min_mask_ratio <= writer_diffusion_max_mask_ratio <= 1.0):
-            raise ValueError("writer diffusion mask ratio bounds must satisfy 0 <= min <= max <= 1")
-        if not (0.0 <= writer_state_corruption_max_ratio <= 1.0):
-            raise ValueError("writer_state_corruption_max_ratio must be in [0, 1]")
         if writer_future_noise_min_cos <= 0.0 or writer_future_noise_max_cos > 1.0 or writer_future_noise_min_cos > writer_future_noise_max_cos:
             raise ValueError("writer future noise cosine range must satisfy 0 < min <= max <= 1")
         if writer_future_noised_start_step < 0 or writer_future_predicted_start_step < 0 or writer_future_mixed_start_step < 0:
@@ -215,9 +191,9 @@ class DilConfig(PretrainedConfig):
         self.writer_dropout = writer_dropout
         self.writer_vocab_size = vocab_size + 1
         self.writer_stop_token_id = vocab_size
-        self.writer_state_vocab_size = self.writer_vocab_size + 1
-        self.writer_empty_token_id = self.writer_vocab_size
-        self.writer_initial_output_bucket = int(writer_initial_output_bucket)
+        self.writer_bos_token_id = self.writer_vocab_size
+        self.writer_empty_token_id = self.writer_vocab_size + 1
+        self.writer_input_vocab_size = self.writer_vocab_size + 2
         self.writer_max_window_size = writer_max_window_size
         self.writer_word_mixer_layers = writer_word_mixer_layers
         self.writer_word_attention_heads = writer_word_attention_heads
@@ -228,9 +204,6 @@ class DilConfig(PretrainedConfig):
         self.writer_stride = writer_stride
         self.writer_right_guard_loss_weight = writer_right_guard_loss_weight
         self.writer_left_consistency_weight = writer_left_consistency_weight
-        self.writer_commit_loss_weight = writer_commit_loss_weight
-        self.writer_self_conditioning_start = writer_self_conditioning_start
-        self.writer_self_conditioning_final = writer_self_conditioning_final
         self.writer_noise_warmup_steps = writer_noise_warmup_steps
         self.writer_noise_clean_ratio = writer_noise_clean_ratio
         self.writer_noise_easy_ratio = writer_noise_easy_ratio
@@ -242,18 +215,9 @@ class DilConfig(PretrainedConfig):
         self.writer_noise_mid_max_cos = writer_noise_mid_max_cos
         self.writer_noise_hard_min_cos = writer_noise_hard_min_cos
         self.writer_noise_hard_max_cos = writer_noise_hard_max_cos
-        self.writer_refinement_steps = writer_refinement_steps
-        self.writer_use_step_embedding = bool(writer_use_step_embedding)
         self.writer_max_position_age = writer_max_position_age
         self.writer_use_zone_noise = bool(writer_use_zone_noise)
         self.writer_gradient_checkpointing = bool(writer_gradient_checkpointing)
-        self.writer_commit_temperature = writer_commit_temperature
-        self.writer_commit_threshold = writer_commit_threshold
-        self.writer_commit_min_precision = writer_commit_min_precision
-        self.writer_diffusion_steps = writer_diffusion_steps
-        self.writer_diffusion_min_mask_ratio = writer_diffusion_min_mask_ratio
-        self.writer_diffusion_max_mask_ratio = writer_diffusion_max_mask_ratio
-        self.writer_state_corruption_max_ratio = writer_state_corruption_max_ratio
         self.writer_future_noise_min_cos = writer_future_noise_min_cos
         self.writer_future_noise_max_cos = writer_future_noise_max_cos
         self.writer_future_noised_start_step = writer_future_noised_start_step

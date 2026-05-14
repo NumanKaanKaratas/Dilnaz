@@ -26,7 +26,7 @@ flowchart LR
     C --> D[(Normalized semantic latent)]
     D --> E[NAZ semantic backbone<br/>semantic dynamics model]
     E --> F[(Next normalized semantic latent)]
-    F --> G[DIL parallel writer<br/>latent to surface pieces]
+    F --> G[DIL causal writer<br/>latent to surface pieces + STOP]
     G --> H[Surface text]
     T[NLLB encoder<br/>multilingual geometry] -. grouped geometry .-> C
     T -. mean geometry .-> D
@@ -61,7 +61,7 @@ The current `DIL` model does not expose a learned post-fit semantic normalizer o
 `DIL` has two coupled but separable jobs:
 
 - encoder: surface/context -> normalized semantic latent
-- writer: semantic latent -> parallel surface-piece logits with an explicit stop token
+- writer: semantic latent -> causal hybrid surface-piece generation until STOP
 
 Main training losses and metrics:
 
@@ -73,6 +73,15 @@ Main training losses and metrics:
 
 The writer path is deliberately fed with detached semantic latents during normal DIL training. That keeps surface-writing gradients from changing the semantic encoder path.
 
+The writer does not emit raw UTF-8 bytes; it emits the tokenizer's existing hybrid surface piece ids. Training uses teacher forcing in one forward pass:
+
+```text
+decoder input = [BOS, piece_0, piece_1, ...]
+label         = [piece_0, piece_1, ..., STOP]
+```
+
+`writer_stop_token_id` is part of the output vocabulary. `writer_bos_token_id` and `writer_empty_token_id` are input-only decoder tokens and are never emitted. Length is not predicted by a learned bucket/head; inference runs until STOP or the `max_surface_pieces_per_unit` safety limit. `surface_bucket_sizes` is only used for packed tensor memory layout.
+
 ## DIL Writer-Only Training
 
 `python -m dilnaz.train.writer.train` loads an existing DIL checkpoint, freezes the encoder, and trains only the writer on plain text. This is used when surface rendering needs improvement without changing the semantic trunk.
@@ -80,14 +89,14 @@ The writer path is deliberately fed with detached semantic latents during normal
 The objective is:
 
 ```text
-objective = plain_text_writer_only
+objective = causal_surface_writer_v1
 loss = writer token cross entropy
 ```
 
 This path uses the same checkpoint family as DIL:
 
 ```text
-DIL checkpoint format_version = 21
+DIL checkpoint format_version = 26
 ```
 
 ## NAZ
@@ -299,17 +308,17 @@ python -m dilnaz.train.interface.interface_naz `
   --compile-mode off
 ```
 
-The NAZ interface streams generated surface text by batching pending semantic latents through the DIL writer. It stops when the writer returns an empty/stop output or when semantic repetition crosses the configured threshold after `min_new_tokens`.
+The NAZ interface streams generated surface text by batching pending semantic latents through the DIL writer. It stops when the writer emits STOP or when semantic repetition crosses the configured threshold after `min_new_tokens`.
 
 ## Checkpoint Contracts
 
 Current checkpoint families:
 
 ```text
-DIL format_version = 21
-NAZ format_version = 25
+DIL format_version = 26
+NAZ format_version = 26
 NAZ objective = semantic_dynamics_moe_mtp_v1
-DIL writer-only objective = plain_text_writer_only
+DIL writer-only objective = causal_surface_writer_v1
 semantic_space = dil_normalized_latent
 ```
 

@@ -37,8 +37,6 @@ def tiny_config(tokenizer: HybridTokenizer) -> DilConfig:
         writer_num_layers=1,
         writer_word_mixer_layers=1,
         writer_word_attention_heads=4,
-        writer_output_buckets=(2, 4, 8, 16),
-        writer_initial_output_bucket=8,
     )
 
 

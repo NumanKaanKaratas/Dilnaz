@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from ...common.norms import DilRMSNorm
-from ..layers import DilPackedDepthwiseConv
 
 
 class DilAdaLNModulation(nn.Module):
@@ -22,12 +21,35 @@ class DilAdaLNModulation(nn.Module):
         return hidden_states * (1.0 + scale) + shift, gate
 
 
-class DilAdaLNConvSwiGLUBlock(nn.Module):
+class DilPackedCausalDepthwiseConv(nn.Module):
+    def __init__(self, hidden_size: int, kernel_size: int, bias: bool):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.weight = nn.Parameter(torch.empty(hidden_size, self.kernel_size))
+        self.bias = nn.Parameter(torch.empty(hidden_size)) if bias else None
+
+    def forward(self, hidden_states: torch.Tensor, unit_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        batch_size, surface_width, hidden_size = hidden_states.shape
+        positions = torch.arange(surface_width, device=hidden_states.device)
+        output = hidden_states.new_zeros(hidden_states.shape)
+        for kernel_idx, offset in enumerate(range(1 - self.kernel_size, 1)):
+            source_positions = (positions + offset).clamp(0, surface_width - 1)
+            in_bounds = (positions + offset).ge(0) & (positions + offset).lt(surface_width)
+            source = hidden_states.index_select(1, source_positions)
+            source_mask = mask.index_select(1, source_positions)
+            same_unit = unit_ids.eq(unit_ids.index_select(1, source_positions)) & in_bounds.view(1, -1) & mask & source_mask
+            output = output + source * same_unit.unsqueeze(-1).to(hidden_states.dtype) * self.weight[:, kernel_idx].view(1, 1, hidden_size)
+        if self.bias is not None:
+            output = output + self.bias.view(1, 1, hidden_size)
+        return output * mask.unsqueeze(-1).to(output.dtype)
+
+
+class DilCausalAdaLNConvSwiGLUBlock(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, kernel_size: int, eps: float, bias: bool, dropout: float = 0.0):
         super().__init__()
         self.norm = DilRMSNorm(hidden_size, eps=eps)
         self.adaln = DilAdaLNModulation(hidden_size)
-        self.depthwise = DilPackedDepthwiseConv(hidden_size, kernel_size, bias)
+        self.depthwise = DilPackedCausalDepthwiseConv(hidden_size, kernel_size, bias)
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
@@ -42,63 +64,14 @@ class DilAdaLNConvSwiGLUBlock(nn.Module):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states, residual_gate = self.adaln(self.norm(hidden_states), condition)
-        if mask is not None:
-            hidden_states = hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
-        else:
+        if mask is None:
             mask = torch.ones(hidden_states.shape[:2], dtype=torch.bool, device=hidden_states.device)
+        hidden_states = hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
         hidden_states = self.depthwise(hidden_states, unit_ids, mask)
         hidden_states = F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
         hidden_states = self.down_proj(hidden_states)
         hidden_states = residual + self.dropout(hidden_states) * residual_gate
-        if mask is not None:
-            hidden_states = hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
-        return hidden_states
-
-
-class DilByteStateCrossAttention(nn.Module):
-    def __init__(self, hidden_size: int, heads: int, eps: float, dropout: float):
-        super().__init__()
-        if hidden_size % heads != 0:
-            raise ValueError("hidden_size must be divisible by heads")
-        self.heads = heads
-        self.head_dim = hidden_size // heads
-        self.query_norm = DilRMSNorm(hidden_size, eps=eps)
-        self.state_norm = DilRMSNorm(hidden_size, eps=eps)
-        self.adaln = DilAdaLNModulation(hidden_size)
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        condition: torch.Tensor,
-        state_hidden: torch.Tensor,
-        state_mask: torch.Tensor,
-        query_unit_ids: torch.Tensor,
-        state_unit_ids: torch.Tensor,
-        byte_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        query, residual_gate = self.adaln(self.query_norm(hidden_states), condition)
-        batch_size, query_width, hidden_size = query.shape
-        state_width = state_hidden.shape[1]
-        query = self.q_proj(query).reshape(batch_size, query_width, self.heads, self.head_dim)
-        keys = self.k_proj(self.state_norm(state_hidden)).reshape(batch_size, state_width, self.heads, self.head_dim)
-        values = self.v_proj(state_hidden).reshape(batch_size, state_width, self.heads, self.head_dim)
-        scores = torch.einsum("bqhd,bshd->bhqs", query, keys) / (self.head_dim**0.5)
-        same_unit = query_unit_ids.unsqueeze(1).unsqueeze(-1).eq(state_unit_ids.unsqueeze(1).unsqueeze(2))
-        valid = same_unit & state_mask.unsqueeze(1).unsqueeze(2) & byte_mask.unsqueeze(1).unsqueeze(-1)
-        has_state = valid.any(dim=-1, keepdim=True)
-        safe_valid = torch.where(has_state, valid, torch.ones_like(valid))
-        scores = scores.masked_fill(~safe_valid, torch.finfo(scores.dtype).min)
-        attention = torch.softmax(scores.float(), dim=-1).to(scores.dtype).masked_fill(~safe_valid, 0.0)
-        attention = attention * has_state.to(attention.dtype)
-        attn_output = torch.einsum("bhqs,bshd->bqhd", attention, values).reshape(batch_size, query_width, hidden_size)
-        attn_output = self.out_proj(attn_output) * byte_mask.unsqueeze(-1).to(attn_output.dtype)
-        hidden_states = hidden_states + self.dropout(attn_output) * residual_gate
-        return hidden_states * byte_mask.unsqueeze(-1).to(hidden_states.dtype)
+        return hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
 
 
 class DilWriterWordMixerBlock(nn.Module):

@@ -103,9 +103,10 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
         self.context_size = config.context_size
         self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
-        self.writer_output_buckets = tuple(config.writer_output_buckets)
         self.pad_token_id = config.pad_token_id
         self.writer_stop_token_id = config.writer_stop_token_id
+        self.writer_bos_token_id = config.writer_bos_token_id
+        self.writer_empty_token_id = config.writer_empty_token_id
         self.batch_size = batch_size
         self.max_segments = max_segments
         self.min_segments = min_segments
@@ -166,7 +167,8 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
                 target_rows,
                 pad_token_id=self.pad_token_id,
                 stop_token_id=self.writer_stop_token_id,
-                writer_output_buckets=self.writer_output_buckets,
+                bos_token_id=self.writer_bos_token_id,
+                empty_token_id=self.writer_empty_token_id,
                 surface_bucket_sizes=self.surface_bucket_sizes,
                 max_pieces_per_unit=self.max_surface_pieces_per_unit,
             ),

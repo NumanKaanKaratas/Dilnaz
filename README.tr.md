@@ -26,7 +26,7 @@ flowchart LR
     C --> D[(Normalize semantic latent)]
     D --> E[NAZ semantic backbone<br/>semantic dynamics modeli]
     E --> F[(Sonraki normalize semantic latent)]
-    F --> G[DIL parallel writer<br/>latent -> surface pieces]
+    F --> G[DIL causal writer<br/>latent -> surface pieces + STOP]
     G --> H[Surface text]
     T[NLLB encoder<br/>cok dilli geometri] -. grouped geometry .-> C
     T -. mean geometry .-> D
@@ -61,7 +61,7 @@ Güncel `DIL` modeli learned post-fit semantic normalizer veya `mean/log_std` VA
 `DIL` iki işi birbirinden ayırarak yapar:
 
 - encoder: surface/context -> normalize semantic latent
-- writer: semantic latent -> explicit stop token içeren parallel surface-piece logits
+- writer: semantic latent -> STOP'a kadar causal hybrid surface-piece üretimi
 
 Ana loss ve metricler:
 
@@ -73,6 +73,15 @@ Ana loss ve metricler:
 
 Normal DIL eğitiminde writer detached semantic latent ile beslenir. Bu sayede yüzey yazma gradientleri semantic encoder trunk'ını bozmaz.
 
+Writer raw UTF-8 byte üretmez; tokenizer'ın mevcut hybrid surface parça ID'lerini üretir. Eğitim kontratı teacher forcing ile tek forward'dır:
+
+```text
+decoder input = [BOS, piece_0, piece_1, ...]
+label         = [piece_0, piece_1, ..., STOP]
+```
+
+`writer_stop_token_id` output vocab içindedir. `writer_bos_token_id` ve `writer_empty_token_id` sadece decoder input tarafında kullanılır, output olarak üretilmez. Uzunluk learned bucket/head ile tahmin edilmez; inference STOP gelene kadar veya `max_surface_pieces_per_unit` güvenlik limitine kadar ilerler. `surface_bucket_sizes` yalnızca packed tensor memory layout seçimi için kullanılır.
+
 ## DIL Writer-Only Eğitimi
 
 `python -m dilnaz.train.writer.train` mevcut DIL checkpointini yükler, encoder'ı freeze eder ve yalnızca writer'ı plain text üzerinde eğitir. Amaç surface rendering kalitesini artırırken semantic trunk'ı değiştirmemektir.
@@ -80,14 +89,14 @@ Normal DIL eğitiminde writer detached semantic latent ile beslenir. Bu sayede y
 Objective:
 
 ```text
-objective = plain_text_writer_only
+objective = causal_surface_writer_v1
 loss = writer token cross entropy
 ```
 
 Bu yol aynı DIL checkpoint ailesini kullanır:
 
 ```text
-DIL checkpoint format_version = 21
+DIL checkpoint format_version = 26
 ```
 
 ## NAZ
@@ -299,17 +308,17 @@ python -m dilnaz.train.interface.interface_naz `
   --compile-mode off
 ```
 
-NAZ interface'i pending semantic latentleri DIL writer'dan batch halinde geçirerek generated surface text'i stream eder. Writer boş/stop output verdiğinde veya `min_new_tokens` sonrası semantic repetition threshold aşılırsa durur.
+NAZ interface'i pending semantic latentleri DIL writer'dan batch halinde geçirerek generated surface text'i stream eder. Writer STOP ürettiğinde veya `min_new_tokens` sonrası semantic repetition threshold aşılırsa durur.
 
 ## Checkpoint Kontratları
 
 Güncel checkpoint aileleri:
 
 ```text
-DIL format_version = 21
-NAZ format_version = 25
+DIL format_version = 26
+NAZ format_version = 26
 NAZ objective = semantic_dynamics_moe_mtp_v1
-DIL writer-only objective = plain_text_writer_only
+DIL writer-only objective = causal_surface_writer_v1
 semantic_space = dil_normalized_latent
 ```
 

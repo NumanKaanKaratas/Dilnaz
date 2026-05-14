@@ -33,8 +33,7 @@ from dilnaz.train.data.dil_data import (
     stream_teacher_text_items,
     trainable_segments,
 )
-from dilnaz.surface import PackedSurfaceState, pack_context_segments, pack_writer_targets, synthetic_state_from_targets, merge_frozen_state, empty_surface_state
-from dilnaz.surface.state import STATE_DRAFT, STATE_KNOWN
+from dilnaz.surface import pack_context_segments, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_TRAIN_DEFAULTS
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.naz import NazConfig
@@ -43,45 +42,25 @@ from dilnaz.models.naz import Naz
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 24
-WRITER_OBJECTIVE = "block_diffusion_writer_v1"
+CHECKPOINT_FORMAT_VERSION = 26
+WRITER_OBJECTIVE = "causal_surface_writer_v1"
 WRITER_METRIC_KEYS = (
     "loss",
     "token_loss",
-    "length_bucket_loss",
     "active_token_loss",
     "right_guard_token_loss",
     "left_consistency_loss",
-    "commit_loss",
-    "state_valid_loss",
-    "emit_loss",
     "byte_acc",
     "token_exact",
     "stop_acc",
     "right_guard_byte_acc",
     "right_guard_token_exact",
     "right_guard_stop_acc",
-    "commit_precision",
-    "commit_recall",
-    "commit_f1",
-    "false_commit_rate",
-    "mean_commit_score",
-    "step0_byte_acc",
-    "step0_token_exact",
-    "step0_stop_acc",
     "stepT_byte_acc",
     "stepT_token_exact",
     "stepT_stop_acc",
-    "self_conditioning_ratio",
-    "mean_mask_ratio",
     "future_horizons",
     "future_mode",
-    "diffusion_step",
-    "diffusion_mask_ratio",
-    "empty_ratio",
-    "draft_ratio",
-    "known_ratio",
-    "frozen_ratio",
 )
 
 
@@ -169,7 +148,8 @@ class HybridDilSlidingWindowDataset(IterableDataset):
                 target_rows,
                 pad_token_id=self.config.pad_token_id,
                 stop_token_id=self.config.writer_stop_token_id,
-                writer_output_buckets=self.config.writer_output_buckets,
+                bos_token_id=self.config.writer_bos_token_id,
+                empty_token_id=self.config.writer_empty_token_id,
                 surface_bucket_sizes=self.config.surface_bucket_sizes,
                 max_pieces_per_unit=self.config.max_surface_pieces_per_unit,
             ),
@@ -258,32 +238,6 @@ def freeze_for_writer_only(model: Dil):
     model.writer.train()
 
 
-def self_conditioning_probability(config: DilConfig, training_step: int | None) -> float:
-    if training_step is None:
-        return 0.0
-    start = float(config.writer_self_conditioning_start)
-    final = float(config.writer_self_conditioning_final)
-    if training_step <= 1000:
-        return start
-    if training_step >= 10000:
-        return final
-    ratio = (training_step - 1000) / 9000.0
-    return start + ratio * (final - start)
-
-
-def sample_diffusion_step(config: DilConfig, device: torch.device, training_step: int | None) -> tuple[int, float]:
-    if training_step is None:
-        step = max(config.writer_diffusion_steps - 1, 0)
-    else:
-        step = int(torch.randint(config.writer_diffusion_steps, (), device=device).detach().cpu())
-    denom = max(config.writer_diffusion_steps - 1, 1)
-    ratio = torch.cos(torch.tensor(step / denom * torch.pi / 2.0, device=device)).square()
-    mask_ratio = config.writer_diffusion_min_mask_ratio + (
-        config.writer_diffusion_max_mask_ratio - config.writer_diffusion_min_mask_ratio
-    ) * float(ratio.detach().cpu())
-    return step, mask_ratio
-
-
 def synthetic_position_age(config: DilConfig, target, zone_ids: torch.Tensor, window_mask: torch.Tensor) -> torch.Tensor:
     valid_words = target.true_lengths.to(window_mask.device).gt(0) & window_mask
     active = zone_ids.eq(1) & valid_words
@@ -293,43 +247,6 @@ def synthetic_position_age(config: DilConfig, target, zone_ids: torch.Tensor, wi
     age = torch.where(active, random_age, age)
     age = torch.where(left, torch.full_like(age, config.writer_max_position_age), age)
     return age
-
-
-@torch.no_grad()
-def self_conditioned_surface_state(
-    model: Dil,
-    semantic: torch.Tensor,
-    target,
-    zone_ids: torch.Tensor,
-    window_mask: torch.Tensor,
-    future_latents: torch.Tensor | None = None,
-) -> PackedSurfaceState:
-    output = model.writer_transition_outputs(
-        semantic,
-        query_surface=target.query,
-        zone_ids=zone_ids,
-        window_mask=window_mask,
-        future_latents=future_latents,
-    )
-    generated = output.token_logits.argmax(dim=-1)
-    zone_per_pos = zone_ids.gather(1, target.query.unit_ids.clamp_max(zone_ids.shape[1] - 1))
-    window_per_pos = window_mask.gather(1, target.query.unit_ids.clamp_max(window_mask.shape[1] - 1))
-    valid = target.label_mask & window_per_pos
-    left = zone_per_pos.eq(0) & valid
-    ids = torch.where(left, target.labels, generated)
-    state_kind = torch.where(left, torch.full_like(target.labels, STATE_KNOWN), torch.full_like(target.labels, STATE_DRAFT))
-    state_kind = torch.where(valid, state_kind, torch.zeros_like(state_kind))
-    return PackedSurfaceState(
-        ids=ids,
-        state_kind=state_kind,
-        frozen=left,
-        mask=valid,
-        unit_ids=target.query.unit_ids,
-        pos_in_unit=target.query.pos_in_unit,
-        unit_lengths=target.query.unit_lengths,
-        unit_offsets=target.query.unit_offsets,
-        unit_mask=target.query.unit_mask,
-    )
 
 
 def sliding_future_latents(semantic: torch.Tensor, window_mask: torch.Tensor, horizons: int) -> torch.Tensor | None:
@@ -433,7 +350,6 @@ def sliding_writer_metrics(
     batch: dict,
     training_step: int | None = None,
     use_future_latents: bool = True,
-    use_persistent_state: bool = True,
     future_predictor: Naz | None = None,
     future_latent_mode: str = "curriculum",
 ) -> dict[str, torch.Tensor]:
@@ -446,7 +362,6 @@ def sliding_writer_metrics(
         flat_semantic = model.encode(surface).float()
         semantic = flat_semantic.reshape(batch_size, window_size, -1)
 
-    diffusion_step, mask_ratio = sample_diffusion_step(model.config, surface.ids.device, training_step)
     true_future_latents = None
     if use_future_latents:
         true_future_latents = sliding_future_latents(
@@ -468,61 +383,19 @@ def sliding_writer_metrics(
         future_predictor,
         resolved_future_mode,
     )
-    probability = self_conditioning_probability(model.config, training_step)
-    self_conditioned = (
-        use_persistent_state
-        and model.training
-        and torch.rand((), device=surface.ids.device).item() < probability
-    )
-    if self_conditioned:
-        surface_state = self_conditioned_surface_state(
-            model,
-            semantic,
-            labels,
-            zone_ids,
-            window_mask,
-            future_latents=future_latents,
-        )
-    else:
-        surface_state = synthetic_state_from_targets(
-            labels,
-            zone_ids=zone_ids,
-            window_mask=window_mask,
-            empty_token_id=model.config.writer_empty_token_id,
-            vocab_size=model.config.writer_vocab_size,
-            mask_ratio=mask_ratio,
-            draft_max_ratio=model.config.writer_state_corruption_max_ratio,
-        )
-        if not use_persistent_state:
-            surface_state = empty_surface_state(labels.query, model.config.writer_empty_token_id)
     position_age = synthetic_position_age(model.config, labels, zone_ids, window_mask)
     metrics = model.writer_transition_loss_and_metrics(
         semantic.detach(),
         labels,
-        surface_state,
         zone_ids,
         window_mask,
         future_latents=future_latents,
         position_age=position_age,
-        training_refinement_step=diffusion_step,
         training_step=training_step,
         return_metrics=True,
     )
-    window_per_pos = window_mask.gather(1, labels.query.unit_ids.clamp_max(window_mask.shape[1] - 1))
-    valid = labels.label_mask & window_per_pos
-    filled = surface_state.state_kind.gt(0) & valid
-    state_present = filled & surface_state.mask
-    denom = valid.sum().clamp_min(1).to(metrics["loss"].dtype)
-    metrics["self_conditioning_ratio"] = metrics["loss"].new_tensor(float(self_conditioned))
-    metrics["mean_mask_ratio"] = 1.0 - filled.sum().to(metrics["loss"].dtype) / denom
     metrics["future_horizons"] = metrics["loss"].new_tensor(0.0 if future_latents is None else float(future_latents.shape[2]))
     metrics["future_mode"] = metrics["loss"].new_tensor(future_mode_id)
-    metrics["diffusion_step"] = metrics["loss"].new_tensor(float(diffusion_step))
-    metrics["diffusion_mask_ratio"] = metrics["loss"].new_tensor(float(mask_ratio))
-    metrics["empty_ratio"] = 1.0 - state_present.sum().to(metrics["loss"].dtype) / denom
-    metrics["draft_ratio"] = (state_present & surface_state.state_kind.eq(STATE_DRAFT)).sum().to(metrics["loss"].dtype) / denom
-    metrics["known_ratio"] = (state_present & surface_state.state_kind.eq(STATE_KNOWN)).sum().to(metrics["loss"].dtype) / denom
-    metrics["frozen_ratio"] = (state_present & surface_state.frozen).sum().to(metrics["loss"].dtype) / denom
     return metrics
 
 
@@ -531,7 +404,6 @@ def writer_only_metrics(
     batch: dict,
     training_step: int | None = None,
     use_future_latents: bool = True,
-    use_persistent_state: bool = True,
     future_predictor: Naz | None = None,
     future_latent_mode: str = "curriculum",
 ) -> dict[str, torch.Tensor]:
@@ -541,7 +413,6 @@ def writer_only_metrics(
             batch,
             training_step,
             use_future_latents=use_future_latents,
-            use_persistent_state=use_persistent_state,
             future_predictor=future_predictor,
             future_latent_mode=future_latent_mode,
         )
@@ -555,40 +426,20 @@ def writer_only_metrics(
     return {
         "loss": loss,
         "token_loss": token_loss,
-        "length_bucket_loss": loss - token_loss,
         "active_token_loss": token_loss,
         "right_guard_token_loss": zero,
         "left_consistency_loss": zero,
-        "commit_loss": zero,
-        "state_valid_loss": zero,
-        "emit_loss": zero,
         "byte_acc": byte_acc,
         "token_exact": token_exact,
         "stop_acc": stop_acc,
         "right_guard_byte_acc": zero,
         "right_guard_token_exact": zero,
         "right_guard_stop_acc": zero,
-        "commit_precision": zero,
-        "commit_recall": zero,
-        "commit_f1": zero,
-        "false_commit_rate": zero,
-        "mean_commit_score": zero,
-        "step0_byte_acc": byte_acc,
-        "step0_token_exact": token_exact,
-        "step0_stop_acc": stop_acc,
         "stepT_byte_acc": byte_acc,
         "stepT_token_exact": token_exact,
         "stepT_stop_acc": stop_acc,
-        "self_conditioning_ratio": zero,
-        "mean_mask_ratio": zero,
         "future_horizons": zero,
         "future_mode": zero,
-        "diffusion_step": zero,
-        "diffusion_mask_ratio": zero,
-        "empty_ratio": zero,
-        "draft_ratio": zero,
-        "known_ratio": zero,
-        "frozen_ratio": zero,
     }
 
 
@@ -654,17 +505,8 @@ def save_checkpoint(
         "writer_active_size": config.writer_active_size,
         "writer_right_guard": config.writer_right_guard,
         "writer_stride": config.writer_stride,
-        "writer_refinement_steps": config.writer_refinement_steps,
-        "writer_use_step_embedding": config.writer_use_step_embedding,
         "writer_use_zone_noise": config.writer_use_zone_noise,
         "writer_gradient_checkpointing": config.writer_gradient_checkpointing,
-        "writer_commit_temperature": config.writer_commit_temperature,
-        "writer_commit_threshold": config.writer_commit_threshold,
-        "writer_commit_min_precision": config.writer_commit_min_precision,
-        "writer_diffusion_steps": config.writer_diffusion_steps,
-        "writer_diffusion_min_mask_ratio": config.writer_diffusion_min_mask_ratio,
-        "writer_diffusion_max_mask_ratio": config.writer_diffusion_max_mask_ratio,
-        "writer_state_corruption_max_ratio": config.writer_state_corruption_max_ratio,
         "writer_future_noise_min_cos": config.writer_future_noise_min_cos,
         "writer_future_noise_max_cos": config.writer_future_noise_max_cos,
         "writer_future_noised_start_step": config.writer_future_noised_start_step,
@@ -699,54 +541,6 @@ def load_model_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[
     return model, config, checkpoint
 
 
-def calibrate_emit_logits(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    min_precision: float,
-) -> dict[str, float]:
-    if logits.numel() == 0:
-        return {
-            "temperature": 1.0,
-            "threshold": 0.5,
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-        }
-    logits = logits.float().cpu()
-    targets = targets.float().cpu()
-    temperatures = torch.tensor([0.50, 0.67, 0.80, 1.00, 1.25, 1.50, 2.00, 3.00], dtype=torch.float32)
-    bce = torch.stack([
-        torch.nn.functional.binary_cross_entropy_with_logits(logits / temperature, targets)
-        for temperature in temperatures
-    ])
-    temperature = float(temperatures[int(bce.argmin())])
-    scores = torch.sigmoid(logits / temperature)
-    thresholds = torch.linspace(0.05, 0.95, 91)
-    best = None
-    constrained = None
-    for threshold in thresholds:
-        pred = scores.ge(threshold)
-        positive = targets.bool()
-        tp = (pred & positive).sum().float()
-        predicted = pred.sum().float()
-        actual = positive.sum().float()
-        precision = tp / predicted.clamp_min(1.0)
-        recall = tp / actual.clamp_min(1.0)
-        f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-6)
-        entry = {
-            "threshold": float(threshold),
-            "precision": float(precision),
-            "recall": float(recall),
-            "f1": float(f1),
-        }
-        if best is None or entry["f1"] > best["f1"]:
-            best = entry
-        if entry["precision"] >= min_precision and (constrained is None or entry["recall"] > constrained["recall"]):
-            constrained = entry
-    selected = constrained if constrained is not None else best
-    return {"temperature": temperature, **selected}
-
-
 @torch.no_grad()
 def evaluate(
     model,
@@ -757,17 +551,13 @@ def evaluate(
     cuda_prefetch: bool,
     max_batches: int,
     use_future_latents: bool,
-    use_persistent_state: bool,
     future_predictor: Naz | None,
     future_latent_mode: str,
-    calibrate_emit: bool,
 ):
     model.eval()
     model.encoder.eval()
     total = {key: 0.0 for key in WRITER_METRIC_KEYS}
     total["batches"] = 0
-    calibration_logits = []
-    calibration_targets = []
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
         cudagraph_step_begin(device, compile_mode)
         with autocast_context(autocast_enabled):
@@ -775,39 +565,18 @@ def evaluate(
                 model,
                 batch,
                 use_future_latents=use_future_latents,
-                use_persistent_state=use_persistent_state,
                 future_predictor=future_predictor,
                 future_latent_mode=future_latent_mode,
             )
         for key in WRITER_METRIC_KEYS:
             total[key] += float(metrics[key].detach().cpu())
-        if calibrate_emit and "emit_calibration_logits" in metrics:
-            calibration_logits.append(metrics["emit_calibration_logits"].detach().cpu())
-            calibration_targets.append(metrics["emit_calibration_targets"].detach().cpu())
         total["batches"] += 1
         if batch_idx >= max_batches:
             break
     model.train()
     model.encoder.eval()
     batches = max(total.pop("batches"), 1)
-    reduced = {f"eval_{key}": value / batches for key, value in total.items()}
-    if calibrate_emit and calibration_logits:
-        calibration = calibrate_emit_logits(
-            torch.cat(calibration_logits),
-            torch.cat(calibration_targets),
-            model.config.writer_commit_min_precision,
-        )
-        model.config.writer_commit_temperature = calibration["temperature"]
-        model.config.writer_commit_threshold = calibration["threshold"]
-        sync_writer_runtime_config(model, model.config)
-        reduced.update({
-            "eval_calibrated_commit_temperature": calibration["temperature"],
-            "eval_calibrated_commit_threshold": calibration["threshold"],
-            "eval_calibrated_commit_precision": calibration["precision"],
-            "eval_calibrated_commit_recall": calibration["recall"],
-            "eval_calibrated_commit_f1": calibration["f1"],
-        })
-    return reduced
+    return {f"eval_{key}": value / batches for key, value in total.items()}
 
 
 def format_log(step: int, metrics: dict) -> str:
@@ -818,32 +587,14 @@ def format_log(step: int, metrics: dict) -> str:
         f"act={metrics['active_token_loss']:.4f}",
         f"guard={metrics['right_guard_token_loss']:.4f}",
         f"left={metrics['left_consistency_loss']:.4f}",
-        f"commit={metrics['commit_loss']:.4f}",
-        f"state={metrics['state_valid_loss']:.4f}",
-        f"emit={metrics['emit_loss']:.4f}",
         f"byte_acc={metrics['byte_acc']:.4f}",
         f"token_exact={metrics['token_exact']:.4f}",
         f"stop_acc={metrics['stop_acc']:.4f}",
         f"guard_acc={metrics['right_guard_byte_acc']:.4f}",
-        f"commit_p={metrics['commit_precision']:.4f}",
-        f"commit_r={metrics['commit_recall']:.4f}",
-        f"commit_f1={metrics['commit_f1']:.4f}",
-        f"false_commit={metrics['false_commit_rate']:.4f}",
-        f"commit_score={metrics['mean_commit_score']:.4f}",
-        f"step0_acc={metrics['step0_byte_acc']:.4f}",
         f"stepT_acc={metrics['stepT_byte_acc']:.4f}",
-        f"step0_exact={metrics['step0_token_exact']:.4f}",
         f"stepT_exact={metrics['stepT_token_exact']:.4f}",
-        f"self_cond={metrics['self_conditioning_ratio']:.4f}",
-        f"mask={metrics['mean_mask_ratio']:.4f}",
         f"future_h={metrics['future_horizons']:.1f}",
         f"future_mode={metrics['future_mode']:.0f}",
-        f"diff_step={metrics['diffusion_step']:.1f}",
-        f"diff_mask={metrics['diffusion_mask_ratio']:.3f}",
-        f"empty={metrics['empty_ratio']:.4f}",
-        f"draft={metrics['draft_ratio']:.4f}",
-        f"known={metrics['known_ratio']:.4f}",
-        f"frozen={metrics['frozen_ratio']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -893,13 +644,6 @@ def parse_args():
     parser.add_argument("--stride", type=int, default=20)
     parser.add_argument("--right-guard-loss-weight", type=float, default=0.2)
     parser.add_argument("--left-consistency-weight", type=float, default=0.5)
-    parser.add_argument("--commit-loss-weight", type=float, default=0.25)
-    parser.add_argument("--self-conditioning-start", type=float, default=0.2)
-    parser.add_argument("--self-conditioning-final", type=float, default=0.6)
-    parser.add_argument("--writer-refinement-steps", type=int, default=None)
-    parser.add_argument("--writer-commit-temperature", type=float, default=1.0)
-    parser.add_argument("--writer-commit-threshold", type=float, default=0.5)
-    parser.add_argument("--writer-commit-min-precision", type=float, default=0.98)
     parser.add_argument("--writer-gradient-checkpointing", action="store_true")
     parser.add_argument("--future-latent-mode", choices=("curriculum", "true", "noised", "predicted", "mixed"), default="curriculum")
     parser.add_argument("--future-naz-checkpoint", type=Path, default=None)
@@ -909,16 +653,8 @@ def parse_args():
     parser.add_argument("--future-mix-ratio", type=float, default=0.50)
     parser.add_argument("--future-noise-min-cos", type=float, default=0.970)
     parser.add_argument("--future-noise-max-cos", type=float, default=0.995)
-    parser.add_argument("--writer-diffusion-steps", type=int, default=4)
-    parser.add_argument("--writer-diffusion-min-mask-ratio", type=float, default=0.05)
-    parser.add_argument("--writer-diffusion-max-mask-ratio", type=float, default=0.95)
-    parser.add_argument("--writer-state-corruption-max-ratio", type=float, default=0.35)
-    parser.add_argument("--disable-commit-calibration", action="store_true")
-    parser.add_argument("--disable-refinement", action="store_true")
-    parser.add_argument("--disable-step-embedding", action="store_true")
     parser.add_argument("--disable-future-latents", action="store_true")
     parser.add_argument("--disable-zone-noise", action="store_true")
-    parser.add_argument("--disable-persistent-state", action="store_true")
     return parser.parse_args()
 
 
@@ -945,24 +681,8 @@ def validate_args(args):
         raise ValueError("--left-frozen + --active-size + --right-guard must equal --window-size")
     if args.stride <= 0 or args.stride > args.active_size:
         raise ValueError("--stride must be in 1..--active-size")
-    if min(args.right_guard_loss_weight, args.left_consistency_weight, args.commit_loss_weight) < 0.0:
+    if min(args.right_guard_loss_weight, args.left_consistency_weight) < 0.0:
         raise ValueError("writer loss weights must be >= 0")
-    if not (0.0 <= args.self_conditioning_start <= 1.0 and 0.0 <= args.self_conditioning_final <= 1.0):
-        raise ValueError("self-conditioning rates must be in [0, 1]")
-    if args.writer_refinement_steps is not None and args.writer_refinement_steps <= 0:
-        raise ValueError("--writer-refinement-steps must be > 0")
-    if args.writer_commit_temperature <= 0.0:
-        raise ValueError("--writer-commit-temperature must be > 0")
-    if not (0.0 <= args.writer_commit_threshold <= 1.0):
-        raise ValueError("--writer-commit-threshold must be in [0, 1]")
-    if not (0.0 < args.writer_commit_min_precision <= 1.0):
-        raise ValueError("--writer-commit-min-precision must be in (0, 1]")
-    if args.writer_diffusion_steps <= 0:
-        raise ValueError("--writer-diffusion-steps must be > 0")
-    if not (0.0 <= args.writer_diffusion_min_mask_ratio <= args.writer_diffusion_max_mask_ratio <= 1.0):
-        raise ValueError("--writer-diffusion-min-mask-ratio/--writer-diffusion-max-mask-ratio must satisfy 0 <= min <= max <= 1")
-    if not (0.0 <= args.writer_state_corruption_max_ratio <= 1.0):
-        raise ValueError("--writer-state-corruption-max-ratio must be in [0, 1]")
     if args.future_noised_start_step < 0 or args.future_predicted_start_step < 0 or args.future_mixed_start_step < 0:
         raise ValueError("future curriculum start steps must be >= 0")
     if args.future_predicted_start_step > args.future_mixed_start_step:
@@ -976,10 +696,7 @@ def validate_args(args):
 
 
 def sync_writer_runtime_config(model: Dil, config: DilConfig) -> None:
-    model.writer.writer_refinement_steps = config.writer_refinement_steps
-    model.writer.use_step_embedding = config.writer_use_step_embedding
     model.writer.gradient_checkpointing = config.writer_gradient_checkpointing
-    model.writer.commit_temperature = config.writer_commit_temperature
 
 
 def load_future_predictor(checkpoint_dir: Path | None, device: torch.device) -> Naz | None:
@@ -1020,22 +737,8 @@ def main():
     config.writer_stride = args.stride
     config.writer_right_guard_loss_weight = args.right_guard_loss_weight
     config.writer_left_consistency_weight = args.left_consistency_weight
-    config.writer_commit_loss_weight = args.commit_loss_weight
-    config.writer_self_conditioning_start = args.self_conditioning_start
-    config.writer_self_conditioning_final = args.self_conditioning_final
-    config.writer_refinement_steps = 1 if args.disable_refinement else (
-        config.writer_refinement_steps if args.writer_refinement_steps is None else args.writer_refinement_steps
-    )
-    config.writer_use_step_embedding = not args.disable_step_embedding
     config.writer_use_zone_noise = not args.disable_zone_noise
     config.writer_gradient_checkpointing = bool(args.writer_gradient_checkpointing)
-    config.writer_commit_temperature = args.writer_commit_temperature
-    config.writer_commit_threshold = args.writer_commit_threshold
-    config.writer_commit_min_precision = args.writer_commit_min_precision
-    config.writer_diffusion_steps = args.writer_diffusion_steps
-    config.writer_diffusion_min_mask_ratio = args.writer_diffusion_min_mask_ratio
-    config.writer_diffusion_max_mask_ratio = args.writer_diffusion_max_mask_ratio
-    config.writer_state_corruption_max_ratio = args.writer_state_corruption_max_ratio
     config.writer_future_noise_min_cos = args.future_noise_min_cos
     config.writer_future_noise_max_cos = args.future_noise_max_cos
     config.writer_future_noised_start_step = args.future_noised_start_step
@@ -1132,11 +835,8 @@ def main():
         f"data_mode={args.data_mode} objective={WRITER_OBJECTIVE} "
         f"vocab_size={config.vocab_size} latent_size={config.latent_size} hidden_size={config.hidden_size} "
         f"window={args.window_size} zones={args.left_frozen}|{args.active_size}|{args.right_guard} stride={args.stride} "
-        f"refine_steps={config.writer_refinement_steps} step_embed={int(config.writer_use_step_embedding)} "
         f"future_latents={int(not args.disable_future_latents)} zone_noise={int(config.writer_use_zone_noise)} "
-        f"persistent_state={int(not args.disable_persistent_state)} commit_temp={config.writer_commit_temperature:.3f} "
-        f"commit_threshold={config.writer_commit_threshold:.3f} future_mode={config.writer_future_latent_mode} "
-        f"future_predictor={int(future_predictor is not None)} diffusion_steps={config.writer_diffusion_steps}",
+        f"future_mode={config.writer_future_latent_mode} future_predictor={int(future_predictor is not None)}",
         flush=True,
     )
 
@@ -1180,7 +880,6 @@ def main():
                     batch,
                     step,
                     use_future_latents=not args.disable_future_latents,
-                    use_persistent_state=not args.disable_persistent_state,
                     future_predictor=future_predictor,
                     future_latent_mode=config.writer_future_latent_mode,
                 )
@@ -1226,10 +925,8 @@ def main():
                             cuda_prefetch,
                             args.max_eval_batches,
                             not args.disable_future_latents,
-                            not args.disable_persistent_state,
                             future_predictor,
                             config.writer_future_latent_mode,
-                            not args.disable_commit_calibration,
                         )
                     )
                 print(format_log(step, averaged), flush=True)
