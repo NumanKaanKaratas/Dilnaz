@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import torch
@@ -89,6 +90,23 @@ class DilWriterWordMixerBlock(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
         self.ffn_dropout = nn.Dropout(dropout)
 
+    def _math_attention(self, hidden_states: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        qkv = F.linear(hidden_states, self.attn.in_proj_weight, self.attn.in_proj_bias)
+        query, key, value = qkv.chunk(3, dim=-1)
+        head_count = self.attn.num_heads
+        head_dim = hidden_size // head_count
+        query = query.view(batch_size, seq_len, head_count, head_dim).transpose(1, 2)
+        key = key.view(batch_size, seq_len, head_count, head_dim).transpose(1, 2)
+        value = value.view(batch_size, seq_len, head_count, head_dim).transpose(1, 2)
+        scores = torch.matmul(query, key.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask[:, None, None, :], torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
+        weights = F.dropout(weights, p=self.attn.dropout, training=self.training)
+        output = torch.matmul(weights, value).transpose(1, 2).reshape(batch_size, seq_len, hidden_size)
+        return F.linear(output, self.attn.out_proj.weight, self.attn.out_proj.bias)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -108,13 +126,7 @@ class DilWriterWordMixerBlock(nn.Module):
 
         residual = hidden_states
         attn_input, attn_gate = self.attn_adaln(self.attn_norm(hidden_states), condition)
-        attn_output, _ = self.attn(
-            attn_input,
-            attn_input,
-            attn_input,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
+        attn_output = self._math_attention(attn_input, key_padding_mask)
         hidden_states = residual + self.attn_dropout(attn_output) * attn_gate
 
         residual = hidden_states
