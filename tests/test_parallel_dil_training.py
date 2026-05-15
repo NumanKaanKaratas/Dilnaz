@@ -40,8 +40,6 @@ def tiny_config(tokenizer: HybridTokenizer) -> DilConfig:
         encoder_intermediate_size=64,
         encoder_attention_window=4,
         writer_num_layers=1,
-        writer_word_mixer_layers=1,
-        writer_word_attention_heads=4,
     )
 
 

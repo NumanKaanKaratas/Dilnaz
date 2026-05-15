@@ -141,9 +141,8 @@ def pack_writer_targets(
     rows: Sequence[Sequence[Sequence[int]]],
     *,
     pad_token_id: int,
-    stop_token_id: int,
     bos_token_id: int,
-    empty_token_id: int,
+    stop_token_id: int,
     surface_bucket_sizes: Sequence[int],
     max_pieces_per_unit: int,
     device: torch.device | None = None,
@@ -163,7 +162,7 @@ def pack_writer_targets(
         pad_token_id=pad_token_id,
         surface_bucket_sizes=surface_bucket_sizes,
     )
-    query_ids = torch.full_like(query.ids, empty_token_id)
+    query_ids = torch.full_like(query.ids, pad_token_id)
     labels = torch.full_like(query.ids, -100)
     label_mask = torch.zeros_like(query.mask)
     for row_idx, row in enumerate(rows):

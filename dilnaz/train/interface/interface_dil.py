@@ -14,7 +14,7 @@ from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 29
+CHECKPOINT_FORMAT_VERSION = 30
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -114,6 +114,7 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
     model.set_compiled_forwards(
         encoder_forward=compile_forward(model.encoder.forward, compile_mode, "DilEncoderCore"),
         writer_forward=compile_forward(model.writer.forward, compile_mode, "DilConditionalWriter"),
+        transition_forward=compile_forward(model.writer.transition, compile_mode, "DilConditionalWriterTransition"),
     )
     model.eval()
     return model, config, tokenizer, checkpoint["training_state"]["step"]
@@ -126,9 +127,9 @@ def encode_tokens(model: Dil, surface):
 
 @torch.no_grad()
 def decode_tokens(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor) -> list[str]:
-    from dilnaz.train.interface.writer_render import render_latents_with_sliding_writer
+    from dilnaz.train.interface.writer_render import render_latents_with_unit_writer
 
-    return render_latents_with_sliding_writer(model, tokenizer, latents)
+    return render_latents_with_unit_writer(model, tokenizer, latents)
 
 
 def similarity_matrix(latents: torch.Tensor) -> list[list[float]]:

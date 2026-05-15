@@ -469,17 +469,6 @@ def build_config(args, tokenizer: HybridTokenizer) -> DilConfig:
         writer_conv_kernel_size=args.writer_conv_kernel_size,
         writer_conv_expansion=args.writer_conv_expansion,
         writer_dropout=args.writer_dropout,
-        writer_noise_warmup_steps=DIL_MODEL_DEFAULTS["writer_noise_warmup_steps"],
-        writer_noise_clean_ratio=DIL_MODEL_DEFAULTS["writer_noise_clean_ratio"],
-        writer_noise_easy_ratio=DIL_MODEL_DEFAULTS["writer_noise_easy_ratio"],
-        writer_noise_mid_ratio=DIL_MODEL_DEFAULTS["writer_noise_mid_ratio"],
-        writer_noise_hard_ratio=DIL_MODEL_DEFAULTS["writer_noise_hard_ratio"],
-        writer_noise_easy_min_cos=DIL_MODEL_DEFAULTS["writer_noise_easy_min_cos"],
-        writer_noise_easy_max_cos=DIL_MODEL_DEFAULTS["writer_noise_easy_max_cos"],
-        writer_noise_mid_min_cos=DIL_MODEL_DEFAULTS["writer_noise_mid_min_cos"],
-        writer_noise_mid_max_cos=DIL_MODEL_DEFAULTS["writer_noise_mid_max_cos"],
-        writer_noise_hard_min_cos=DIL_MODEL_DEFAULTS["writer_noise_hard_min_cos"],
-        writer_noise_hard_max_cos=DIL_MODEL_DEFAULTS["writer_noise_hard_max_cos"],
         tokenizer_vocab_file=args.tokenizer_vocab.name,
     )
 

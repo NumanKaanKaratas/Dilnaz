@@ -37,7 +37,6 @@ class NazGenerationOutput(ModelOutput):
 @dataclass
 class NazGenerationStep(ModelOutput):
     latent: Optional[torch.FloatTensor] = None
-    future_latents: Optional[torch.FloatTensor] = None
     latent_cos_to_previous: Optional[torch.FloatTensor] = None
     should_stop: Optional[torch.Tensor] = None
     candidate_index: Optional[torch.LongTensor] = None

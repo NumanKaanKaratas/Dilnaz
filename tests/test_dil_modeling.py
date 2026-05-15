@@ -30,14 +30,6 @@ def tiny_config() -> DilConfig:
         encoder_attention_window=4,
         byte_conv_layers=1,
         writer_num_layers=1,
-        writer_word_mixer_layers=1,
-        writer_word_attention_heads=4,
-        writer_max_window_size=5,
-        writer_sliding_window_size=5,
-        writer_left_frozen=1,
-        writer_active_size=3,
-        writer_right_guard=1,
-        writer_stride=3,
     )
 
 
@@ -49,15 +41,23 @@ def make_writer_target(cfg: DilConfig, rows):
     return pack_writer_targets(
         rows,
         pad_token_id=cfg.pad_token_id,
-        stop_token_id=cfg.writer_stop_token_id,
-        bos_token_id=cfg.writer_bos_token_id,
-        empty_token_id=cfg.writer_empty_token_id,
+        bos_token_id=cfg.decoder_start_token_id,
+        stop_token_id=cfg.eos_token_id,
         surface_bucket_sizes=cfg.surface_bucket_sizes,
         max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
     )
 
 
-def test_writer_targets_use_causal_inputs_and_stop_labels():
+def test_shared_embedding_contract():
+    cfg = tiny_config()
+    model = Dil(cfg)
+    assert model.encoder.embed_tokens is model.shared_token_embeddings
+    assert model.writer.token_embeddings is model.shared_token_embeddings
+    assert "_".join(("surface", "input", "embeddings")) not in dict(model.writer.named_modules())
+    assert not hasattr(model.writer, "_".join(("token", "head")))
+
+
+def test_writer_targets_use_single_vocab_causal_inputs_and_eos_stop():
     cfg = tiny_config()
     comma = make_writer_target(cfg, [[[7]]])
     araba = make_writer_target(cfg, [[[2, 3, 4, 5, 6]]])
@@ -67,14 +67,14 @@ def test_writer_targets_use_causal_inputs_and_stop_labels():
     assert araba.query.unit_lengths.item() == 6
     assert padded.query.unit_lengths.tolist() == [[3, 0]]
     assert padded.query.unit_mask.tolist() == [[True, False]]
-    assert comma.query.ids[0, 0].item() == cfg.writer_bos_token_id
+    assert comma.query.ids[0, 0].item() == cfg.decoder_start_token_id
     assert comma.query.ids[0, 1].item() == 7
     assert comma.labels[0, 0].item() == 7
-    assert comma.labels[0, 1].item() == cfg.writer_stop_token_id
-    assert eos.query.ids[0, 0].item() == cfg.writer_bos_token_id
+    assert comma.labels[0, 1].item() == cfg.eos_token_id
+    assert eos.query.ids[0, 0].item() == cfg.decoder_start_token_id
     assert eos.query.ids[0, 1].item() == cfg.eos_token_id
     assert eos.labels[0, 0].item() == cfg.eos_token_id
-    assert eos.labels[0, 1].item() == cfg.writer_stop_token_id
+    assert eos.labels[0, 1].item() == cfg.eos_token_id
 
 
 def test_dil_packed_encoder_output_shape():
@@ -101,23 +101,17 @@ def test_dil_packed_encoder_output_shape():
 def test_writer_packed_logits_no_nan():
     cfg = tiny_config()
     model = Dil(cfg)
-    semantic = torch.randn(2, cfg.writer_sliding_window_size, cfg.latent_size)
-    target = make_writer_target(
-        cfg,
-        [
-            [[2], [3, 4], [5], [6], [7]],
-            [[8], [9], [10, 11, 12], [13], [14]],
-        ],
-    )
+    semantic = torch.randn(2, cfg.latent_size)
+    target = make_writer_target(cfg, [[[2]], [[3, 4]]])
     output = model.writer.transition(semantic, query_surface=target.query)
-    assert output.token_logits.shape == (2, target.query.surface_width, cfg.writer_vocab_size)
+    assert output.token_logits.shape == (2, target.query.surface_width, cfg.vocab_size)
     assert torch.isfinite(output.token_logits).all()
 
 
 def test_writer_causal_surface_path_does_not_see_future_inputs():
     cfg = tiny_config()
     model = Dil(cfg).eval()
-    semantic = torch.randn(1, 1, cfg.latent_size)
+    semantic = torch.randn(1, cfg.latent_size)
     left = make_writer_target(cfg, [[[2, 3, 4]]])
     right = make_writer_target(cfg, [[[2, 9, 9]]])
     with torch.no_grad():
@@ -127,22 +121,14 @@ def test_writer_causal_surface_path_does_not_see_future_inputs():
     assert torch.allclose(left_logits[:, 1], right_logits[:, 1], atol=1e-6, rtol=1e-5)
 
 
-def test_writer_transition_loss_is_causal_token_loss():
+def test_writer_loss_is_unit_local_token_loss():
     cfg = tiny_config()
     model = Dil(cfg)
-    semantic = torch.randn(1, cfg.writer_sliding_window_size, cfg.latent_size)
-    target = make_writer_target(cfg, [[[2], [3, 4], [5], [6], [7]]])
-    zone_ids = torch.tensor([[0, 1, 1, 1, 2]])
-    window_mask = torch.ones(1, cfg.writer_sliding_window_size, dtype=torch.bool)
-    metrics = model.writer_transition_loss_and_metrics(
-        semantic,
-        target,
-        zone_ids,
-        window_mask,
-        return_metrics=True,
-    )
-    assert "length_bucket_loss" not in metrics
+    semantic = torch.randn(1, cfg.latent_size)
+    target = make_writer_target(cfg, [[[2, 3, 4]]])
+    metrics = model.writer_loss_and_metrics(semantic, target, return_metrics=True)
     assert torch.isfinite(metrics["loss"])
+    assert torch.equal(metrics["loss"], metrics["token_loss"])
 
 
 def test_writer_generation_result_stops_or_hits_surface_limit():
@@ -156,18 +142,18 @@ def test_writer_generation_result_stops_or_hits_surface_limit():
     assert generation.stopped.shape == (2,)
 
 
-def test_writer_generation_stops_on_stop_token():
+def test_writer_generation_stops_on_eos_stop_token():
     cfg = tiny_config()
     model = Dil(cfg)
 
-    def stop_transition(self, semantic, query_surface=None, **kwargs):
+    def stop_transition(self, semantic, query_surface=None):
         logits = torch.zeros(
             query_surface.ids.shape[0],
             query_surface.surface_width,
-            self.writer_vocab_size,
+            self.vocab_size,
             device=semantic.device,
         )
-        logits[..., self.writer_stop_token_id] = 1.0
+        logits[..., self.stop_token_id] = 1.0
         return DilWriterOutput(token_logits=logits, query_surface=query_surface)
 
     model.writer.transition = MethodType(stop_transition, model.writer)
@@ -181,11 +167,11 @@ def test_writer_generation_caps_when_stop_is_missing():
     cfg = tiny_config()
     model = Dil(cfg)
 
-    def token_transition(self, semantic, query_surface=None, **kwargs):
+    def token_transition(self, semantic, query_surface=None):
         logits = torch.zeros(
             query_surface.ids.shape[0],
             query_surface.surface_width,
-            self.writer_vocab_size,
+            self.vocab_size,
             device=semantic.device,
         )
         logits[..., 2] = 1.0

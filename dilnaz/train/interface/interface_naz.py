@@ -9,7 +9,7 @@ from dilnaz.models.dil import DilConfig
 from dilnaz.models.naz import NazConfig
 from dilnaz.models.naz import Naz
 from dilnaz.surface import pack_token_units
-from dilnaz.train.interface.writer_buffer import SlidingWriterBuffer
+from dilnaz.train.interface.writer_buffer import UnitWriterBuffer
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
@@ -103,7 +103,7 @@ def stream_text(
     sys.stdout.write(prompt_text)
     sys.stdout.flush()
 
-    writer_buffer = SlidingWriterBuffer(model, model.dil_model.config, tokenizer)
+    writer_buffer = UnitWriterBuffer(model, model.dil_model.config, tokenizer, microbatch_size=writer_microbatch_size)
     prompt_latents = None
     if hasattr(model, "encode_sequence_latents"):
         prompt_latents = model.encode_sequence_latents(surface, unit_mask)
@@ -119,7 +119,6 @@ def stream_text(
     ):
         writer_buffer.append(
             step.latent,
-            getattr(step, "future_latents", None),
             bool(step.should_stop[0].detach().cpu()),
         )
         if writer_buffer.flush(force=False):

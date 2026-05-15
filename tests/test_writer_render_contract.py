@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -6,7 +7,8 @@ from dilnaz.models.dil import Dil, DilConfig
 from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer
 from dilnaz.train.interface.interface_dil import decode_tokens, make_batch, tokenize_text
-from dilnaz.train.interface.writer_render import render_latents_with_sliding_writer
+from dilnaz.train.interface.writer_render import render_latents_with_unit_writer
+from dilnaz.train.writer.train import HybridDilUnitWriterDataset
 
 
 def tiny_config():
@@ -29,18 +31,27 @@ def tiny_config():
         encoder_attention_window=4,
         byte_conv_layers=1,
         writer_num_layers=1,
-        writer_word_mixer_layers=1,
-        writer_word_attention_heads=4,
-        writer_max_window_size=5,
-        writer_sliding_window_size=5,
-        writer_left_frozen=1,
-        writer_active_size=3,
-        writer_right_guard=1,
-        writer_stride=3,
     )
 
 
-def test_render_does_not_use_direct_decode_semantic():
+def constant_decode(token_id: int = 65):
+    def decode(semantic: torch.Tensor):
+        batch_size = semantic.shape[0]
+        token_ids = torch.full((batch_size, 4), 0, dtype=torch.long, device=semantic.device)
+        token_mask = torch.zeros((batch_size, 4), dtype=torch.bool, device=semantic.device)
+        token_ids[:, 0] = token_id
+        token_mask[:, 0] = True
+        return SimpleNamespace(
+            token_ids=token_ids,
+            token_mask=token_mask,
+            lengths=torch.ones((batch_size,), dtype=torch.long, device=semantic.device),
+            stopped=torch.ones((batch_size,), dtype=torch.bool, device=semantic.device),
+        )
+
+    return decode
+
+
+def test_render_uses_unit_microbatches():
     cfg = tiny_config()
     model = Dil(cfg).eval()
     surface = pack_token_units(
@@ -51,17 +62,16 @@ def test_render_does_not_use_direct_decode_semantic():
     )
     latents = model.encode(surface).float()
 
-    class DirectDecodePatch:
-        def __init__(self, original):
-            self.original = original
-            self.called = False
+    class DecodePatch:
+        def __init__(self):
+            self.calls = 0
 
         def __call__(self, semantic):
-            self.called = True
-            return self.original(semantic)
+            assert semantic.dim() == 2
+            self.calls += 1
+            return constant_decode()(semantic)
 
-    original_decode = model.decode_semantic
-    patched = DirectDecodePatch(original_decode)
+    patched = DecodePatch()
     model.decode_semantic = patched
 
     dummy_tokenizer = HybridTokenizer(
@@ -71,16 +81,14 @@ def test_render_does_not_use_direct_decode_semantic():
         common_word_tokens=[],
         contextual_tokens={},
     )
-    try:
-        render_latents_with_sliding_writer(model, dummy_tokenizer, latents)
-    except Exception:
-        pass
-    assert not patched.called, "render_latents_with_sliding_writer must not call decode_semantic (direct decode)"
+    render_latents_with_unit_writer(model, dummy_tokenizer, latents, microbatch_size=2)
+    assert patched.calls == 2
 
 
 def test_render_short_sequence_returns_expected_count():
     cfg = tiny_config()
     model = Dil(cfg).eval()
+    model.decode_semantic = constant_decode()
     surface = pack_token_units(
         [[[2], [3, 4], [5]]],
         pad_token_id=cfg.pad_token_id,
@@ -96,13 +104,14 @@ def test_render_short_sequence_returns_expected_count():
         common_word_tokens=[],
         contextual_tokens={},
     )
-    output = render_latents_with_sliding_writer(model, dummy_tokenizer, latents)
+    output = render_latents_with_unit_writer(model, dummy_tokenizer, latents)
     assert len(output) == 3, f"expected 3 tokens for 3-unit sequence, got {len(output)}"
 
 
 def test_render_respects_unit_mask():
     cfg = tiny_config()
     model = Dil(cfg).eval()
+    model.decode_semantic = constant_decode()
     surface = pack_token_units(
         [[[2], [3, 4], [5]]],
         pad_token_id=cfg.pad_token_id,
@@ -119,13 +128,14 @@ def test_render_respects_unit_mask():
         common_word_tokens=[],
         contextual_tokens={},
     )
-    output = render_latents_with_sliding_writer(model, dummy_tokenizer, latents, unit_mask=unit_mask)
+    output = render_latents_with_unit_writer(model, dummy_tokenizer, latents, unit_mask=unit_mask)
     assert len(output) == 2, f"expected 2 tokens for 3-unit sequence with unit_mask excluding index 1, got {len(output)}"
 
 
-def test_render_long_sequence_uses_multiple_windows():
+def test_render_long_sequence_uses_unit_batches():
     cfg = tiny_config()
     model = Dil(cfg).eval()
+    model.decode_semantic = constant_decode()
     unit_count = 8
     rows = [[[i + 2] for i in range(unit_count)]]
     surface = pack_token_units(
@@ -144,7 +154,7 @@ def test_render_long_sequence_uses_multiple_windows():
         common_word_tokens=[],
         contextual_tokens={},
     )
-    output = render_latents_with_sliding_writer(model, dummy_tokenizer, latents)
+    output = render_latents_with_unit_writer(model, dummy_tokenizer, latents, microbatch_size=3)
     assert len(output) <= unit_count, f"expected at most {unit_count} tokens (empty positions are filtered), got {len(output)}"
     assert len(output) >= unit_count // 2, f"expected at least {unit_count // 2} non-empty tokens, got {len(output)}"
 
@@ -152,6 +162,7 @@ def test_render_long_sequence_uses_multiple_windows():
 def test_render_output_is_finite():
     cfg = tiny_config()
     model = Dil(cfg).eval()
+    model.decode_semantic = constant_decode()
     surface = pack_token_units(
         [[[2], [3, 4], [5]]],
         pad_token_id=cfg.pad_token_id,
@@ -168,32 +179,98 @@ def test_render_output_is_finite():
         common_word_tokens=[],
         contextual_tokens={},
     )
-    output = render_latents_with_sliding_writer(model, dummy_tokenizer, latents)
+    output = render_latents_with_unit_writer(model, dummy_tokenizer, latents)
     assert isinstance(output, list), "output must be a list of strings"
 
 
 def test_interface_dil_decode_tokens_does_not_call_direct_decode_semantic():
-    """interface_dil.decode_tokens must use the sliding-window helper, not direct decode_semantic."""
+    """interface_dil.decode_tokens must use the unit writer helper, not an ad-hoc direct decode."""
     import dilnaz.train.interface.interface_dil as interface
 
     source = Path(interface.__file__).read_text(encoding="utf-8")
     assert "decode_semantic(latents.unsqueeze" not in source, (
         "interface_dil must not call decode_semantic with unsqueeze directly"
     )
-    assert "render_latents_with_sliding_writer" in source, (
-        "interface_dil.decode_tokens must import and use render_latents_with_sliding_writer"
+    assert "render_latents_with_unit_writer" in source, (
+        "interface_dil.decode_tokens must import and use render_latents_with_unit_writer"
     )
 
 
-def test_zone_ids_match_training_contract():
+def test_writer_contract_has_no_context_window_fields():
     cfg = tiny_config()
-    zone_ids_template = torch.full((cfg.writer_sliding_window_size,), 1, dtype=torch.long)
-    zone_ids_template[: cfg.writer_left_frozen] = 0
-    zone_ids_template[cfg.writer_left_frozen + cfg.writer_active_size :] = 2
+    for name in (
+        "_".join(("writer", "sliding", "window", "size")),
+        "_".join(("writer", "left", "frozen")),
+        "_".join(("writer", "active", "size")),
+        "_".join(("writer", "right", "guard")),
+        "_".join(("writer", "stride")),
+    ):
+        assert not hasattr(cfg, name)
 
-    expected = torch.tensor([0, 1, 1, 1, 2])
-    assert cfg.writer_sliding_window_size == 5
-    assert cfg.writer_left_frozen == 1
-    assert cfg.writer_active_size == 3
-    assert cfg.writer_right_guard == 1
-    assert torch.equal(zone_ids_template, expected), f"zone_ids {zone_ids_template} must match training contract {expected}"
+
+def test_unit_writer_dataset_encodes_full_sequence_and_gathers_writer_units(tmp_path: Path):
+    data = tmp_path / "train.jsonl"
+    data.write_text('{"text":"araba car"}\n', encoding="utf-8")
+    tokenizer = HybridTokenizer(
+        char_tokens=[],
+        surface_tokens=["araba", "car"],
+        numeric_tokens=[],
+        common_word_tokens=[],
+        contextual_tokens={},
+    )
+    cfg = tiny_config()
+    cfg.vocab_size = tokenizer.vocab_size
+    cfg.pad_token_id = tokenizer.pad_token_id
+    cfg.eos_token_id = tokenizer.eos_token_id
+    dataset = HybridDilUnitWriterDataset(
+        data,
+        cfg,
+        tokenizer,
+        batch_size=8,
+        read_chars=1024,
+        repeat=False,
+        context_aug_max_units=0,
+    )
+    batch = next(dataset.iter_once(worker_id=0, worker_count=1))
+
+    assert "labels" not in batch
+    assert "window_mask" not in batch
+    assert batch["surface"].batch_size == 1
+    assert batch["writer_source_rows"].shape[0] == batch["writer_labels"].true_lengths.shape[0]
+    assert batch["writer_labels"].true_lengths.shape[0] == int(batch["surface"].unit_mask.sum())
+    assert int(batch["writer_unit_indices"].max()) < batch["surface"].unit_count
+
+
+def test_unit_writer_dataset_adds_short_context_spans(tmp_path: Path):
+    data = tmp_path / "train.jsonl"
+    data.write_text('{"text":"araba car araba car araba car araba car araba car"}\n', encoding="utf-8")
+    tokenizer = HybridTokenizer(
+        char_tokens=[],
+        surface_tokens=["araba", "car"],
+        numeric_tokens=[],
+        common_word_tokens=[],
+        contextual_tokens={},
+    )
+    cfg = tiny_config()
+    cfg.vocab_size = tokenizer.vocab_size
+    cfg.pad_token_id = tokenizer.pad_token_id
+    cfg.eos_token_id = tokenizer.eos_token_id
+    dataset = HybridDilUnitWriterDataset(
+        data,
+        cfg,
+        tokenizer,
+        batch_size=128,
+        read_chars=1024,
+        repeat=False,
+        context_aug_max_units=4,
+        context_aug_stride=2,
+    )
+    batch = next(dataset.iter_once(worker_id=0, worker_count=1))
+    row_lengths = batch["surface"].unit_mask.sum(dim=1)
+
+    assert batch["surface"].batch_size > 1
+    assert row_lengths.max().item() > 4
+    assert row_lengths.eq(1).any()
+    assert row_lengths.eq(2).any()
+    assert row_lengths.eq(4).any()
+    assert batch["writer_labels"].true_lengths.shape[0] == int(batch["surface"].unit_mask.sum())

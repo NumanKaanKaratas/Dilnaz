@@ -41,8 +41,6 @@ def test_resident_source_uses_dil_surface_config(monkeypatch, tmp_path: Path):
         encoder_intermediate_size=64,
         encoder_attention_window=4,
         writer_num_layers=1,
-        writer_word_mixer_layers=1,
-        writer_word_attention_heads=4,
     )
     naz_config = NazConfig(latent_size=dil_config.latent_size, mtp_horizons=2)
     seen = {}

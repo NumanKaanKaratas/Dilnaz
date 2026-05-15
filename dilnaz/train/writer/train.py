@@ -34,36 +34,35 @@ from dilnaz.train.data.dil_data import (
     stream_teacher_text_items_with_eos,
     trainable_segments,
 )
-from dilnaz.surface import pack_token_units, pack_writer_targets
+from dilnaz.surface import pack_token_units
 from dilnaz.train.configs.defaults import DIL_TRAIN_DEFAULTS
 from dilnaz.models.dil import DilConfig
-from dilnaz.models.dil import Dil, angular_noise_like
+from dilnaz.models.dil import Dil
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
+from dilnaz.train.dil.writer_units import build_writer_unit_view, gather_writer_semantic, writer_unit_counts
 
 
-CHECKPOINT_FORMAT_VERSION = 29
-WRITER_OBJECTIVE = "causal_surface_writer_v1"
+CHECKPOINT_FORMAT_VERSION = 30
+WRITER_OBJECTIVE = "unit_surface_writer_v3"
 WRITER_METRIC_KEYS = (
     "loss",
     "token_loss",
-    "active_token_loss",
-    "right_guard_token_loss",
-    "left_consistency_loss",
-    "byte_acc",
-    "token_exact",
-    "stop_acc",
-    "right_guard_byte_acc",
-    "right_guard_token_exact",
-    "right_guard_stop_acc",
-    "stepT_byte_acc",
-    "stepT_token_exact",
-    "stepT_stop_acc",
-    "future_horizons",
-    "future_mode",
+    "teacher_byte_acc",
+    "teacher_token_exact",
+    "teacher_stop_acc",
+)
+FREE_METRIC_KEYS = (
+    "free_byte_acc",
+    "free_token_exact",
+    "short_le4_exact",
+    "short_le8_exact",
+    "short_le16_exact",
+    "first_token_exact",
+    "empty_output_rate",
 )
 
 
-class HybridDilSlidingWindowDataset(IterableDataset):
+class HybridDilUnitWriterDataset(IterableDataset):
     def __init__(
         self,
         train_file: Path,
@@ -73,11 +72,8 @@ class HybridDilSlidingWindowDataset(IterableDataset):
         read_chars: int,
         repeat: bool = True,
         max_samples: int = 0,
-        window_size: int | None = None,
-        left_frozen: int | None = None,
-        active_size: int | None = None,
-        right_guard: int | None = None,
-        stride: int | None = None,
+        context_aug_max_units: int = 16,
+        context_aug_stride: int = 8,
     ):
         super().__init__()
         self.train_file = train_file
@@ -87,85 +83,104 @@ class HybridDilSlidingWindowDataset(IterableDataset):
         self.read_chars = read_chars
         self.repeat = repeat
         self.max_samples = max_samples
-        self.window_size = config.writer_sliding_window_size if window_size is None else window_size
-        self.left_frozen = config.writer_left_frozen if left_frozen is None else left_frozen
-        self.active_size = config.writer_active_size if active_size is None else active_size
-        self.right_guard = config.writer_right_guard if right_guard is None else right_guard
-        self.stride = config.writer_stride if stride is None else stride
-        if self.left_frozen + self.active_size + self.right_guard != self.window_size:
-            raise ValueError("writer window zones must sum to window_size")
-        if self.stride <= 0 or self.stride > self.active_size:
-            raise ValueError("stride must be in 1..active_size")
-        self.zone_template = torch.full((self.window_size,), 1, dtype=torch.long)
-        self.zone_template[: self.left_frozen] = 0
-        self.zone_template[self.left_frozen + self.active_size :] = 2
-        self._carry_texts: list[str] = []
+        self.context_aug_max_units = context_aug_max_units
+        self.context_aug_stride = context_aug_stride
         self._carry_line_ids: list[int] = []
-        self._carry_segments = []
-        self._carry_refs: list[tuple[int, int]] = []
+        self._carry_unit_rows: list[list[list[int]]] = []
+        self._carry_unit_count = 0
         self._produced = 0
 
-    def make_batch(self, texts: list[str], line_ids: list[int], segments_by_text: list, refs: list[tuple[int, int]]):
-        batch_size = len(refs)
-        target_rows = []
-        window_mask = torch.zeros((batch_size, self.window_size), dtype=torch.bool)
-        source_line_ids = torch.zeros((batch_size,), dtype=torch.long)
+    @staticmethod
+    def _span_key(row: list[list[int]]) -> tuple[tuple[int, ...], ...]:
+        return tuple(tuple(unit) for unit in row)
 
-        for batch_idx, (text_idx, active_start) in enumerate(refs):
-            segments = segments_by_text[text_idx]
-            source_line_ids[batch_idx] = int(line_ids[text_idx])
-            window_start = active_start - self.left_frozen
-            target_row: list[list[int]] = []
-            for window_idx in range(self.window_size):
-                token_idx = window_start + window_idx
-                if token_idx < 0 or token_idx >= len(segments):
-                    target_row.append([])
-                    continue
-                window_mask[batch_idx, window_idx] = True
-                segment = segments[token_idx]
-                target_row.append(segment_piece_ids(segment))
-            target_rows.append(target_row)
+    def context_augmented_rows(self, row: list[list[int]]) -> list[list[list[int]]]:
+        row_len = len(row)
+        if self.context_aug_max_units <= 0 or row_len <= 1:
+            return []
 
+        max_span_size = min(self.context_aug_max_units, row_len)
+        rows: list[list[list[int]]] = []
+        seen = {self._span_key(row)}
+
+        def add_span(start: int, end: int) -> None:
+            if end <= start or (start == 0 and end == row_len):
+                return
+            span = [list(unit) for unit in row[start:end]]
+            key = self._span_key(span)
+            if key not in seen:
+                seen.add(key)
+                rows.append(span)
+
+        span_size = 1
+        while span_size < max_span_size:
+            add_span(0, span_size)
+            add_span(row_len - span_size, row_len)
+            span_size *= 2
+        add_span(0, max_span_size)
+        add_span(row_len - max_span_size, row_len)
+
+        if max_span_size < row_len:
+            start = 0
+            while start < row_len:
+                end = min(start + max_span_size, row_len)
+                if end - start < max_span_size:
+                    start = row_len - max_span_size
+                    end = row_len
+                add_span(start, end)
+                if end == row_len:
+                    break
+                start += self.context_aug_stride
+        return rows
+
+    def append_training_row(
+        self,
+        row: list[list[int]],
+        source_line_id: int,
+        unit_rows: list[list[list[int]]],
+        line_ids: list[int],
+        unit_count: int,
+    ) -> tuple[list[list[list[int]]], list[int], int, dict | None]:
+        unit_rows.append(row)
+        line_ids.append(source_line_id)
+        unit_count += len(row)
+        self._produced += len(row)
+        if unit_count >= self.batch_size:
+            batch = self.make_batch(unit_rows, line_ids)
+            return [], [], 0, batch
+        return unit_rows, line_ids, unit_count, None
+
+    def make_batch(self, unit_rows: list[list[list[int]]], line_ids: list[int]):
+        writer_view = build_writer_unit_view(unit_rows, self.config)
         return {
             "surface": pack_token_units(
-                target_rows,
+                unit_rows,
                 pad_token_id=self.config.pad_token_id,
                 bucket_sizes=self.config.surface_bucket_sizes,
                 max_pieces_per_unit=self.config.max_surface_pieces_per_unit,
             ),
-            "labels": pack_writer_targets(
-                target_rows,
-                pad_token_id=self.config.pad_token_id,
-                stop_token_id=self.config.writer_stop_token_id,
-                bos_token_id=self.config.writer_bos_token_id,
-                empty_token_id=self.config.writer_empty_token_id,
-                surface_bucket_sizes=self.config.surface_bucket_sizes,
-                max_pieces_per_unit=self.config.max_surface_pieces_per_unit,
-            ),
-            "zone_ids": self.zone_template.unsqueeze(0).expand(batch_size, -1).clone(),
-            "window_mask": window_mask,
-            "source_line_ids": source_line_ids,
+            "writer_labels": writer_view["writer_labels"],
+            "writer_source_rows": writer_view["writer_source_rows"],
+            "writer_unit_indices": writer_view["writer_unit_indices"],
+            "source_line_ids": torch.tensor(line_ids, dtype=torch.long),
         }
 
     def carry_batch(self):
-        if not self._carry_refs:
+        if not self._carry_unit_rows:
             return None
-        batch = self.make_batch(self._carry_texts, self._carry_line_ids, self._carry_segments, self._carry_refs)
-        self._carry_texts = []
+        batch = self.make_batch(self._carry_unit_rows, self._carry_line_ids)
         self._carry_line_ids = []
-        self._carry_segments = []
-        self._carry_refs = []
+        self._carry_unit_rows = []
+        self._carry_unit_count = 0
         return batch
 
     def iter_once(self, worker_id: int, worker_count: int):
-        texts = self._carry_texts
         line_ids = self._carry_line_ids
-        segments_by_text = self._carry_segments
-        refs = self._carry_refs
-        self._carry_texts = []
+        unit_rows = self._carry_unit_rows
+        unit_count = self._carry_unit_count
         self._carry_line_ids = []
-        self._carry_segments = []
-        self._carry_refs = []
+        self._carry_unit_rows = []
+        self._carry_unit_count = 0
 
         for text_idx, (source_line_id, text, add_eos) in enumerate(
             stream_teacher_text_items_with_eos(self.train_file, self.read_chars)
@@ -180,33 +195,28 @@ class HybridDilSlidingWindowDataset(IterableDataset):
             )
             if not segments:
                 continue
-            local_text_idx = len(texts)
-            texts.append(text)
-            line_ids.append(source_line_id)
-            segments_by_text.append(segments)
-            for active_start in range(0, len(segments), self.stride):
-                refs.append((local_text_idx, active_start))
-                self._produced += 1
-                if len(refs) == self.batch_size:
-                    yield self.make_batch(texts, line_ids, segments_by_text, refs)
-                    texts, line_ids, segments_by_text, refs = [], [], [], []
-                    if active_start + self.stride < len(segments):
-                        local_text_idx = 0
-                        texts.append(text)
-                        line_ids.append(source_line_id)
-                        segments_by_text.append(segments)
+            row = [segment_piece_ids(segment) for segment in segments]
+            for candidate in (row, *self.context_augmented_rows(row)):
+                unit_rows, line_ids, unit_count, batch = self.append_training_row(
+                    candidate,
+                    source_line_id,
+                    unit_rows,
+                    line_ids,
+                    unit_count,
+                )
+                if batch is not None:
+                    yield batch
                 if self.max_samples > 0 and self._produced >= self.max_samples:
-                    if refs:
-                        yield self.make_batch(texts, line_ids, segments_by_text, refs)
+                    if unit_rows:
+                        yield self.make_batch(unit_rows, line_ids)
                     return
 
-        if refs and not self.repeat:
-            yield self.make_batch(texts, line_ids, segments_by_text, refs)
-        elif refs:
-            self._carry_texts = texts
+        if unit_rows and not self.repeat:
+            yield self.make_batch(unit_rows, line_ids)
+        elif unit_rows:
             self._carry_line_ids = line_ids
-            self._carry_segments = segments_by_text
-            self._carry_refs = refs
+            self._carry_unit_rows = unit_rows
+            self._carry_unit_count = unit_count
 
     def __iter__(self):
         from torch.utils.data import get_worker_info
@@ -219,8 +229,8 @@ class HybridDilSlidingWindowDataset(IterableDataset):
             for batch in self.iter_once(worker_id, worker_count):
                 yielded = True
                 yield batch
-            if not yielded and not self._carry_refs:
-                raise ValueError(f"{self.train_file} produced no sliding writer windows")
+            if not yielded and not self._carry_unit_rows:
+                raise ValueError(f"{self.train_file} produced no unit writer samples")
             if not self.repeat:
                 return
 
@@ -230,227 +240,102 @@ def freeze_for_writer_only(model: Dil):
         param.requires_grad = False
     for param in model.writer.parameters():
         param.requires_grad = True
+    model.shared_token_embeddings.weight.requires_grad = False
     model.encoder.eval()
     model.writer.train()
 
 
-def synthetic_position_age(config: DilConfig, target, zone_ids: torch.Tensor, window_mask: torch.Tensor) -> torch.Tensor:
-    valid_words = target.true_lengths.to(window_mask.device).gt(0) & window_mask
-    active = zone_ids.eq(1) & valid_words
-    left = zone_ids.eq(0) & valid_words
-    age = torch.zeros(zone_ids.shape, device=window_mask.device, dtype=torch.long)
-    random_age = torch.randint(config.writer_max_position_age + 1, zone_ids.shape, device=window_mask.device, dtype=torch.long)
-    age = torch.where(active, random_age, age)
-    age = torch.where(left, torch.full_like(age, config.writer_max_position_age), age)
-    return age
-
-
-def sliding_future_latents(semantic: torch.Tensor, window_mask: torch.Tensor, horizons: int) -> torch.Tensor | None:
-    if horizons <= 0:
-        return None
-    batch_size, window_size, latent_size = semantic.shape
-    future = semantic.new_zeros((batch_size, window_size, horizons, latent_size))
-    for horizon_idx in range(horizons):
-        offset = horizon_idx + 1
-        if offset >= window_size:
-            break
-        future[:, :-offset, horizon_idx] = (
-            semantic[:, offset:] * window_mask[:, offset:].unsqueeze(-1).to(semantic.dtype)
-        )
-    return future
-
-
-@torch.no_grad()
-def predicted_future_latents(
-    predictor: Naz | None,
-    semantic: torch.Tensor,
-    window_mask: torch.Tensor,
-    horizons: int,
-) -> torch.Tensor | None:
-    if predictor is None or horizons <= 0:
-        return None
-    predictor_device = next(predictor.parameters()).device
-    dynamics = predictor.predict_semantic_dynamics(
-        semantic.to(predictor_device),
-        window_mask.to(predictor_device),
-    )
-    predicted = semantic.new_zeros((*semantic.shape[:2], horizons, semantic.shape[-1]))
-    available_horizons = min(horizons, dynamics.selected_latents.shape[2])
-    predicted[:, :, :available_horizons] = dynamics.selected_latents[:, :, :available_horizons].to(
-        device=semantic.device,
-        dtype=semantic.dtype,
-    )
-    return predicted
-
-
-def noised_future_latents(config: DilConfig, future_latents: torch.Tensor) -> torch.Tensor:
-    valid = future_latents.float().norm(dim=-1).gt(1e-6)
-    if not valid.any():
-        return future_latents
-    noised = future_latents.float().clone()
-    min_cos = torch.full(valid.shape, config.writer_future_noise_min_cos, device=future_latents.device, dtype=torch.float32)[valid]
-    max_cos = torch.full(valid.shape, config.writer_future_noise_max_cos, device=future_latents.device, dtype=torch.float32)[valid]
-    noised[valid] = angular_noise_like(noised[valid], min_cos, max_cos)
-    return noised.to(future_latents.dtype)
-
-
-def resolve_future_mode(config: DilConfig, training_step: int | None, predictor: Naz | None, requested_mode: str) -> str:
-    if requested_mode != "curriculum":
-        if requested_mode in ("predicted", "mixed") and predictor is None:
-            raise ValueError("--future-latent-mode predicted/mixed requires --future-naz-checkpoint")
-        return requested_mode
-    if training_step is None:
-        return "off"
-    if predictor is not None and training_step >= config.writer_future_mixed_start_step:
-        return "mixed"
-    if predictor is not None and training_step >= config.writer_future_predicted_start_step:
-        return "predicted"
-    if training_step >= config.writer_future_noised_start_step:
-        return "noised"
-    return "off"
-
-
-def build_future_latents(
-    config: DilConfig,
-    true_future: torch.Tensor | None,
-    semantic: torch.Tensor,
-    window_mask: torch.Tensor,
-    predictor: Naz | None,
-    mode: str,
-) -> tuple[torch.Tensor | None, float]:
-    if true_future is None:
-        return None, 0.0
-    if mode == "off":
-        return None, 0.0
-    if mode == "true":
-        return true_future, 1.0
-    if mode == "noised":
-        return noised_future_latents(config, true_future), 2.0
-    horizons = true_future.shape[2]
-    predicted = predicted_future_latents(predictor, semantic, window_mask, horizons)
-    if mode == "predicted":
-        if predicted is None:
-            raise ValueError("predicted future latents require a loaded Naz predictor")
-        return predicted, 3.0
-    if mode == "mixed":
-        if predicted is None:
-            raise ValueError("mixed future latents require a loaded Naz predictor")
-        choose_predicted = torch.rand(true_future.shape[:3], device=true_future.device).lt(config.writer_future_mix_ratio)
-        mixed = torch.where(choose_predicted.unsqueeze(-1), predicted, true_future)
-        return mixed, 4.0
-    raise ValueError(f"unsupported future latent mode: {mode}")
-
-
-def sliding_writer_metrics(
+def free_writer_metrics(
     model: Dil,
-    batch: dict,
-    training_step: int | None = None,
-    use_future_latents: bool = True,
-    future_predictor: Naz | None = None,
-    future_latent_mode: str = "curriculum",
+    semantic: torch.Tensor,
+    target,
 ) -> dict[str, torch.Tensor]:
-    surface = batch["surface"]
-    labels = batch["labels"].to(surface.ids.device)
-    zone_ids = batch["zone_ids"].to(surface.ids.device)
-    window_mask = batch["window_mask"].to(surface.ids.device, dtype=torch.bool)
-    batch_size, window_size = window_mask.shape
     with torch.no_grad():
-        semantic = model.encode(surface).float()
-        if semantic.shape[:2] != window_mask.shape:
-            raise ValueError("writer-only DIL encode output must match the sliding window shape")
+        generation = model.decode_semantic(semantic)
 
-    true_future_latents = None
-    if use_future_latents:
-        true_future_latents = sliding_future_latents(
-            semantic,
-            window_mask,
-            min(model.config.writer_right_guard, max(window_size - 1, 0)),
-        )
-    resolved_future_mode = "off" if not use_future_latents else resolve_future_mode(
-        model.config,
-        training_step,
-        future_predictor,
-        future_latent_mode,
-    )
-    future_latents, future_mode_id = build_future_latents(
-        model.config,
-        true_future_latents,
-        semantic,
-        window_mask,
-        future_predictor,
-        resolved_future_mode,
-    )
-    position_age = synthetic_position_age(model.config, labels, zone_ids, window_mask)
-    metrics = model.writer_transition_loss_and_metrics(
-        semantic.detach(),
-        labels,
-        zone_ids,
-        window_mask,
-        future_latents=future_latents,
-        position_age=position_age,
-        training_step=training_step,
-        return_metrics=True,
-    )
-    metrics["future_horizons"] = metrics["loss"].new_tensor(0.0 if future_latents is None else float(future_latents.shape[2]))
-    metrics["future_mode"] = metrics["loss"].new_tensor(future_mode_id)
+    labels = target.labels.to(semantic.device)
+    label_mask = target.label_mask.to(semantic.device)
+    true_lengths = target.true_lengths.to(semantic.device)
+    piece_lengths = (true_lengths[:, 0] - 1).clamp_min(0)
+    width = min(generation.token_ids.shape[-1], labels.shape[-1])
+    target_ids = labels[:, :width]
+    target_mask = label_mask[:, :width] & target_ids.ne(model.config.eos_token_id)
+    pred_ids = generation.token_ids[:, :width]
+    pred_mask = generation.token_mask[:, :width]
+
+    byte_matches = pred_mask & target_mask & pred_ids.eq(target_ids)
+    free_byte_acc = byte_matches.sum().float() / target_mask.sum().clamp_min(1).float()
+    mask_exact = pred_mask.eq(target_mask).all(dim=1)
+    id_exact = ((~target_mask) | pred_ids.eq(target_ids)).all(dim=1)
+    token_exact_rows = mask_exact & id_exact & true_lengths[:, 0].gt(0)
+    valid_rows = true_lengths[:, 0].gt(0)
+    free_token_exact = token_exact_rows.sum().float() / valid_rows.sum().clamp_min(1).float()
+    first_token_exact = (
+        pred_mask[:, 0] & target_mask[:, 0] & pred_ids[:, 0].eq(target_ids[:, 0])
+    ).sum().float() / valid_rows.sum().clamp_min(1).float()
+    empty_output_rate = generation.lengths.eq(0).float().mean()
+
+    metrics = {
+        "free_byte_acc": free_byte_acc,
+        "free_token_exact": free_token_exact,
+        "first_token_exact": first_token_exact,
+        "empty_output_rate": empty_output_rate,
+    }
+    for threshold in (4, 8, 16):
+        short = valid_rows & piece_lengths.le(threshold)
+        metrics[f"short_le{threshold}_exact"] = token_exact_rows[short].sum().float() / short.sum().clamp_min(1).float()
     return metrics
 
 
 def writer_only_metrics(
     model: Dil,
     batch: dict,
-    training_step: int | None = None,
-    use_future_latents: bool = True,
-    future_predictor: Naz | None = None,
-    future_latent_mode: str = "curriculum",
+    compute_free_metrics: bool = False,
 ) -> dict[str, torch.Tensor]:
-    if "window_mask" in batch:
-        return sliding_writer_metrics(
-            model,
-            batch,
-            training_step,
-            use_future_latents=use_future_latents,
-            future_predictor=future_predictor,
-            future_latent_mode=future_latent_mode,
-        )
-    labels = batch["labels"].to(batch["surface"].ids.device)
-    loss, token_loss, byte_acc, token_exact, stop_acc = model.writer_loss_and_metrics(
-        model.encode(batch["surface"]).detach(),
-        labels,
-        training_step=training_step,
+    surface = batch["surface"]
+    target = batch["writer_labels"].to(surface.ids.device)
+    with torch.no_grad():
+        full_semantic = model.encode(surface).float()
+    semantic = gather_writer_semantic(
+        full_semantic,
+        batch["writer_source_rows"],
+        batch["writer_unit_indices"],
     )
-    zero = loss.new_zeros(())
-    return {
-        "loss": loss,
-        "token_loss": token_loss,
-        "active_token_loss": token_loss,
-        "right_guard_token_loss": zero,
-        "left_consistency_loss": zero,
-        "byte_acc": byte_acc,
-        "token_exact": token_exact,
-        "stop_acc": stop_acc,
-        "right_guard_byte_acc": zero,
-        "right_guard_token_exact": zero,
-        "right_guard_stop_acc": zero,
-        "stepT_byte_acc": byte_acc,
-        "stepT_token_exact": token_exact,
-        "stepT_stop_acc": stop_acc,
-        "future_horizons": zero,
-        "future_mode": zero,
+    metrics = model.writer_loss_and_metrics(
+        semantic.detach(),
+        target,
+        return_metrics=True,
+    )
+    output = {
+        "loss": metrics["loss"],
+        "token_loss": metrics["token_loss"],
+        "teacher_byte_acc": metrics["byte_acc"],
+        "teacher_token_exact": metrics["token_exact"],
+        "teacher_stop_acc": metrics["stop_acc"],
     }
+    if compute_free_metrics:
+        output.update(free_writer_metrics(model, semantic.detach(), target))
+    return output
 
 
-def writer_only_forward(model: Dil, batch: dict, training_step: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    metrics = writer_only_metrics(model, batch, training_step)
-    return metrics["loss"], metrics["byte_acc"], metrics["token_exact"], metrics["stop_acc"]
+def writer_only_forward(model: Dil, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    metrics = writer_only_metrics(model, batch)
+    return metrics["loss"], metrics["teacher_byte_acc"], metrics["teacher_token_exact"], metrics["teacher_stop_acc"]
 
 
 def materialize_writer_batches(dataset, device: torch.device, batch_size: int, seed: int):
+    keep_keys = {
+        "surface",
+        "writer_labels",
+        "writer_source_rows",
+        "writer_unit_indices",
+        "source_line_ids",
+    }
     batches = [
         {
             key: value.detach().cpu() if hasattr(value, "detach") else value
             for key, value in batch.items()
-            if key in ("surface", "labels", "source_line_ids", "zone_ids", "window_mask")
+            if key in keep_keys
         }
         for batch in dataset.iter_once(worker_id=0, worker_count=1)
     ]
@@ -460,7 +345,7 @@ def materialize_writer_batches(dataset, device: torch.device, batch_size: int, s
             {
                 key: value.detach().cpu() if hasattr(value, "detach") else value
                 for key, value in carry_batch.items()
-                if key in ("surface", "labels", "source_line_ids", "zone_ids", "window_mask")
+                if key in keep_keys
             }
         )
     return ResidentDilBatcher(batches, batch_size=batch_size, device=device, seed=seed)
@@ -497,20 +382,7 @@ def save_checkpoint(
         "max_sequence_units": config.max_sequence_units,
         "encoder_context_layers": config.encoder_context_layers,
         "latent_size": config.latent_size,
-        "writer_window_size": config.writer_sliding_window_size,
-        "writer_left_frozen": config.writer_left_frozen,
-        "writer_active_size": config.writer_active_size,
-        "writer_right_guard": config.writer_right_guard,
-        "writer_stride": config.writer_stride,
-        "writer_use_zone_noise": config.writer_use_zone_noise,
         "writer_gradient_checkpointing": config.writer_gradient_checkpointing,
-        "writer_future_noise_min_cos": config.writer_future_noise_min_cos,
-        "writer_future_noise_max_cos": config.writer_future_noise_max_cos,
-        "writer_future_noised_start_step": config.writer_future_noised_start_step,
-        "writer_future_predicted_start_step": config.writer_future_predicted_start_step,
-        "writer_future_mixed_start_step": config.writer_future_mixed_start_step,
-        "writer_future_mix_ratio": config.writer_future_mix_ratio,
-        "writer_future_latent_mode": config.writer_future_latent_mode,
     }
     import os as _os
 
@@ -551,14 +423,10 @@ def evaluate(
     autocast_enabled: bool,
     cuda_prefetch: bool,
     max_batches: int,
-    use_future_latents: bool,
-    future_predictor: Naz | None,
-    future_latent_mode: str,
-    tokenizer=None,
 ):
     model.eval()
     model.encoder.eval()
-    total = {key: 0.0 for key in WRITER_METRIC_KEYS}
+    total = {key: 0.0 for key in (*WRITER_METRIC_KEYS, *FREE_METRIC_KEYS)}
     total["batches"] = 0
     for batch_idx, batch in enumerate(DeviceBatchPrefetcher(eval_loader, device, cuda_prefetch), start=1):
         cudagraph_step_begin(device, compile_mode)
@@ -566,12 +434,11 @@ def evaluate(
             metrics = writer_only_metrics(
                 model,
                 batch,
-                use_future_latents=use_future_latents,
-                future_predictor=future_predictor,
-                future_latent_mode=future_latent_mode,
-                tokenizer=tokenizer,
+                compute_free_metrics=True,
             )
-        for key in WRITER_METRIC_KEYS:
+        for key in total:
+            if key == "batches":
+                continue
             total[key] += float(metrics[key].detach().cpu())
         total["batches"] += 1
         if batch_idx >= max_batches:
@@ -587,22 +454,14 @@ def format_log(step: int, metrics: dict) -> str:
         f"step={step}",
         f"loss={metrics['loss']:.4f}",
         f"tok={metrics['token_loss']:.4f}",
-        f"act={metrics['active_token_loss']:.4f}",
-        f"guard={metrics['right_guard_token_loss']:.4f}",
-        f"left={metrics['left_consistency_loss']:.4f}",
-        f"byte_acc={metrics['byte_acc']:.4f}",
-        f"token_exact={metrics['token_exact']:.4f}",
-        f"stop_acc={metrics['stop_acc']:.4f}",
-        f"guard_acc={metrics['right_guard_byte_acc']:.4f}",
-        f"stepT_acc={metrics['stepT_byte_acc']:.4f}",
-        f"stepT_exact={metrics['stepT_token_exact']:.4f}",
-        f"future_h={metrics['future_horizons']:.1f}",
-        f"future_mode={metrics['future_mode']:.0f}",
+        f"teacher_byte_acc={metrics['teacher_byte_acc']:.4f}",
+        f"teacher_token_exact={metrics['teacher_token_exact']:.4f}",
+        f"teacher_stop_acc={metrics['teacher_stop_acc']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
         f"t/s={metrics['tokens_per_second']:.1f}",
-        f"w/s={metrics['windows_per_second']:.1f}",
+        f"u/s={metrics['units_per_second']:.1f}",
         f"step/s={metrics['steps_per_second']:.2f}",
     ]
     if "source_lines_seen" in metrics:
@@ -641,24 +500,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=DIL_TRAIN_DEFAULTS["seed"])
     parser.add_argument("--max-samples", type=int, default=DIL_TRAIN_DEFAULTS["max_samples"])
     parser.add_argument("--bf16", action="store_true")
-    parser.add_argument("--window-size", type=int, default=32)
-    parser.add_argument("--left-frozen", type=int, default=8)
-    parser.add_argument("--active-size", type=int, default=20)
-    parser.add_argument("--right-guard", type=int, default=4)
-    parser.add_argument("--stride", type=int, default=20)
-    parser.add_argument("--right-guard-loss-weight", type=float, default=0.2)
-    parser.add_argument("--left-consistency-weight", type=float, default=0.5)
     parser.add_argument("--writer-gradient-checkpointing", action="store_true")
-    parser.add_argument("--future-latent-mode", choices=("curriculum", "true", "noised", "predicted", "mixed"), default="curriculum")
-    parser.add_argument("--future-naz-checkpoint", type=Path, default=None)
-    parser.add_argument("--future-noised-start-step", type=int, default=2000)
-    parser.add_argument("--future-predicted-start-step", type=int, default=10000)
-    parser.add_argument("--future-mixed-start-step", type=int, default=14000)
-    parser.add_argument("--future-mix-ratio", type=float, default=0.50)
-    parser.add_argument("--future-noise-min-cos", type=float, default=0.970)
-    parser.add_argument("--future-noise-max-cos", type=float, default=0.995)
-    parser.add_argument("--disable-future-latents", action="store_true")
-    parser.add_argument("--disable-zone-noise", action="store_true")
+    parser.add_argument("--context-aug-max-units", type=int, default=16)
+    parser.add_argument("--context-aug-stride", type=int, default=8)
     return parser.parse_args()
 
 
@@ -683,41 +527,14 @@ def validate_args(args):
         raise ValueError("--num-workers must be >= 0")
     if args.data_mode == "resident" and args.max_samples > 0:
         raise ValueError("--max-samples is not supported with --data-mode resident")
-    if args.left_frozen + args.active_size + args.right_guard != args.window_size:
-        raise ValueError("--left-frozen + --active-size + --right-guard must equal --window-size")
-    if args.stride <= 0 or args.stride > args.active_size:
-        raise ValueError("--stride must be in 1..--active-size")
-    if min(args.right_guard_loss_weight, args.left_consistency_weight) < 0.0:
-        raise ValueError("writer loss weights must be >= 0")
-    if args.future_noised_start_step < 0 or args.future_predicted_start_step < 0 or args.future_mixed_start_step < 0:
-        raise ValueError("future curriculum start steps must be >= 0")
-    if args.future_predicted_start_step > args.future_mixed_start_step:
-        raise ValueError("--future-predicted-start-step must be <= --future-mixed-start-step")
-    if not (0.0 <= args.future_mix_ratio <= 1.0):
-        raise ValueError("--future-mix-ratio must be in [0, 1]")
-    if args.future_noise_min_cos <= 0.0 or args.future_noise_max_cos > 1.0 or args.future_noise_min_cos > args.future_noise_max_cos:
-        raise ValueError("--future-noise-min-cos/--future-noise-max-cos must satisfy 0 < min <= max <= 1")
-    if args.future_latent_mode in ("predicted", "mixed") and args.future_naz_checkpoint is None:
-        raise ValueError("--future-latent-mode predicted/mixed requires --future-naz-checkpoint")
+    if args.context_aug_max_units < 0:
+        raise ValueError("--context-aug-max-units must be >= 0")
+    if args.context_aug_max_units > 0 and args.context_aug_stride <= 0:
+        raise ValueError("--context-aug-stride must be > 0 when context augmentation is enabled")
 
 
 def sync_writer_runtime_config(model: Dil, config: DilConfig) -> None:
     model.writer.gradient_checkpointing = config.writer_gradient_checkpointing
-
-
-def load_future_predictor(checkpoint_dir: Path | None, device: torch.device) -> Naz | None:
-    if checkpoint_dir is None:
-        return None
-    from dilnaz.models.naz import Naz, NazConfig
-
-    config = NazConfig.from_pretrained(checkpoint_dir)
-    model = Naz(config).to(device)
-    checkpoint = load_checkpoint(checkpoint_dir / "checkpoint.pt", device)
-    model.load_trainable_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad = False
-    return model
 
 
 def main():
@@ -736,28 +553,15 @@ def main():
     cuda_prefetch = bool(device.type == "cuda" and not args.no_cuda_prefetch)
 
     model, config, checkpoint = load_model_checkpoint(args.checkpoint, device)
-    if args.window_size > config.writer_max_window_size:
-        raise ValueError("--window-size must be <= config.writer_max_window_size")
-    config.writer_sliding_window_size = args.window_size
-    config.writer_left_frozen = args.left_frozen
-    config.writer_active_size = args.active_size
-    config.writer_right_guard = args.right_guard
-    config.writer_stride = args.stride
-    config.writer_right_guard_loss_weight = args.right_guard_loss_weight
-    config.writer_left_consistency_weight = args.left_consistency_weight
-    config.writer_use_zone_noise = not args.disable_zone_noise
     config.writer_gradient_checkpointing = bool(args.writer_gradient_checkpointing)
-    config.writer_future_noise_min_cos = args.future_noise_min_cos
-    config.writer_future_noise_max_cos = args.future_noise_max_cos
-    config.writer_future_noised_start_step = args.future_noised_start_step
-    config.writer_future_predicted_start_step = args.future_predicted_start_step
-    config.writer_future_mixed_start_step = args.future_mixed_start_step
-    config.writer_future_mix_ratio = args.future_mix_ratio
-    config.writer_future_latent_mode = args.future_latent_mode
     sync_writer_runtime_config(model, config)
-    future_predictor = load_future_predictor(args.future_naz_checkpoint, device)
     tokenizer_vocab_path = args.checkpoint.parent / config.tokenizer_vocab_file
     tokenizer = load_hybrid_tokenizer(tokenizer_vocab_path)
+    writer_resume = checkpoint.get("training_state", {}).get("objective") == WRITER_OBJECTIVE
+    if not writer_resume:
+        fresh_model = Dil(config).to(device)
+        model.writer.load_state_dict(fresh_model.writer.state_dict())
+        del fresh_model
     freeze_for_writer_only(model)
     model.set_compiled_forwards(
         encoder_forward=compile_forward(model.encoder.forward, compile_mode, "DilEncoderCore"),
@@ -775,13 +579,12 @@ def main():
         betas=(args.adam_beta1, args.adam_beta2),
     )
     scheduler = make_scheduler(optimizer, args.learning_rate, args.warmup_steps, args.max_steps)
-    writer_resume = checkpoint.get("training_state", {}).get("objective") == WRITER_OBJECTIVE
     if writer_resume:
         optimizer.load_state_dict(checkpoint["writer_optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["writer_scheduler_state_dict"])
         restore_rng_state(checkpoint["rng_state"])
 
-    train_dataset = HybridDilSlidingWindowDataset(
+    train_dataset = HybridDilUnitWriterDataset(
         args.train_file,
         config,
         tokenizer,
@@ -789,26 +592,20 @@ def main():
         read_chars=args.text_read_chars,
         repeat=True,
         max_samples=args.max_samples,
-        window_size=args.window_size,
-        left_frozen=args.left_frozen,
-        active_size=args.active_size,
-        right_guard=args.right_guard,
-        stride=args.stride,
+        context_aug_max_units=args.context_aug_max_units,
+        context_aug_stride=args.context_aug_stride,
     )
     eval_dataset = None
     if args.eval_every > 0:
-        eval_dataset = HybridDilSlidingWindowDataset(
+        eval_dataset = HybridDilUnitWriterDataset(
             args.eval_file,
             config,
             tokenizer,
             batch_size=args.eval_batch_size,
             read_chars=args.text_read_chars,
             repeat=False,
-            window_size=args.window_size,
-            left_frozen=args.left_frozen,
-            active_size=args.active_size,
-            right_guard=args.right_guard,
-            stride=args.stride,
+            context_aug_max_units=args.context_aug_max_units,
+            context_aug_stride=args.context_aug_stride,
         )
 
     if args.data_mode == "resident":
@@ -843,15 +640,14 @@ def main():
         f"device={device.type} bf16={int(autocast_enabled)} compile_mode={compile_mode} "
         f"data_mode={args.data_mode} objective={WRITER_OBJECTIVE} "
         f"vocab_size={config.vocab_size} latent_size={config.latent_size} hidden_size={config.hidden_size} "
-        f"window={args.window_size} zones={args.left_frozen}|{args.active_size}|{args.right_guard} stride={args.stride} "
-        f"future_latents={int(not args.disable_future_latents)} zone_noise={int(config.writer_use_zone_noise)} "
-        f"future_mode={config.writer_future_latent_mode} future_predictor={int(future_predictor is not None)}",
+        f"unit_local=1 shared_embedding=1 context_aug={args.context_aug_max_units}/{args.context_aug_stride} "
+        f"writer_resume={int(writer_resume)}",
         flush=True,
     )
 
     log_start = time.perf_counter()
     log_tokens = 0
-    log_windows = 0
+    log_units = 0
     log_steps = 0
     log_micro_steps = 0
     data_seconds = 0.0
@@ -889,16 +685,12 @@ def main():
                     metrics = writer_only_metrics(
                         model,
                         batch,
-                        step,
-                        use_future_latents=not args.disable_future_latents,
-                        future_predictor=future_predictor,
-                        future_latent_mode=config.writer_future_latent_mode,
                     )
                     loss = metrics["loss"]
                 (loss / args.gradient_accumulation_steps).backward()
-                real_tokens = int(batch["labels"].label_mask.sum().detach().cpu())
+                real_tokens, real_units = writer_unit_counts(batch["writer_labels"])
                 log_tokens += real_tokens
-                log_windows += int(batch["labels"].true_lengths.gt(0).sum().detach().cpu())
+                log_units += real_units
                 log_micro_steps += 1
                 if "source_line_ids" in batch:
                     source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
@@ -922,7 +714,7 @@ def main():
                 averaged["data_seconds"] = data_seconds / max(log_steps, 1)
                 averaged["compute_seconds"] = compute_seconds / max(log_steps, 1)
                 averaged["tokens_per_second"] = log_tokens / elapsed
-                averaged["windows_per_second"] = log_windows / elapsed
+                averaged["units_per_second"] = log_units / elapsed
                 averaged["steps_per_second"] = log_steps / elapsed
                 if source_lines_seen:
                     averaged["source_lines_seen"] = len(source_lines_seen)
@@ -936,17 +728,13 @@ def main():
                             autocast_enabled,
                             cuda_prefetch,
                             args.max_eval_batches,
-                            not args.disable_future_latents,
-                            future_predictor,
-                            config.writer_future_latent_mode,
-                            tokenizer=tokenizer,
                         )
                     )
                 print(format_log(step, averaged), flush=True)
                 last_metrics = averaged
                 log_start = time.perf_counter()
                 log_tokens = 0
-                log_windows = 0
+                log_units = 0
                 log_steps = 0
                 log_micro_steps = 0
                 data_seconds = 0.0

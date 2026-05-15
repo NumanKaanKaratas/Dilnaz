@@ -34,12 +34,12 @@ class DilPackedSurfaceStem(nn.Module):
 
 
 class DilEncoderCore(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, token_embeddings: nn.Embedding):
         super().__init__()
         self.latent_size = config.latent_size
         self.max_sequence_units = config.max_sequence_units
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        object.__setattr__(self, "embed_tokens", token_embeddings)
         self.surface_stem = DilPackedSurfaceStem(config)
         self.pool_norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pool_score = nn.Linear(config.hidden_size, 1, bias=False)
