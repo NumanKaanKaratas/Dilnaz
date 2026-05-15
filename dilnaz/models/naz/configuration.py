@@ -50,16 +50,12 @@ class NazConfig(PretrainedConfig):
         rms_norm_eps=1e-6,
         use_cache=True,
         bos_token_id=1,
-        pretraining_tp=1,
         tie_word_embeddings=False,
         rope_theta=10000000.0,
-        rope_scaling=None,
-        attention_bias=False,
         attention_dropout=0.0,
-        mlp_bias=False,
         **kwargs,
     ):
-        if ("max_" + "word_bytes") in kwargs:
+        if "max_word_bytes" in kwargs:
             raise ValueError("fixed-width surface config is not supported by Naz")
         self.dil_path = dil_path
         self.byte_vocab_size = byte_vocab_size
@@ -112,13 +108,9 @@ class NazConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
-        self.pretraining_tp = pretraining_tp
         self.tie_word_embeddings = tie_word_embeddings
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.mlp_bias = mlp_bias
 
         super().__init__(
             pad_token_id=pad_token_id,

@@ -29,12 +29,11 @@ class DilConfig(PretrainedConfig):
         encoder_partial_rotary_factor=0.5,
         encoder_rope_theta=10000.0,
         encoder_gradient_checkpointing=False,
-        max_sequence_units=1024,
+        max_sequence_units=4096,
         dil_dropout=0.10,
         distillation_weight=16.0,
         mean_geometry_weight=8.0,
         variance_weight=0.05,
-        writer_loss_weight=1.0,
         writer_num_layers=6,
         writer_conv_kernel_size=5,
         writer_conv_expansion=4,
@@ -77,7 +76,7 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=28,
+        checkpoint_format_version=29,
         **kwargs,
     ):
         unsupported_encoder_keys = {"context_left_radius", "context_radius", "context_size", "target_index", "num_encoder_layers"}
@@ -226,7 +225,6 @@ class DilConfig(PretrainedConfig):
         self.distillation_weight = distillation_weight
         self.mean_geometry_weight = mean_geometry_weight
         self.variance_weight = variance_weight
-        self.writer_loss_weight = writer_loss_weight
         self.writer_num_layers = writer_num_layers
         self.writer_conv_kernel_size = writer_conv_kernel_size
         self.writer_conv_expansion = writer_conv_expansion

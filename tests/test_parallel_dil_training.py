@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 
 from dilnaz.models.dil import DilConfig
-from dilnaz.surface import PackedSurface, PackedWriterTarget
+from dilnaz.surface import PackedSurface
 from dilnaz.tokenization import HybridTokenizer
 from dilnaz.train.data.dil_data import trainable_segments
 from dilnaz.train.data.parallel_dil_data import ParallelDilBatchDataset
@@ -53,14 +53,12 @@ def test_parallel_dil_dataset_uses_packed_surface(tmp_path: Path):
     dataset = ParallelDilBatchDataset(data, config, tokenizer, batch_size=2, repeat=False)
     batch = next(dataset.iter_once(worker_id=0, worker_count=1))
     assert isinstance(batch["surface"], PackedSurface)
-    assert isinstance(batch["labels"], PackedWriterTarget)
+    assert "labels" not in batch
+    assert "writer_labels" not in batch
     assert batch["surface"].batch_size == 2
-    assert batch["surface"].unit_count == batch["labels"].query.unit_count
     assert batch["teacher_starts"].shape == batch["surface"].unit_mask.shape
     assert batch["row_batch_indices"].numel() == int(batch["surface"].unit_mask.sum())
-    assert batch["writer_labels"].query.unit_count == config.writer_sliding_window_size
-    assert batch["writer_window_mask"].shape == batch["writer_unit_indices"].shape
-    assert batch["labels"].label_mask.any()
+    assert batch["surface"].unit_mask.any()
 
 
 def test_teacherless_parallel_dataset_uses_packed_surface(tmp_path: Path):
@@ -84,8 +82,8 @@ def test_teacherless_parallel_dataset_uses_packed_surface(tmp_path: Path):
     batch = next(iter(dataset))
     assert isinstance(batch["tr_surface"], PackedSurface)
     assert isinstance(batch["en_surface"], PackedSurface)
-    assert isinstance(batch["tr_labels"], PackedWriterTarget)
-    assert isinstance(batch["en_labels"], PackedWriterTarget)
+    assert "tr_labels" not in batch
+    assert "en_labels" not in batch
     assert batch["tr_unit_mask"].dtype == torch.bool
     assert batch["en_unit_mask"].dtype == torch.bool
 

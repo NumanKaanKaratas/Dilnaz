@@ -21,8 +21,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 28:
-            raise ValueError("DIL sequence semantic encoder checkpoints require checkpoint_format_version=28")
+        if config.checkpoint_format_version != 29:
+            raise ValueError("DIL sequence semantic encoder checkpoints require checkpoint_format_version=29")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
@@ -40,8 +40,6 @@ class Dil(PreTrainedModel):
         self.distillation_weight = config.distillation_weight
         self.mean_geometry_weight = config.mean_geometry_weight
         self.variance_weight = config.variance_weight
-        self.writer_loss_weight = config.writer_loss_weight
-
         self.post_init()
 
     def _init_weights(self, module):
@@ -234,7 +232,7 @@ class Dil(PreTrainedModel):
         self,
         semantic: torch.Tensor,
         target: PackedWriterTarget,
-        training_step: int | None = None,
+        training_step: int | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target = target.to(semantic.device)
         semantic = self.writer_training_semantic(semantic, training_step)
@@ -329,7 +327,6 @@ class Dil(PreTrainedModel):
     def forward(
         self,
         surface: PackedSurface,
-        labels: Optional[PackedWriterTarget] = None,
         teacher_layers: Optional[torch.Tensor] = None,
         teacher_mask: Optional[torch.Tensor] = None,
         training_step: Optional[int] = None,
@@ -368,31 +365,12 @@ class Dil(PreTrainedModel):
             )
             loss = loss + distill_loss * self.distillation_weight
 
-        writer_loss = semantic.new_zeros(())
-        byte_acc = semantic.new_zeros(())
-        token_exact = semantic.new_zeros(())
-        writer_token_loss = semantic.new_zeros(())
-        stop_acc = semantic.new_zeros(())
-        if labels is not None and self.writer_loss_weight > 0.0:
-            writer_semantic = semantic.detach()
-            writer_loss, writer_token_loss, byte_acc, token_exact, stop_acc = self.writer_loss_and_metrics(
-                writer_semantic,
-                labels,
-                training_step,
-            )
-            loss = loss + writer_loss * self.writer_loss_weight
-
         return DilOutput(
             loss=loss,
             semantic=semantic,
             distill_loss=distill_loss,
-            writer_loss=writer_loss,
-            writer_token_loss=writer_token_loss,
             mean_geometry_loss=mean_geometry_loss,
             variance_loss=variance_loss,
-            byte_acc=byte_acc,
-            token_exact=token_exact,
-            stop_acc=stop_acc,
         )
 
     @torch.no_grad()

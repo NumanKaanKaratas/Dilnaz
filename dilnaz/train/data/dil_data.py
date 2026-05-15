@@ -12,10 +12,9 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from dilnaz.models.dil import DilConfig
-from dilnaz.surface import pack_token_units, pack_writer_targets
+from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer, TokenSegment, default_vocab_path
 from dilnaz.train.common.runtime import move_to_device
-from dilnaz.train.dil.writer_windows import build_writer_window_view
 
 
 SENTENCE_CHUNK_PATTERN = re.compile(r".+?(?:[.!?]+(?:\s+|$)|\n+|$)", re.UNICODE | re.DOTALL)
@@ -312,9 +311,6 @@ class HybridDilBatchDataset(IterableDataset):
         self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
         self.pad_token_id = config.pad_token_id
-        self.writer_stop_token_id = config.writer_stop_token_id
-        self.writer_bos_token_id = config.writer_bos_token_id
-        self.writer_empty_token_id = config.writer_empty_token_id
         self.batch_size = batch_size
         self.read_chars = read_chars
         self.repeat = repeat
@@ -336,7 +332,6 @@ class HybridDilBatchDataset(IterableDataset):
         size = len(segments_by_text)
         max_units = max(len(segments) for segments in segments_by_text)
         surface_rows: list[list[list[int]]] = []
-        target_rows: list[list[list[int]]] = []
         teacher_text_indices = np.zeros((size, max_units), dtype=np.int64)
         teacher_starts = np.zeros((size, max_units), dtype=np.int64)
         teacher_ends = np.zeros((size, max_units), dtype=np.int64)
@@ -346,21 +341,17 @@ class HybridDilBatchDataset(IterableDataset):
         for row_idx, segments in enumerate(segments_by_text):
             source_line_ids[row_idx] = line_ids[row_idx]
             surface_row: list[list[int]] = []
-            target_row: list[list[int]] = []
             for unit_idx in range(max_units):
                 if unit_idx >= len(segments):
                     surface_row.append([])
-                    target_row.append([])
                     continue
                 segment = segments[unit_idx]
                 surface_row.append(segment_piece_ids(segment))
-                target_row.append(segment_piece_ids(segment))
                 teacher_text_indices[row_idx, unit_idx] = row_idx
                 teacher_starts[row_idx, unit_idx] = segment.start
                 teacher_ends[row_idx, unit_idx] = segment.end
                 teacher_distill_mask[row_idx, unit_idx] = teacher_distill_segment(segment)
             surface_rows.append(surface_row)
-            target_rows.append(target_row)
 
         return {
             "surface": pack_token_units(
@@ -369,22 +360,12 @@ class HybridDilBatchDataset(IterableDataset):
                 bucket_sizes=self.surface_bucket_sizes,
                 max_pieces_per_unit=self.max_surface_pieces_per_unit,
             ),
-            "labels": pack_writer_targets(
-                target_rows,
-                pad_token_id=self.pad_token_id,
-                stop_token_id=self.writer_stop_token_id,
-                bos_token_id=self.writer_bos_token_id,
-                empty_token_id=self.writer_empty_token_id,
-                surface_bucket_sizes=self.surface_bucket_sizes,
-                max_pieces_per_unit=self.max_surface_pieces_per_unit,
-            ),
             "teacher_texts": texts,
             "teacher_text_indices": torch.from_numpy(teacher_text_indices),
             "teacher_starts": torch.from_numpy(teacher_starts),
             "teacher_ends": torch.from_numpy(teacher_ends),
             "teacher_distill_mask": torch.from_numpy(teacher_distill_mask),
             "source_line_ids": torch.from_numpy(source_line_ids),
-            **build_writer_window_view(target_rows, self.config),
         }
 
     def iter_once(self, worker_id: int, worker_count: int):
@@ -512,104 +493,6 @@ class ResidentDilBatcher:
             device=self.device,
         ).item()
         return self.batches[int(batch_idx)]
-
-
-class ReadyParquetDilBatchDataset(IterableDataset):
-    def __init__(
-        self,
-        parquet_path: Path,
-        config: DilConfig,
-        batch_size: int,
-        repeat: bool = True,
-        max_samples: int = 0,
-    ):
-        super().__init__()
-        raise ValueError("Dilnaz-ready fixed surface parquet is not supported; regenerate packed surface streaming data")
-        self.parquet_path = parquet_path
-        self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
-        self.teacher_layer_count = len(NLLB_LAYER_GROUPS)
-        self.teacher_dim = 1024
-        self.batch_size = batch_size
-        self.repeat = repeat
-        self.max_samples = max_samples
-        self.columns = list(DILNAZ_READY_REQUIRED_COLUMNS)
-        self._carry: list[dict] = []
-        self._produced = 0
-
-    def rows_from_record_batch(self, record_batch) -> list[dict]:
-        columns = {
-            name: record_batch.column(record_batch.schema.get_field_index(name)).to_pylist()
-            for name in self.columns
-        }
-        return [
-            {name: columns[name][row_idx] for name in self.columns}
-            for row_idx in range(record_batch.num_rows)
-        ]
-
-    def make_batch(self, rows: list[dict]) -> dict:
-        raise ValueError("packed surface parquet batching is not implemented; use streaming data")
-
-    def iter_once(self, worker_id: int, worker_count: int):
-        rows = self._carry
-        self._carry = []
-        parquet = pq.ParquetFile(self.parquet_path)
-        for batch_idx, record_batch in enumerate(
-            parquet.iter_batches(batch_size=self.batch_size, columns=self.columns)
-        ):
-            if batch_idx % worker_count != worker_id:
-                continue
-            for row in self.rows_from_record_batch(record_batch):
-                rows.append(row)
-                self._produced += 1
-                if len(rows) == self.batch_size:
-                    yield self.make_batch(rows)
-                    rows = []
-                if self.max_samples > 0 and self._produced >= self.max_samples:
-                    if rows:
-                        yield self.make_batch(rows)
-                    return
-
-        if rows and not self.repeat:
-            yield self.make_batch(rows)
-        elif rows:
-            self._carry = rows
-
-    def __iter__(self):
-        worker = get_worker_info()
-        worker_id = 0 if worker is None else worker.id
-        worker_count = 1 if worker is None else worker.num_workers
-        while True:
-            yielded = False
-            for batch in self.iter_once(worker_id, worker_count):
-                yielded = True
-                yield batch
-            if not yielded and not self._carry:
-                raise ValueError(f"{self.parquet_path} produced no Dilnaz-ready rows")
-            if not self.repeat:
-                return
-
-
-class ResidentReadyParquetBatcher(ResidentDilBatcher):
-    @classmethod
-    def from_dataset(
-        cls,
-        dataset: ReadyParquetDilBatchDataset,
-        batch_size: int,
-        device: torch.device,
-        seed: int,
-    ) -> "ResidentReadyParquetBatcher":
-        batches = [
-            {key: value.detach().cpu() for key, value in batch.items()}
-            for batch in dataset.iter_once(worker_id=0, worker_count=1)
-        ]
-        if dataset._carry:
-            batches.append(
-                {
-                    key: value.detach().cpu()
-                    for key, value in dataset.make_batch(dataset._carry).items()
-                }
-            )
-        return cls(batches, batch_size=batch_size, device=device, seed=seed)
 
 
 class ResidentDilEvalLoader:

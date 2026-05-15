@@ -14,7 +14,7 @@ from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
-CHECKPOINT_FORMAT_VERSION = 28
+CHECKPOINT_FORMAT_VERSION = 29
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -126,13 +126,9 @@ def encode_tokens(model: Dil, surface):
 
 @torch.no_grad()
 def decode_tokens(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor) -> list[str]:
-    generation = model.decode_semantic(latents.unsqueeze(0))
-    token_ids = generation.token_ids[0] if generation.token_ids.dim() == 3 else generation.token_ids
-    token_mask = generation.token_mask[0] if generation.token_mask.dim() == 3 else generation.token_mask
-    return [
-        tokenizer.decode([int(token_id) for token_id, keep in zip(row.tolist(), mask.tolist()) if keep])
-        for row, mask in zip(token_ids, token_mask)
-    ]
+    from dilnaz.train.interface.writer_render import render_latents_with_sliding_writer
+
+    return render_latents_with_sliding_writer(model, tokenizer, latents)
 
 
 def similarity_matrix(latents: torch.Tensor) -> list[list[float]]:

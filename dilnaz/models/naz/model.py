@@ -363,28 +363,34 @@ class Naz(PreTrainedModel):
         min_new_tokens: Optional[int] = None,
         repetition_cos_threshold: Optional[float] = None,
     ) -> NazGenerationOutput:
-        unit_mask = surface.unit_mask if unit_mask is None else unit_mask
-        prompt_model_latents = self.encode_sequence_latents(
-            surface,
-            unit_mask,
-        )
-        generated = [
-            step.latent
-            for step in self._generate_stream_from_semantic_states(
-                semantic_states=prompt_model_latents,
-                unit_mask=unit_mask,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                repetition_cos_threshold=repetition_cos_threshold,
+        was_training = self.training
+        self.eval()
+        try:
+            unit_mask = surface.unit_mask if unit_mask is None else unit_mask
+            prompt_model_latents = self.encode_sequence_latents(
+                surface,
+                unit_mask,
             )
-        ]
-        prompt_latents = prompt_model_latents
-        generated_latents = torch.stack(generated, dim=1) if generated else prompt_latents.new_empty(
-            prompt_latents.shape[0],
-            0,
-            prompt_latents.shape[-1],
-        )
-        return NazGenerationOutput(prompt_latents=prompt_latents, generated_latents=generated_latents)
+            generated = [
+                step.latent
+                for step in self._generate_stream_from_semantic_states(
+                    semantic_states=prompt_model_latents,
+                    unit_mask=unit_mask,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
+                    repetition_cos_threshold=repetition_cos_threshold,
+                )
+            ]
+            prompt_latents = prompt_model_latents
+            generated_latents = torch.stack(generated, dim=1) if generated else prompt_latents.new_empty(
+                prompt_latents.shape[0],
+                0,
+                prompt_latents.shape[-1],
+            )
+            return NazGenerationOutput(prompt_latents=prompt_latents, generated_latents=generated_latents)
+        finally:
+            if was_training:
+                self.train()
 
     def _generate_stream_from_semantic_states(
         self,
@@ -444,27 +450,32 @@ class Naz(PreTrainedModel):
         repetition_cos_threshold: Optional[float] = None,
         prompt_latents: Optional[torch.Tensor] = None,
     ):
+        was_training = self.training
         self.eval()
-        if max_new_tokens <= 0:
-            raise ValueError("max_new_tokens must be > 0")
-        unit_mask = surface.unit_mask if unit_mask is None else unit_mask.to(surface.ids.device, dtype=torch.bool)
-        if unit_mask.shape != surface.unit_lengths.shape:
-            raise ValueError("unit_mask must be shaped [batch, units]")
-        if not bool(unit_mask.all().detach().cpu()):
-            raise ValueError("Naz.generate_stream expects packed prompts without unit padding")
-        if prompt_latents is not None:
-            if prompt_latents.dim() != 3 or prompt_latents.shape[:2] != unit_mask.shape:
-                raise ValueError("prompt_latents must be shaped [batch, units, latent_size]")
-            if prompt_latents.shape[-1] != self.config.latent_size:
-                raise ValueError("prompt_latents last dimension must equal config.latent_size")
-            semantic_states = prompt_latents
-        else:
-            semantic_states = self.encode_sequence_latents(surface, unit_mask)
+        try:
+            if max_new_tokens <= 0:
+                raise ValueError("max_new_tokens must be > 0")
+            unit_mask = surface.unit_mask if unit_mask is None else unit_mask.to(surface.ids.device, dtype=torch.bool)
+            if unit_mask.shape != surface.unit_lengths.shape:
+                raise ValueError("unit_mask must be shaped [batch, units]")
+            if not bool(unit_mask.all().detach().cpu()):
+                raise ValueError("Naz.generate_stream expects packed prompts without unit padding")
+            if prompt_latents is not None:
+                if prompt_latents.dim() != 3 or prompt_latents.shape[:2] != unit_mask.shape:
+                    raise ValueError("prompt_latents must be shaped [batch, units, latent_size]")
+                if prompt_latents.shape[-1] != self.config.latent_size:
+                    raise ValueError("prompt_latents last dimension must equal config.latent_size")
+                semantic_states = prompt_latents
+            else:
+                semantic_states = self.encode_sequence_latents(surface, unit_mask)
 
-        yield from self._generate_stream_from_semantic_states(
-            semantic_states=semantic_states,
-            unit_mask=unit_mask,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=min_new_tokens,
-            repetition_cos_threshold=repetition_cos_threshold,
-        )
+            yield from self._generate_stream_from_semantic_states(
+                semantic_states=semantic_states,
+                unit_mask=unit_mask,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                repetition_cos_threshold=repetition_cos_threshold,
+            )
+        finally:
+            if was_training:
+                self.train()

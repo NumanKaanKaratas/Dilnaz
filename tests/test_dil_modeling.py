@@ -7,6 +7,7 @@ import torch
 from dilnaz.models.dil import Dil, DilConfig
 from dilnaz.models.dil.writer import DilWriterOutput
 from dilnaz.surface import pack_token_units, pack_writer_targets
+from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
 
 
 def tiny_config() -> DilConfig:
@@ -38,6 +39,10 @@ def tiny_config() -> DilConfig:
         writer_right_guard=1,
         writer_stride=3,
     )
+
+
+def test_dil_config_sequence_limit_matches_training_default():
+    assert DilConfig().max_sequence_units == DIL_MODEL_DEFAULTS["max_sequence_units"]
 
 
 def make_writer_target(cfg: DilConfig, rows):

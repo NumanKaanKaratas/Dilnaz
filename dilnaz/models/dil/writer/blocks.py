@@ -31,15 +31,15 @@ class DilPackedCausalDepthwiseConv(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, unit_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         batch_size, surface_width, hidden_size = hidden_states.shape
-        positions = torch.arange(surface_width, device=hidden_states.device)
-        output = hidden_states.new_zeros(hidden_states.shape)
-        for kernel_idx, offset in enumerate(range(1 - self.kernel_size, 1)):
-            source_positions = (positions + offset).clamp(0, surface_width - 1)
-            in_bounds = (positions + offset).ge(0) & (positions + offset).lt(surface_width)
-            source = hidden_states.index_select(1, source_positions)
-            source_mask = mask.index_select(1, source_positions)
-            same_unit = unit_ids.eq(unit_ids.index_select(1, source_positions)) & in_bounds.view(1, -1) & mask & source_mask
-            output = output + source * same_unit.unsqueeze(-1).to(hidden_states.dtype) * self.weight[:, kernel_idx].view(1, 1, hidden_size)
+        device = hidden_states.device
+        positions = torch.arange(surface_width, device=device)
+        offsets = torch.arange(1 - self.kernel_size, 1, device=device)
+        neighbor_pos = (positions.unsqueeze(0) + offsets.unsqueeze(1)).clamp(0, surface_width - 1)
+        in_bounds = (positions.unsqueeze(0) + offsets.unsqueeze(1)).ge(0) & (positions.unsqueeze(0) + offsets.unsqueeze(1)).lt(surface_width)
+        hidden_expanded = hidden_states[:, neighbor_pos]
+        same_unit = unit_ids[:, neighbor_pos].eq(unit_ids.unsqueeze(1)) & in_bounds.unsqueeze(0) & mask[:, neighbor_pos] & mask.unsqueeze(1)
+        weight_view = self.weight.T.view(1, self.kernel_size, 1, hidden_size)
+        output = (hidden_expanded * same_unit.unsqueeze(-1).to(hidden_states.dtype) * weight_view).sum(dim=1)
         if self.bias is not None:
             output = output + self.bias.view(1, 1, hidden_size)
         return output * mask.unsqueeze(-1).to(output.dtype)

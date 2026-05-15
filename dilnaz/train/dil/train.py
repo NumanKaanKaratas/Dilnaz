@@ -35,10 +35,7 @@ from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
-from dilnaz.train.dil.writer_windows import gather_writer_semantic, writer_window_counts
-
-
-CHECKPOINT_FORMAT_VERSION = 28
+CHECKPOINT_FORMAT_VERSION = 29
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -101,7 +98,6 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "encoder_context_layers": config.encoder_context_layers,
         "latent_size": config.latent_size,
         "distillation_weight": config.distillation_weight,
-        "writer_loss_weight": config.writer_loss_weight,
     }
 
 
@@ -119,6 +115,7 @@ def runtime_training_state(args) -> dict:
         "adam_beta1": args.adam_beta1,
         "adam_beta2": args.adam_beta2,
         "warmup_steps": args.warmup_steps,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "max_grad_norm": args.max_grad_norm,
         "log_every": args.log_every,
         "checkpoint_every": args.checkpoint_every,
@@ -152,6 +149,9 @@ def save_checkpoint(
     state = json_training_state(config, step, metrics, compile_mode)
     if runtime is not None:
         state["runtime"] = runtime
+    import os as _os
+
+    tmp_path = checkpoint_dir / "checkpoint.pt.tmp"
     torch.save(
         {
             "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -161,8 +161,9 @@ def save_checkpoint(
             "training_state": state,
             "rng_state": rng_state(),
         },
-        checkpoint_dir / "checkpoint.pt",
+        tmp_path,
     )
+    _os.replace(str(tmp_path), str(checkpoint_dir / "checkpoint.pt"))
     with (checkpoint_dir / "training_state.json").open("w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=2)
     return checkpoint_dir
@@ -193,30 +194,10 @@ def model_inputs(batch: dict) -> dict:
     }
 
 
-def apply_writer_window_loss(model: Dil, outputs, batch: dict, training_step: int | None):
-    if model.config.writer_loss_weight <= 0.0 or "writer_labels" not in batch:
-        return outputs
-    writer_window_mask = batch["writer_window_mask"].to(outputs.semantic.device, dtype=torch.bool)
-    writer_semantic = gather_writer_semantic(
-        outputs.semantic.detach(),
-        batch["writer_source_rows"],
-        batch["writer_unit_indices"],
-        writer_window_mask,
-    )
-    writer_loss, writer_token_loss, byte_acc, token_exact, stop_acc = model.writer_transition_loss_and_metrics(
-        writer_semantic,
-        batch["writer_labels"],
-        batch["writer_zone_ids"],
-        writer_window_mask,
-        training_step=training_step,
-    )
-    outputs.loss = outputs.loss + writer_loss * model.config.writer_loss_weight
-    outputs.writer_loss = writer_loss
-    outputs.writer_token_loss = writer_token_loss
-    outputs.byte_acc = byte_acc
-    outputs.token_exact = token_exact
-    outputs.stop_acc = stop_acc
-    return outputs
+def freeze_writer_for_encoder_training(model: Dil) -> None:
+    model.writer.eval()
+    for param in model.writer.parameters():
+        param.requires_grad_(False)
 
 
 class AsyncTeacherIterator:
@@ -246,13 +227,8 @@ def empty_metric_sums() -> dict:
     return {
         "loss": 0.0,
         "distill": 0.0,
-        "writer": 0.0,
-        "writer_token": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
-        "byte_acc": 0.0,
-        "token_exact": 0.0,
-        "stop_acc": 0.0,
         "batches": 0,
         "source_line_ids": set(),
     }
@@ -261,13 +237,8 @@ def empty_metric_sums() -> dict:
 def accumulate_output_metrics(total: dict, outputs, batch: dict) -> None:
     total["loss"] += float(outputs.loss.detach().cpu())
     total["distill"] += float(outputs.distill_loss.detach().cpu())
-    total["writer"] += float(outputs.writer_loss.detach().cpu())
-    total["writer_token"] += float(outputs.writer_token_loss.detach().cpu())
     total["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     total["var"] += float(outputs.variance_loss.detach().cpu())
-    total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
-    total["token_exact"] += float(outputs.token_exact.detach().cpu())
-    total["stop_acc"] += float(outputs.stop_acc.detach().cpu())
     total["batches"] += 1
     if "source_line_ids" in batch:
         total["source_line_ids"].update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
@@ -290,13 +261,8 @@ def format_log(step, metrics):
         f"step={step}",
         f"loss={metrics['loss']:.4f}",
         f"distill={metrics['distill']:.4f}",
-        f"writer={metrics['writer']:.4f}",
-        f"writer_tok={metrics['writer_token']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
-        f"byte_acc={metrics['byte_acc']:.4f}",
-        f"token_exact={metrics['token_exact']:.4f}",
-        f"stop_acc={metrics['stop_acc']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -338,6 +304,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--adam-beta1", type=float, default=DIL_TRAIN_DEFAULTS["adam_beta1"])
     parser.add_argument("--adam-beta2", type=float, default=DIL_TRAIN_DEFAULTS["adam_beta2"])
     parser.add_argument("--warmup-steps", type=int, default=DIL_TRAIN_DEFAULTS["warmup_steps"])
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=DIL_TRAIN_DEFAULTS["gradient_accumulation_steps"])
     parser.add_argument("--max-grad-norm", type=float, default=DIL_TRAIN_DEFAULTS["max_grad_norm"])
     parser.add_argument("--log-every", type=int, default=DIL_TRAIN_DEFAULTS["log_every"])
     parser.add_argument("--checkpoint-every", type=int, default=DIL_TRAIN_DEFAULTS["checkpoint_every"])
@@ -358,7 +325,6 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
-    parser.add_argument("--writer-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["writer_loss_weight"])
     parser.add_argument("--writer-num-layers", type=int, default=DIL_MODEL_DEFAULTS["writer_num_layers"])
     parser.add_argument("--writer-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_kernel_size"])
     parser.add_argument("--writer-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_expansion"])
@@ -385,8 +351,6 @@ def validate_args(args):
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
         raise ValueError("--byte-conv-expansion must be > 0")
-    if args.writer_loss_weight < 0.0:
-        raise ValueError("--writer-loss-weight must be >= 0")
     if args.writer_num_layers < 0:
         raise ValueError("--writer-num-layers must be >= 0")
     if args.writer_conv_kernel_size <= 0 or args.writer_conv_kernel_size % 2 == 0:
@@ -399,6 +363,8 @@ def validate_args(args):
         raise ValueError("--num-workers must be >= 0")
     if args.prefetch_factor <= 0:
         raise ValueError("--prefetch-factor must be > 0")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be > 0")
     if args.eval_every < 0 or args.checkpoint_every < 0:
         raise ValueError("--eval-every and --checkpoint-every must be >= 0")
     if args.eval_every > 0 and args.eval_file is None:
@@ -407,11 +373,6 @@ def validate_args(args):
         raise ValueError("--max-eval-batches must be > 0")
     if args.data_mode == "resident" and args.max_samples > 0:
         raise ValueError("--max-samples is not supported with --data-mode resident")
-
-def is_parquet_path(path: Path | None) -> bool:
-    return False
-
-
 def build_config(args, tokenizer):
     if args.resume is not None:
         return DilConfig.from_pretrained(args.resume.parent)
@@ -430,7 +391,7 @@ def build_config(args, tokenizer):
         distillation_weight=args.distillation_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
-        writer_loss_weight=args.writer_loss_weight,
+        max_sequence_units=DIL_MODEL_DEFAULTS["max_sequence_units"],
         writer_num_layers=args.writer_num_layers,
         writer_conv_kernel_size=args.writer_conv_kernel_size,
         writer_conv_expansion=args.writer_conv_expansion,
@@ -451,8 +412,6 @@ class DilBaseTrainer(BaseTrainer):
         self.tokenizer_vocab_path = self.resolve_tokenizer_vocab_path(args)
         self.tokenizer = load_hybrid_tokenizer(self.tokenizer_vocab_path)
         self.config = build_config(args, self.tokenizer)
-        self.train_is_parquet = is_parquet_path(args.train_file)
-        self.eval_is_parquet = is_parquet_path(args.eval_file)
         self.validate_data_contracts()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.type == "cuda":
@@ -464,6 +423,7 @@ class DilBaseTrainer(BaseTrainer):
         self.cuda_prefetch = bool(self.device.type == "cuda" and not args.no_cuda_prefetch)
         self.model = Dil(self.config).to(self.device)
         self.model.train()
+        freeze_writer_for_encoder_training(self.model)
         self.optimizer = AdamW(
             self.optimizer_param_groups(args.weight_decay),
             lr=args.learning_rate,
@@ -481,8 +441,6 @@ class DilBaseTrainer(BaseTrainer):
             )
         self.model.set_compiled_forwards(
             encoder_forward=compile_forward(self.model.encoder.forward, self.compile_mode, "DilEncoderCore"),
-            writer_forward=compile_forward(self.model.writer.forward, self.compile_mode, "DilConditionalWriter"),
-            transition_forward=compile_forward(self.model.writer.transition, self.compile_mode, "DilConditionalWriterTransition"),
         )
         self.train_iterator = None
         self.eval_loader = None
@@ -502,9 +460,6 @@ class DilBaseTrainer(BaseTrainer):
             raise ValueError("fixed surface parquet caches are not part of the packed surface training contract")
 
     def build_teacher(self):
-        needs_online_teacher = not self.train_is_parquet or (self.args.eval_file is not None and not self.eval_is_parquet)
-        if not needs_online_teacher:
-            return None
         return NllbTeacher(
             self.config.nllb_model_name,
             self.config.nllb_src_lang,
@@ -579,16 +534,13 @@ class DilBaseTrainer(BaseTrainer):
             prefetch_factor=self.args.prefetch_factor,
         )
         train_prefetcher = DeviceBatchPrefetcher(train_loader, self.device, self.cuda_prefetch)
-        if self.train_is_parquet:
-            self.train_iterator = train_prefetcher
-        else:
-            self.batch_source = AsyncTeacherBatchSource(
-                train_prefetcher,
-                self.teacher,
-                self.device,
-                self.args.max_batch_reuse,
-            )
-            self.train_iterator = AsyncTeacherIterator(self.batch_source)
+        self.batch_source = AsyncTeacherBatchSource(
+            train_prefetcher,
+            self.teacher,
+            self.device,
+            self.args.max_batch_reuse,
+        )
+        self.train_iterator = AsyncTeacherIterator(self.batch_source)
         if eval_dataset is not None:
             self.eval_loader = make_dil_batch_loader(
                 eval_dataset,
@@ -632,12 +584,12 @@ class DilBaseTrainer(BaseTrainer):
         model_batch = model_inputs(batch)
         if training_step is not None:
             model_batch["training_step"] = training_step
-        outputs = self.model(**model_batch)
-        return apply_writer_window_loss(self.model, outputs, batch, training_step)
+        return self.model(**model_batch)
 
     def train_step(self, batch: dict, step: int) -> StepResult:
         outputs = self.forward_batch(batch, step)
-        token_count, window_count = writer_window_counts(batch["writer_labels"])
+        token_count = int(batch["surface"].mask.sum().detach().cpu())
+        window_count = int(batch["surface"].unit_mask.sum().detach().cpu())
         return StepResult(
             loss=outputs.loss,
             outputs=outputs,
@@ -649,7 +601,8 @@ class DilBaseTrainer(BaseTrainer):
     def eval_step(self, batch: dict) -> StepResult:
         self.materialize_eval_teacher(batch)
         outputs = self.forward_batch(batch, None)
-        token_count, window_count = writer_window_counts(batch["writer_labels"])
+        token_count = int(batch["surface"].mask.sum().detach().cpu())
+        window_count = int(batch["surface"].unit_mask.sum().detach().cpu())
         return StepResult(
             loss=outputs.loss,
             outputs=outputs,
@@ -686,8 +639,7 @@ class DilBaseTrainer(BaseTrainer):
     def run(self) -> None:
         print(
             f"device={self.device.type} bf16={int(self.autocast_enabled)} compile_mode={self.compile_mode} "
-            f"data_mode={self.args.data_mode} resume_step={self.start_step} "
-            f"teacher_source={'parquet nllb=disabled' if self.train_is_parquet else 'online_nllb'} "
+            f"data_mode={self.args.data_mode} resume_step={self.start_step} teacher_source=online_nllb "
             f"vocab_size={self.config.vocab_size} latent_size={self.config.latent_size} "
             f"hidden_size={self.config.hidden_size}",
             flush=True,

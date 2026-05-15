@@ -163,23 +163,31 @@ class BaseTrainer:
         data_seconds = 0.0
         transfer_seconds = 0.0
         compute_seconds = 0.0
+        accumulation_steps = int(getattr(self.args, "gradient_accumulation_steps", 1))
+        if accumulation_steps <= 0:
+            raise ValueError("gradient_accumulation_steps must be > 0")
 
         try:
             for step in range(self.start_step + 1, self.args.max_steps + 1):
-                batch = next(train_iterator)
-                data_seconds += train_iterator.last_data_seconds
-                transfer_seconds += train_iterator.last_transfer_seconds
-
                 sync_timing = bool(getattr(self.args, "sync_timing", False))
                 if sync_timing:
                     cuda_sync(self.device)
                 compute_start = time.perf_counter()
                 self.optimizer.zero_grad(set_to_none=True)
-                cudagraph_step_begin(self.device, self.compile_mode)
-                with autocast_context(self.autocast_enabled):
-                    result = self.train_step(batch, step)
+                for _ in range(accumulation_steps):
+                    batch = next(train_iterator)
+                    data_seconds += train_iterator.last_data_seconds
+                    transfer_seconds += train_iterator.last_transfer_seconds
 
-                result.loss.backward()
+                    cudagraph_step_begin(self.device, self.compile_mode)
+                    with autocast_context(self.autocast_enabled):
+                        result = self.train_step(batch, step)
+
+                    (result.loss / accumulation_steps).backward()
+                    log_tokens += result.token_count
+                    log_windows += result.window_count
+                    self.accumulate_metrics(metric_sums, result)
+
                 torch.nn.utils.clip_grad_norm_(self.trainable_parameters(), self.args.max_grad_norm)
                 self.optimizer.step()
                 self.scheduler.step()
@@ -188,10 +196,7 @@ class BaseTrainer:
                 compute_seconds += time.perf_counter() - compute_start
                 self.completed_step = step
 
-                log_tokens += result.token_count
-                log_windows += result.window_count
                 log_steps += 1
-                self.accumulate_metrics(metric_sums, result)
 
                 should_log = step % self.args.log_every == 0 or step == self.start_step + 1 or step == self.args.max_steps
                 should_eval = self.has_eval() and step % self.args.eval_every == 0

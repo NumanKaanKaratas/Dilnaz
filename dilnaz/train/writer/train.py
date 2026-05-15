@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import random
@@ -35,13 +37,11 @@ from dilnaz.train.data.dil_data import (
 from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_TRAIN_DEFAULTS
 from dilnaz.models.dil import DilConfig
-from dilnaz.models.naz import NazConfig
 from dilnaz.models.dil import Dil, angular_noise_like
-from dilnaz.models.naz import Naz
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 28
+CHECKPOINT_FORMAT_VERSION = 29
 WRITER_OBJECTIVE = "causal_surface_writer_v1"
 WRITER_METRIC_KEYS = (
     "loss",
@@ -300,14 +300,14 @@ def resolve_future_mode(config: DilConfig, training_step: int | None, predictor:
             raise ValueError("--future-latent-mode predicted/mixed requires --future-naz-checkpoint")
         return requested_mode
     if training_step is None:
-        return "true"
+        return "off"
     if predictor is not None and training_step >= config.writer_future_mixed_start_step:
         return "mixed"
     if predictor is not None and training_step >= config.writer_future_predicted_start_step:
         return "predicted"
     if training_step >= config.writer_future_noised_start_step:
         return "noised"
-    return "true"
+    return "off"
 
 
 def build_future_latents(
@@ -512,6 +512,9 @@ def save_checkpoint(
         "writer_future_mix_ratio": config.writer_future_mix_ratio,
         "writer_future_latent_mode": config.writer_future_latent_mode,
     }
+    import os as _os
+
+    tmp_path = checkpoint_dir / "checkpoint.pt.tmp"
     torch.save(
         {
             "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -521,8 +524,9 @@ def save_checkpoint(
             "training_state": training_state,
             "rng_state": rng_state(),
         },
-        checkpoint_dir / "checkpoint.pt",
+        tmp_path,
     )
+    _os.replace(str(tmp_path), str(checkpoint_dir / "checkpoint.pt"))
     with (checkpoint_dir / "training_state.json").open("w", encoding="utf-8") as handle:
         json.dump(training_state, handle, indent=2)
     return checkpoint_dir
@@ -550,6 +554,7 @@ def evaluate(
     use_future_latents: bool,
     future_predictor: Naz | None,
     future_latent_mode: str,
+    tokenizer=None,
 ):
     model.eval()
     model.encoder.eval()
@@ -564,6 +569,7 @@ def evaluate(
                 use_future_latents=use_future_latents,
                 future_predictor=future_predictor,
                 future_latent_mode=future_latent_mode,
+                tokenizer=tokenizer,
             )
         for key in WRITER_METRIC_KEYS:
             total[key] += float(metrics[key].detach().cpu())
@@ -625,6 +631,7 @@ def parse_args():
     parser.add_argument("--adam-beta1", type=float, default=DIL_TRAIN_DEFAULTS["adam_beta1"])
     parser.add_argument("--adam-beta2", type=float, default=DIL_TRAIN_DEFAULTS["adam_beta2"])
     parser.add_argument("--warmup-steps", type=int, default=DIL_TRAIN_DEFAULTS["warmup_steps"])
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=DIL_TRAIN_DEFAULTS["gradient_accumulation_steps"])
     parser.add_argument("--max-grad-norm", type=float, default=DIL_TRAIN_DEFAULTS["max_grad_norm"])
     parser.add_argument("--log-every", type=int, default=DIL_TRAIN_DEFAULTS["log_every"])
     parser.add_argument("--checkpoint-every", type=int, default=DIL_TRAIN_DEFAULTS["checkpoint_every"])
@@ -664,6 +671,8 @@ def validate_args(args):
         raise ValueError("--text-read-chars must be > 0")
     if args.prefetch_factor <= 0:
         raise ValueError("--prefetch-factor must be > 0")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be > 0")
     if args.eval_every < 0 or args.checkpoint_every < 0:
         raise ValueError("--eval-every and --checkpoint-every must be >= 0")
     if args.eval_every > 0 and args.eval_file is None:
@@ -699,6 +708,8 @@ def sync_writer_runtime_config(model: Dil, config: DilConfig) -> None:
 def load_future_predictor(checkpoint_dir: Path | None, device: torch.device) -> Naz | None:
     if checkpoint_dir is None:
         return None
+    from dilnaz.models.naz import Naz, NazConfig
+
     config = NazConfig.from_pretrained(checkpoint_dir)
     model = Naz(config).to(device)
     checkpoint = load_checkpoint(checkpoint_dir / "checkpoint.pt", device)
@@ -764,7 +775,8 @@ def main():
         betas=(args.adam_beta1, args.adam_beta2),
     )
     scheduler = make_scheduler(optimizer, args.learning_rate, args.warmup_steps, args.max_steps)
-    if checkpoint.get("training_state", {}).get("objective") == WRITER_OBJECTIVE:
+    writer_resume = checkpoint.get("training_state", {}).get("objective") == WRITER_OBJECTIVE
+    if writer_resume:
         optimizer.load_state_dict(checkpoint["writer_optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["writer_scheduler_state_dict"])
         restore_rng_state(checkpoint["rng_state"])
@@ -841,12 +853,13 @@ def main():
     log_tokens = 0
     log_windows = 0
     log_steps = 0
+    log_micro_steps = 0
     data_seconds = 0.0
     compute_seconds = 0.0
     source_lines_seen: set[int] = set()
     metric_sums = {key: 0.0 for key in WRITER_METRIC_KEYS}
     last_metrics = {}
-    completed_step = 0
+    completed_step = checkpoint.get("training_state", {}).get("step", 0) if writer_resume else 0
 
     def save_current(checkpoint_name: str = ""):
         return save_checkpoint(
@@ -863,25 +876,34 @@ def main():
         )
 
     try:
-        for step in range(1, args.max_steps + 1):
-            data_start = time.perf_counter()
-            batch = next(train_iter)
-            data_seconds += time.perf_counter() - data_start
-
+        for step in range(completed_step + 1, args.max_steps + 1):
             compute_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
-            cudagraph_step_begin(device, compile_mode)
-            with autocast_context(autocast_enabled):
-                metrics = writer_only_metrics(
-                    model,
-                    batch,
-                    step,
-                    use_future_latents=not args.disable_future_latents,
-                    future_predictor=future_predictor,
-                    future_latent_mode=config.writer_future_latent_mode,
-                )
-                loss = metrics["loss"]
-            loss.backward()
+            for _ in range(args.gradient_accumulation_steps):
+                data_start = time.perf_counter()
+                batch = next(train_iter)
+                data_seconds += time.perf_counter() - data_start
+
+                cudagraph_step_begin(device, compile_mode)
+                with autocast_context(autocast_enabled):
+                    metrics = writer_only_metrics(
+                        model,
+                        batch,
+                        step,
+                        use_future_latents=not args.disable_future_latents,
+                        future_predictor=future_predictor,
+                        future_latent_mode=config.writer_future_latent_mode,
+                    )
+                    loss = metrics["loss"]
+                (loss / args.gradient_accumulation_steps).backward()
+                real_tokens = int(batch["labels"].label_mask.sum().detach().cpu())
+                log_tokens += real_tokens
+                log_windows += int(batch["labels"].true_lengths.gt(0).sum().detach().cpu())
+                log_micro_steps += 1
+                if "source_line_ids" in batch:
+                    source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
+                for key in WRITER_METRIC_KEYS:
+                    metric_sums[key] += float(metrics[key].detach().cpu())
             torch.nn.utils.clip_grad_norm_(model.writer.parameters(), args.max_grad_norm)
             optimizer.step()
             scheduler.step()
@@ -889,20 +911,13 @@ def main():
             compute_seconds += time.perf_counter() - compute_start
             completed_step = step
 
-            real_tokens = int(batch["labels"].label_mask.sum().detach().cpu())
-            log_tokens += real_tokens
-            log_windows += int(batch["labels"].true_lengths.gt(0).sum().detach().cpu())
             log_steps += 1
-            if "source_line_ids" in batch:
-                source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
-            for key in WRITER_METRIC_KEYS:
-                metric_sums[key] += float(metrics[key].detach().cpu())
 
             should_log = step % args.log_every == 0 or step == 1 or step == args.max_steps
             should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0
             if should_log or should_eval:
                 elapsed = max(time.perf_counter() - log_start, 1e-9)
-                averaged = {key: value / max(log_steps, 1) for key, value in metric_sums.items()}
+                averaged = {key: value / max(log_micro_steps, 1) for key, value in metric_sums.items()}
                 averaged["lr"] = scheduler.get_last_lr()[0]
                 averaged["data_seconds"] = data_seconds / max(log_steps, 1)
                 averaged["compute_seconds"] = compute_seconds / max(log_steps, 1)
@@ -924,6 +939,7 @@ def main():
                             not args.disable_future_latents,
                             future_predictor,
                             config.writer_future_latent_mode,
+                            tokenizer=tokenizer,
                         )
                     )
                 print(format_log(step, averaged), flush=True)
@@ -932,6 +948,7 @@ def main():
                 log_tokens = 0
                 log_windows = 0
                 log_steps = 0
+                log_micro_steps = 0
                 data_seconds = 0.0
                 compute_seconds = 0.0
                 for key in metric_sums:

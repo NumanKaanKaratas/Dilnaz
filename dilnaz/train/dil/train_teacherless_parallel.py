@@ -21,13 +21,12 @@ from dilnaz.train.common.runtime import (
     validate_compile_environment,
 )
 from dilnaz.train.data.dil_data import load_hybrid_tokenizer, make_dil_batch_loader, segment_piece_ids, trainable_segments
-from dilnaz.surface import pack_token_units, pack_writer_targets
+from dilnaz.surface import pack_token_units
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import HybridTokenizer, TokenSegment, default_vocab_path
-from dilnaz.train.dil.train import is_dataloader_worker_exit, restore_checkpoint, save_checkpoint
-from dilnaz.train.dil.writer_windows import build_writer_window_view, gather_writer_semantic
+from dilnaz.train.dil.train import freeze_writer_for_encoder_training, is_dataloader_worker_exit, restore_checkpoint, save_checkpoint
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
@@ -49,16 +48,9 @@ class TokenizedParallelPair:
 class TeacherlessDilOutput:
     loss: torch.Tensor
     sentence_loss: torch.Tensor
-    writer_loss: torch.Tensor
-    writer_token_loss: torch.Tensor
     variance_loss: torch.Tensor
-    token_set_loss: torch.Tensor
     token_balance_loss: torch.Tensor
     covariance_loss: torch.Tensor
-    byte_acc: torch.Tensor
-    token_exact: torch.Tensor
-    stop_acc: torch.Tensor
-    token_set_weight: float
     token_balance_weight: float
     covariance_weight: float
 
@@ -104,9 +96,6 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
         self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
         self.pad_token_id = config.pad_token_id
-        self.writer_stop_token_id = config.writer_stop_token_id
-        self.writer_bos_token_id = config.writer_bos_token_id
-        self.writer_empty_token_id = config.writer_empty_token_id
         self.batch_size = batch_size
         self.max_segments = max_segments
         self.min_segments = min_segments
@@ -165,7 +154,6 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
                 target_row.append(pieces)
             surface_rows.append(surface_row)
             target_rows.append(target_row)
-        writer_view = build_writer_window_view(target_rows, self.config)
         return {
             f"{prefix}_surface": pack_token_units(
                 surface_rows,
@@ -173,22 +161,8 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
                 bucket_sizes=self.surface_bucket_sizes,
                 max_pieces_per_unit=self.max_surface_pieces_per_unit,
             ),
-            f"{prefix}_labels": pack_writer_targets(
-                target_rows,
-                pad_token_id=self.pad_token_id,
-                stop_token_id=self.writer_stop_token_id,
-                bos_token_id=self.writer_bos_token_id,
-                empty_token_id=self.writer_empty_token_id,
-                surface_bucket_sizes=self.surface_bucket_sizes,
-                max_pieces_per_unit=self.max_surface_pieces_per_unit,
-            ),
             f"{prefix}_unit_mask": unit_mask,
             f"{prefix}_segment_counts": segment_counts,
-            f"{prefix}_writer_labels": writer_view["writer_labels"],
-            f"{prefix}_writer_source_rows": writer_view["writer_source_rows"],
-            f"{prefix}_writer_unit_indices": writer_view["writer_unit_indices"],
-            f"{prefix}_writer_zone_ids": writer_view["writer_zone_ids"],
-            f"{prefix}_writer_window_mask": writer_view["writer_window_mask"],
         }
 
     def fill_side(
@@ -314,72 +288,6 @@ def covariance_regularizer(sentence_latents: torch.Tensor) -> torch.Tensor:
     return covariance.pow(2).sum() / sentence_latents.shape[-1]
 
 
-def valid_label_mask(labels: torch.Tensor, writer_stop_token_id: int, pad_token_id: int, eos_token_id: int) -> torch.Tensor:
-    return (
-        labels.ge(0)
-        & labels.ne(writer_stop_token_id)
-        & labels.ne(pad_token_id)
-        & labels.ne(eos_token_id)
-    )
-
-
-def batch_token_set_targets(
-    labels,
-    writer_stop_token_id: int,
-    pad_token_id: int,
-    eos_token_id: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    labels = labels.labels if hasattr(labels, "labels") else labels
-    flat = labels.reshape(labels.shape[0], -1)
-    valid = valid_label_mask(flat, writer_stop_token_id, pad_token_id, eos_token_id)
-    vocab_ids = torch.unique(flat[valid])
-    targets = torch.zeros((flat.shape[0], vocab_ids.numel()), dtype=torch.float32, device=labels.device)
-    if vocab_ids.numel() == 0:
-        return vocab_ids, targets
-    nonnegative = flat.ge(0)
-    lookup_size = int(flat[nonnegative].max().detach().cpu().item()) + 1
-    lookup = torch.full((lookup_size,), -1, dtype=torch.long, device=labels.device)
-    lookup[vocab_ids] = torch.arange(vocab_ids.numel(), device=labels.device)
-    columns = lookup[flat.clamp_min(0)]
-    rows = torch.arange(flat.shape[0], device=labels.device).unsqueeze(1).expand_as(flat)
-    active = valid & columns.ge(0)
-    targets[rows[active], columns[active]] = 1.0
-    return vocab_ids, targets
-
-
-def balanced_bce_with_logits(logits: torch.Tensor, targets: torch.Tensor, positive_weight: float) -> torch.Tensor:
-    losses = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    positive = targets.bool()
-    negative = ~positive
-    positive_loss = losses[positive].mean() if bool(positive.any()) else logits.new_zeros(())
-    negative_loss = losses[negative].mean() if bool(negative.any()) else logits.new_zeros(())
-    return positive_loss * positive_weight + negative_loss
-
-
-def token_set_bow_loss(
-    source_sentence: torch.Tensor,
-    target_labels: torch.Tensor,
-    token_embedding: torch.Tensor,
-    writer_stop_token_id: int,
-    pad_token_id: int,
-    eos_token_id: int,
-    temperature: float,
-    positive_weight: float,
-) -> torch.Tensor:
-    vocab_ids, targets = batch_token_set_targets(
-        target_labels,
-        writer_stop_token_id,
-        pad_token_id,
-        eos_token_id,
-    )
-    if vocab_ids.numel() == 0:
-        return source_sentence.new_zeros(())
-    source = F.normalize(source_sentence.float(), dim=-1, eps=1e-6)
-    target_embedding = F.normalize(token_embedding.index_select(0, vocab_ids).float(), dim=-1, eps=1e-6)
-    logits = source @ target_embedding.T / temperature
-    return balanced_bce_with_logits(logits, targets, positive_weight)
-
-
 def ramped_weight(step: int, start_step: int, ramp_steps: int, target_weight: float) -> float:
     if target_weight <= 0.0 or step < start_step:
         return 0.0
@@ -405,11 +313,6 @@ def runtime_training_state(args) -> dict:
         "margin": args.margin,
         "teacherless_variance_weight": args.teacherless_variance_weight,
         "variance_target_std": args.variance_target_std,
-        "token_set_loss_weight": args.token_set_loss_weight,
-        "token_set_start_step": args.token_set_start_step,
-        "token_set_ramp_steps": args.token_set_ramp_steps,
-        "token_set_temperature": args.token_set_temperature,
-        "token_set_positive_weight": args.token_set_positive_weight,
         "token_balance_weight": args.token_balance_weight,
         "token_balance_start_step": args.token_balance_start_step,
         "token_balance_ramp_steps": args.token_balance_ramp_steps,
@@ -421,6 +324,7 @@ def runtime_training_state(args) -> dict:
         "adam_beta1": args.adam_beta1,
         "adam_beta2": args.adam_beta2,
         "warmup_steps": args.warmup_steps,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "max_grad_norm": args.max_grad_norm,
         "log_every": args.log_every,
         "checkpoint_every": args.checkpoint_every,
@@ -456,6 +360,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--adam-beta1", type=float, default=DIL_TRAIN_DEFAULTS["adam_beta1"])
     parser.add_argument("--adam-beta2", type=float, default=DIL_TRAIN_DEFAULTS["adam_beta2"])
     parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=DIL_TRAIN_DEFAULTS["gradient_accumulation_steps"])
     parser.add_argument("--max-grad-norm", type=float, default=DIL_TRAIN_DEFAULTS["max_grad_norm"])
     parser.add_argument("--log-every", type=int, default=DIL_TRAIN_DEFAULTS["log_every"])
     parser.add_argument("--checkpoint-every", type=int, default=DIL_TRAIN_DEFAULTS["checkpoint_every"])
@@ -473,7 +378,6 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
     parser.add_argument("--byte-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_expansion"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
-    parser.add_argument("--writer-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["writer_loss_weight"])
     parser.add_argument("--writer-num-layers", type=int, default=DIL_MODEL_DEFAULTS["writer_num_layers"])
     parser.add_argument("--writer-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_kernel_size"])
     parser.add_argument("--writer-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_expansion"])
@@ -483,11 +387,6 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--margin", type=float, default=0.3)
     parser.add_argument("--teacherless-variance-weight", type=float, default=0.5)
     parser.add_argument("--variance-target-std", type=float, default=1.0)
-    parser.add_argument("--token-set-loss-weight", type=float, default=0.5)
-    parser.add_argument("--token-set-start-step", type=int, default=2000)
-    parser.add_argument("--token-set-ramp-steps", type=int, default=1000)
-    parser.add_argument("--token-set-temperature", type=float, default=0.07)
-    parser.add_argument("--token-set-positive-weight", type=float, default=1.0)
     parser.add_argument("--token-balance-weight", type=float, default=0.2)
     parser.add_argument("--token-balance-start-step", type=int, default=2000)
     parser.add_argument("--token-balance-ramp-steps", type=int, default=1000)
@@ -516,8 +415,6 @@ def validate_args(args) -> None:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
         raise ValueError("--byte-conv-expansion must be > 0")
-    if args.writer_loss_weight < 0.0:
-        raise ValueError("--writer-loss-weight must be >= 0")
     if args.writer_num_layers < 0:
         raise ValueError("--writer-num-layers must be >= 0")
     if args.writer_conv_kernel_size <= 0 or args.writer_conv_kernel_size % 2 == 0:
@@ -530,24 +427,23 @@ def validate_args(args) -> None:
         raise ValueError("--num-workers must be >= 0")
     if args.prefetch_factor <= 0:
         raise ValueError("--prefetch-factor must be > 0")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be > 0")
     if args.eval_every < 0 or args.checkpoint_every < 0:
         raise ValueError("--eval-every and --checkpoint-every must be >= 0")
     if args.eval_every > 0 and args.eval_file is None:
         raise ValueError("--eval-file is required when --eval-every > 0")
     if args.max_eval_batches <= 0:
         raise ValueError("--max-eval-batches must be > 0")
-    if args.temperature <= 0.0 or args.token_set_temperature <= 0.0:
-        raise ValueError("contrastive and token-set temperatures must be > 0")
+    if args.temperature <= 0.0:
+        raise ValueError("--temperature must be > 0")
     if min(
         args.sentence_loss_weight,
         args.teacherless_variance_weight,
-        args.token_set_loss_weight,
         args.token_balance_weight,
         args.covariance_weight,
     ) < 0.0:
         raise ValueError("loss weights must be >= 0")
-    if args.token_set_loss_weight > 0.0 and args.latent_size != args.hidden_size and args.resume is None:
-        raise ValueError("token-set BoW uses tied embed_tokens, so --latent-size must equal --hidden-size")
 
 
 def build_config(args, tokenizer: HybridTokenizer) -> DilConfig:
@@ -568,7 +464,7 @@ def build_config(args, tokenizer: HybridTokenizer) -> DilConfig:
         distillation_weight=0.0,
         mean_geometry_weight=0.0,
         variance_weight=0.0,
-        writer_loss_weight=args.writer_loss_weight,
+        max_sequence_units=DIL_MODEL_DEFAULTS["max_sequence_units"],
         writer_num_layers=args.writer_num_layers,
         writer_conv_kernel_size=args.writer_conv_kernel_size,
         writer_conv_expansion=args.writer_conv_expansion,
@@ -592,19 +488,11 @@ def empty_metric_sums() -> dict:
     return {
         "loss": 0.0,
         "sent": 0.0,
-        "writer": 0.0,
-        "writer_tok": 0.0,
         "var": 0.0,
-        "token_set": 0.0,
-        "token_set_w": 0.0,
         "token_balance": 0.0,
         "token_balance_w": 0.0,
         "cov": 0.0,
         "cov_w": 0.0,
-        "byte_acc": 0.0,
-        "token_exact": 0.0,
-        "stop_acc": 0.0,
-        "token_set_weight": 0.0,
         "token_balance_weight": 0.0,
         "covariance_weight": 0.0,
         "batches": 0,
@@ -615,19 +503,11 @@ def empty_metric_sums() -> dict:
 def accumulate_output_metrics(total: dict, outputs: TeacherlessDilOutput, batch: dict) -> None:
     total["loss"] += float(outputs.loss.detach().cpu())
     total["sent"] += float(outputs.sentence_loss.detach().cpu())
-    total["writer"] += float(outputs.writer_loss.detach().cpu())
-    total["writer_tok"] += float(outputs.writer_token_loss.detach().cpu())
     total["var"] += float(outputs.variance_loss.detach().cpu())
-    total["token_set"] += float(outputs.token_set_loss.detach().cpu())
-    total["token_set_w"] += float((outputs.token_set_loss * outputs.token_set_weight).detach().cpu())
     total["token_balance"] += float(outputs.token_balance_loss.detach().cpu())
     total["token_balance_w"] += float((outputs.token_balance_loss * outputs.token_balance_weight).detach().cpu())
     total["cov"] += float(outputs.covariance_loss.detach().cpu())
     total["cov_w"] += float((outputs.covariance_loss * outputs.covariance_weight).detach().cpu())
-    total["byte_acc"] += float(outputs.byte_acc.detach().cpu())
-    total["token_exact"] += float(outputs.token_exact.detach().cpu())
-    total["stop_acc"] += float(outputs.stop_acc.detach().cpu())
-    total["token_set_weight"] += outputs.token_set_weight
     total["token_balance_weight"] += outputs.token_balance_weight
     total["covariance_weight"] += outputs.covariance_weight
     total["batches"] += 1
@@ -651,19 +531,11 @@ def format_log(step: int, metrics: dict[str, float]) -> str:
         f"step={step}",
         f"loss={metrics['loss']:.4f}",
         f"sent={metrics['sent']:.4f}",
-        f"writer={metrics['writer']:.4f}",
-        f"writer_tok={metrics['writer_tok']:.4f}",
         f"var={metrics['var']:.4f}",
-        f"token_set={metrics['token_set']:.4f}",
-        f"token_set_w={metrics['token_set_w']:.4f}",
         f"token_balance={metrics['token_balance']:.4f}",
         f"token_balance_w={metrics['token_balance_w']:.4f}",
         f"cov={metrics['cov']:.4f}",
         f"cov_w={metrics['cov_w']:.4f}",
-        f"byte_acc={metrics['byte_acc']:.4f}",
-        f"token_exact={metrics['token_exact']:.4f}",
-        f"stop_acc={metrics['stop_acc']:.4f}",
-        f"bow_weight={metrics['token_set_weight']:.3f}",
         f"balance_weight={metrics['token_balance_weight']:.3f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
@@ -689,8 +561,6 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
         self.tokenizer_vocab_path = self.resolve_tokenizer_vocab_path(args)
         self.tokenizer = load_hybrid_tokenizer(self.tokenizer_vocab_path)
         self.config = build_config(args, self.tokenizer)
-        if args.token_set_loss_weight > 0.0 and self.config.latent_size != self.config.hidden_size:
-            raise ValueError("token-set BoW uses tied embed_tokens, so config.latent_size must equal config.hidden_size")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.type == "cuda":
             torch.set_float32_matmul_precision("high")
@@ -700,13 +570,13 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
         self.cuda_prefetch = bool(self.device.type == "cuda" and not args.no_cuda_prefetch)
         self.model = Dil(self.config).to(self.device)
         self.model.train()
+        freeze_writer_for_encoder_training(self.model)
         self.optimizer = AdamW(
-            self.model.parameters(),
+            self.optimizer_param_groups(args.weight_decay),
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
-            weight_decay=args.weight_decay,
         )
-        self.scheduler = make_scheduler(self.optimizer, args.learning_rate, args.warmup_steps)
+        self.scheduler = make_scheduler(self.optimizer, args.learning_rate, args.warmup_steps, args.max_steps)
         if args.resume is not None:
             self.start_step, self.last_metrics = restore_checkpoint(
                 args.resume,
@@ -717,7 +587,6 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
             )
         self.model.set_compiled_forwards(
             encoder_forward=compile_forward(self.model.encoder.forward, self.compile_mode, "DilEncoderCore"),
-            writer_forward=compile_forward(self.model.writer.forward, self.compile_mode, "DilConditionalWriter"),
         )
         self.train_loader = None
         self.eval_loader = None
@@ -790,28 +659,6 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
             raise ValueError("encoded sequence latents must match unit_mask shape")
         return latents * unit_mask.unsqueeze(-1).to(latents.dtype)
 
-    def writer_side_loss(
-        self,
-        latents: torch.Tensor,
-        batch: dict,
-        prefix: str,
-        step: int | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        window_mask = batch[f"{prefix}_writer_window_mask"].to(latents.device, dtype=torch.bool)
-        writer_semantic = gather_writer_semantic(
-            latents.detach(),
-            batch[f"{prefix}_writer_source_rows"],
-            batch[f"{prefix}_writer_unit_indices"],
-            window_mask,
-        )
-        return self.model.writer_transition_loss_and_metrics(
-            writer_semantic,
-            batch[f"{prefix}_writer_labels"],
-            batch[f"{prefix}_writer_zone_ids"],
-            window_mask,
-            training_step=step,
-        )
-
     def forward_batch(self, batch: dict, step: int | None) -> TeacherlessDilOutput:
         tr_latents = self.encode_side(batch, "tr")
         en_latents = self.encode_side(batch, "en")
@@ -826,23 +673,10 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
             temperature=self.args.temperature,
             margin=self.args.margin,
         )
-        tr_writer = self.writer_side_loss(tr_latents, batch, "tr", step)
-        en_writer = self.writer_side_loss(en_latents, batch, "en", step)
-        writer_loss = (tr_writer[0] + en_writer[0]) * 0.5
-        writer_token_loss = (tr_writer[1] + en_writer[1]) * 0.5
-        byte_acc = (tr_writer[2] + en_writer[2]) * 0.5
-        token_exact = (tr_writer[3] + en_writer[3]) * 0.5
-        stop_acc = (tr_writer[4] + en_writer[4]) * 0.5
 
         variance_loss = variance_regularizer(
             torch.cat([tr_sentence, en_sentence], dim=0),
             self.args.variance_target_std,
-        )
-        token_set_weight = ramped_weight(
-            0 if step is None else step,
-            self.args.token_set_start_step,
-            self.args.token_set_ramp_steps,
-            self.args.token_set_loss_weight,
         )
         token_balance_weight = ramped_weight(
             0 if step is None else step,
@@ -857,29 +691,6 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
             self.args.covariance_weight,
         )
 
-        token_embedding = self.model.encoder.embed_tokens.weight
-        token_set_loss = (
-            token_set_bow_loss(
-                tr_sentence,
-                batch["en_labels"],
-                token_embedding,
-                self.config.writer_stop_token_id,
-                self.config.pad_token_id,
-                self.config.eos_token_id,
-                self.args.token_set_temperature,
-                self.args.token_set_positive_weight,
-            )
-            + token_set_bow_loss(
-                en_sentence,
-                batch["tr_labels"],
-                token_embedding,
-                self.config.writer_stop_token_id,
-                self.config.pad_token_id,
-                self.config.eos_token_id,
-                self.args.token_set_temperature,
-                self.args.token_set_positive_weight,
-            )
-        ) * 0.5
         balance_loss = (
             token_balance_loss(tr_latents, tr_unit_mask, self.args.token_balance_target_std)
             + token_balance_loss(en_latents, en_unit_mask, self.args.token_balance_target_std)
@@ -888,44 +699,29 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
 
         loss = (
             sentence_loss * self.args.sentence_loss_weight
-            + writer_loss * self.config.writer_loss_weight
             + variance_loss * self.args.teacherless_variance_weight
-            + token_set_loss * token_set_weight
             + balance_loss * token_balance_weight
             + covariance_loss * covariance_weight
         )
         return TeacherlessDilOutput(
             loss=loss,
             sentence_loss=sentence_loss,
-            writer_loss=writer_loss,
-            writer_token_loss=writer_token_loss,
             variance_loss=variance_loss,
-            token_set_loss=token_set_loss,
             token_balance_loss=balance_loss,
             covariance_loss=covariance_loss,
-            byte_acc=byte_acc,
-            token_exact=token_exact,
-            stop_acc=stop_acc,
-            token_set_weight=token_set_weight,
             token_balance_weight=token_balance_weight,
             covariance_weight=covariance_weight,
         )
 
     def train_step(self, batch: dict, step: int) -> StepResult:
         outputs = self.forward_batch(batch, step)
-        token_count = int(
-            batch["tr_labels"].label_mask.sum().detach().cpu()
-            + batch["en_labels"].label_mask.sum().detach().cpu()
-        )
+        token_count = int(batch["tr_surface"].mask.sum().detach().cpu() + batch["en_surface"].mask.sum().detach().cpu())
         window_count = int(batch["tr_unit_mask"].sum().detach().cpu() + batch["en_unit_mask"].sum().detach().cpu())
         return StepResult(outputs.loss, outputs, token_count=token_count, window_count=window_count, batch=batch)
 
     def eval_step(self, batch: dict) -> StepResult:
         outputs = self.forward_batch(batch, self.completed_step)
-        token_count = int(
-            batch["tr_labels"].label_mask.sum().detach().cpu()
-            + batch["en_labels"].label_mask.sum().detach().cpu()
-        )
+        token_count = int(batch["tr_surface"].mask.sum().detach().cpu() + batch["en_surface"].mask.sum().detach().cpu())
         window_count = int(batch["tr_unit_mask"].sum().detach().cpu() + batch["en_unit_mask"].sum().detach().cpu())
         return StepResult(outputs.loss, outputs, token_count=token_count, window_count=window_count, batch=batch)
 

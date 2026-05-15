@@ -19,6 +19,7 @@ from dilnaz.train.common.runtime import (
     effective_compile_mode,
     validate_compile_environment,
 )
+from dilnaz.train.common.trainer_core import make_adamw_param_groups
 from dilnaz.train.data.dil_data import load_hybrid_tokenizer, make_dil_batch_loader
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
 from dilnaz.models.dil import DilConfig
@@ -33,14 +34,13 @@ from dilnaz.train.data.parallel_dil_data import (
 )
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.dil.train import (
-    apply_writer_window_loss,
+    freeze_writer_for_encoder_training,
     is_dataloader_worker_exit,
     make_scheduler,
     model_inputs,
     restore_checkpoint,
     save_checkpoint,
 )
-from dilnaz.train.dil.writer_windows import writer_window_counts
 
 
 class ParallelAsyncTeacherBatchSource:
@@ -106,6 +106,7 @@ def parse_args():
     parser.add_argument("--adam-beta1", type=float, default=DIL_TRAIN_DEFAULTS["adam_beta1"])
     parser.add_argument("--adam-beta2", type=float, default=DIL_TRAIN_DEFAULTS["adam_beta2"])
     parser.add_argument("--warmup-steps", type=int, default=DIL_TRAIN_DEFAULTS["warmup_steps"])
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=DIL_TRAIN_DEFAULTS["gradient_accumulation_steps"])
     parser.add_argument("--max-grad-norm", type=float, default=DIL_TRAIN_DEFAULTS["max_grad_norm"])
     parser.add_argument("--log-every", type=int, default=DIL_TRAIN_DEFAULTS["log_every"])
     parser.add_argument("--checkpoint-every", type=int, default=DIL_TRAIN_DEFAULTS["checkpoint_every"])
@@ -126,7 +127,6 @@ def parse_args():
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
-    parser.add_argument("--writer-loss-weight", type=float, default=DIL_MODEL_DEFAULTS["writer_loss_weight"])
     parser.add_argument("--writer-num-layers", type=int, default=DIL_MODEL_DEFAULTS["writer_num_layers"])
     parser.add_argument("--writer-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_kernel_size"])
     parser.add_argument("--writer-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_expansion"])
@@ -156,8 +156,6 @@ def validate_args(args):
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
         raise ValueError("--byte-conv-expansion must be > 0")
-    if args.writer_loss_weight < 0.0:
-        raise ValueError("--writer-loss-weight must be >= 0")
     if args.writer_num_layers < 0:
         raise ValueError("--writer-num-layers must be >= 0")
     if args.writer_conv_kernel_size <= 0 or args.writer_conv_kernel_size % 2 == 0:
@@ -170,6 +168,8 @@ def validate_args(args):
         raise ValueError("--num-workers must be >= 0")
     if args.prefetch_factor <= 0:
         raise ValueError("--prefetch-factor must be > 0")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be > 0")
     if args.eval_every < 0 or args.checkpoint_every < 0:
         raise ValueError("--eval-every and --checkpoint-every must be >= 0")
     if args.eval_every > 0 and args.eval_file is None:
@@ -195,7 +195,7 @@ def build_config(args, tokenizer):
         distillation_weight=args.distillation_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
-        writer_loss_weight=args.writer_loss_weight,
+        max_sequence_units=DIL_MODEL_DEFAULTS["max_sequence_units"],
         writer_num_layers=args.writer_num_layers,
         writer_conv_kernel_size=args.writer_conv_kernel_size,
         writer_conv_expansion=args.writer_conv_expansion,
@@ -220,11 +220,8 @@ def format_parallel_log(step: int, metrics: dict) -> str:
         f"parallel={metrics['parallel']:.4f}",
         f"parallel_w={metrics['parallel_weighted']:.4f}",
         f"distill={metrics['distill']:.4f}",
-        f"writer={metrics['writer']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
-        f"byte_acc={metrics['byte_acc']:.4f}",
-        f"token_exact={metrics['token_exact']:.4f}",
         f"align_groups={metrics['align_groups']:.1f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
@@ -247,12 +244,8 @@ def empty_metric_sums() -> dict[str, float]:
         "parallel": 0.0,
         "parallel_weighted": 0.0,
         "distill": 0.0,
-        "writer": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
-        "byte_acc": 0.0,
-        "token_exact": 0.0,
-        "stop_acc": 0.0,
         "align_groups": 0.0,
     }
 
@@ -263,12 +256,8 @@ def accumulate_metrics(metric_sums: dict[str, float], loss, outputs, parallel_lo
     metric_sums["parallel"] += float(parallel_loss.detach().cpu())
     metric_sums["parallel_weighted"] += float((parallel_loss * weight).detach().cpu())
     metric_sums["distill"] += float(outputs.distill_loss.detach().cpu())
-    metric_sums["writer"] += float(outputs.writer_loss.detach().cpu())
     metric_sums["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
-    metric_sums["byte_acc"] += float(outputs.byte_acc.detach().cpu())
-    metric_sums["token_exact"] += float(outputs.token_exact.detach().cpu())
-    metric_sums["stop_acc"] += float(outputs.stop_acc.detach().cpu())
     metric_sums["align_groups"] += float(batch["parallel_alignment_scores"].shape[0])
 
 
@@ -291,7 +280,7 @@ def evaluate_parallel(
         teacher.materialize(batch)
         cudagraph_step_begin(device, compile_mode)
         with autocast_context(autocast_enabled):
-            outputs = apply_writer_window_loss(model, model(**model_inputs(batch)), batch, None)
+            outputs = model(**model_inputs(batch))
             loss, parallel_loss = parallel_total_loss(outputs, batch, parallel_alignment_weight)
         accumulate_metrics(total, loss, outputs, parallel_loss, batch, model.config, parallel_alignment_weight)
         batches += 1
@@ -327,18 +316,23 @@ def main():
 
     base_model = Dil(config).to(device)
     base_model.train()
+    freeze_writer_for_encoder_training(base_model)
     base_model.set_compiled_forwards(
         encoder_forward=compile_forward(base_model.encoder.forward, compile_mode, "DilEncoderCore"),
-        writer_forward=compile_forward(base_model.writer.forward, compile_mode, "DilConditionalWriter"),
     )
     model = base_model
+    trainable_named_parameters = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    ]
+    trainable_parameters = [param for _, param in trainable_named_parameters]
     optimizer = AdamW(
-        model.parameters(),
+        make_adamw_param_groups(trainable_named_parameters, args.weight_decay),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.weight_decay,
     )
-    scheduler = make_scheduler(optimizer, args.learning_rate, args.warmup_steps)
+    scheduler = make_scheduler(optimizer, args.learning_rate, args.warmup_steps, args.max_steps)
     teacher = ParallelNllbTeacher(
         args.nllb_model_name,
         args.source_lang,
@@ -402,6 +396,7 @@ def main():
     log_tokens = 0
     log_windows = 0
     log_steps = 0
+    log_micro_steps = 0
     data_seconds = 0.0
     compute_seconds = 0.0
     source_lines_seen: set[int] = set()
@@ -426,50 +421,51 @@ def main():
 
     try:
         for step in range(start_step + 1, args.max_steps + 1):
-            batch = current_batch
             compute_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
-            cudagraph_step_begin(device, compile_mode)
-            model_batch = model_inputs(batch)
-            model_batch["training_step"] = step
-            with autocast_context(autocast_enabled):
-                outputs = model(**model_batch)
-                outputs = apply_writer_window_loss(model, outputs, batch, step)
-                loss, parallel_loss = parallel_total_loss(outputs, batch, args.parallel_alignment_weight)
+            for _ in range(args.gradient_accumulation_steps):
+                batch = current_batch
+                cudagraph_step_begin(device, compile_mode)
+                model_batch = model_inputs(batch)
+                model_batch["training_step"] = step
+                with autocast_context(autocast_enabled):
+                    outputs = model(**model_batch)
+                    loss, parallel_loss = parallel_total_loss(outputs, batch, args.parallel_alignment_weight)
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                (loss / args.gradient_accumulation_steps).backward()
+                token_count = int(batch["surface"].mask.sum().detach().cpu())
+                window_count = int(batch["surface"].unit_mask.sum().detach().cpu())
+                log_tokens += token_count
+                log_windows += window_count
+                log_micro_steps += 1
+                source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
+                accumulate_metrics(
+                    metric_sums,
+                    loss,
+                    outputs,
+                    parallel_loss,
+                    batch,
+                    config,
+                    args.parallel_alignment_weight,
+                )
+                current_batch, current_batch_seen, wait_seconds = batch_source.next_after_step(
+                    current_batch,
+                    current_batch_seen,
+                )
+                data_seconds += wait_seconds
+            torch.nn.utils.clip_grad_norm_(trainable_parameters, args.max_grad_norm)
             optimizer.step()
             scheduler.step()
             cuda_sync(device)
             compute_seconds += time.perf_counter() - compute_start
             completed_step = step
-            current_batch, current_batch_seen, wait_seconds = batch_source.next_after_step(
-                current_batch,
-                current_batch_seen,
-            )
-            data_seconds += wait_seconds
-
-            token_count, window_count = writer_window_counts(batch["writer_labels"])
-            log_tokens += token_count
-            log_windows += window_count
             log_steps += 1
-            source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
-            accumulate_metrics(
-                metric_sums,
-                loss,
-                outputs,
-                parallel_loss,
-                batch,
-                config,
-                args.parallel_alignment_weight,
-            )
 
             should_log = step % args.log_every == 0 or step == start_step + 1 or step == args.max_steps
             should_eval = eval_loader is not None and args.eval_every > 0 and step % args.eval_every == 0
             if should_log or should_eval:
                 elapsed = max(time.perf_counter() - log_start, 1e-9)
-                averaged = {key: value / max(log_steps, 1) for key, value in metric_sums.items()}
+                averaged = {key: value / max(log_micro_steps, 1) for key, value in metric_sums.items()}
                 averaged["lr"] = scheduler.get_last_lr()[0]
                 averaged["data_seconds"] = data_seconds / max(log_steps, 1)
                 averaged["compute_seconds"] = compute_seconds / max(log_steps, 1)
@@ -498,6 +494,7 @@ def main():
                 log_tokens = 0
                 log_windows = 0
                 log_steps = 0
+                log_micro_steps = 0
                 data_seconds = 0.0
                 compute_seconds = 0.0
                 metric_sums = empty_metric_sums()

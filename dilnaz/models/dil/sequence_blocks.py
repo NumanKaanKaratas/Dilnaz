@@ -114,9 +114,6 @@ class DilBidirectionalAttention(nn.Module):
         key = self.k_norm(self._shape_kv(self.k_proj(hidden_states)))
         value = self._shape_kv(self.v_proj(hidden_states))
         query, key = self.rotary(query, key, position_ids)
-        if self.num_key_value_groups > 1:
-            key = key.repeat_interleave(self.num_key_value_groups, dim=1)
-            value = value.repeat_interleave(self.num_key_value_groups, dim=1)
         attention_mask = self._attention_mask(unit_mask, seq_len, hidden_states.device)
         output = F.scaled_dot_product_attention(
             query,
@@ -126,6 +123,7 @@ class DilBidirectionalAttention(nn.Module):
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=False,
             scale=self.scale,
+            enable_gqa=self.num_key_value_groups > 1,
         )
         gate = torch.sigmoid(self._shape_q(self.gate_proj(hidden_states)))
         output = (output * gate).transpose(1, 2).reshape(batch_size, seq_len, self.num_heads * self.head_dim)

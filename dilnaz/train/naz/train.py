@@ -55,6 +55,7 @@ RUNTIME_STATE_FIELDS = (
     "adam_beta1",
     "adam_beta2",
     "warmup_steps",
+    "gradient_accumulation_steps",
     "max_grad_norm",
     "log_every",
     "checkpoint_every",
@@ -190,6 +191,9 @@ def save_checkpoint(
         init_naz_checkpoint,
         runtime,
     )
+    import os as _os
+
+    tmp_path = checkpoint_dir / "checkpoint.pt.tmp"
     torch.save(
         {
             "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -199,8 +203,9 @@ def save_checkpoint(
             "training_state": state,
             "rng_state": rng_state(),
         },
-        checkpoint_dir / "checkpoint.pt",
+        tmp_path,
     )
+    _os.replace(str(tmp_path), str(checkpoint_dir / "checkpoint.pt"))
     with (checkpoint_dir / "training_state.json").open("w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=2)
     return checkpoint_dir
@@ -464,6 +469,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--adam-beta1", type=float, default=None)
     parser.add_argument("--adam-beta2", type=float, default=None)
     parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--max-grad-norm", type=float, default=None)
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--checkpoint-every", type=int, default=None)
@@ -543,6 +549,8 @@ def validate_common_args(args) -> None:
         raise ValueError("--semantic-cache-chunk-tokens must be > 0")
     if args.max_eval_batches <= 0:
         raise ValueError("--max-eval-batches must be > 0")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be > 0")
     if args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
     if args.prefetch_factor <= 0:
