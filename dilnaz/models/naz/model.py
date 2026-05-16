@@ -86,9 +86,10 @@ class Naz(PreTrainedModel):
     def _load_dil(self, dil_path: Path, dil_config: DilConfig):
         model = Dil(dil_config)
         checkpoint = torch.load(dil_path / "checkpoint.pt", map_location="cpu", weights_only=False)
-        if checkpoint["format_version"] != dil_config.checkpoint_format_version:
+        supported_versions = {dil_config.checkpoint_format_version, 30}
+        if checkpoint["format_version"] not in supported_versions:
             raise ValueError(f"unsupported Dil checkpoint format_version={checkpoint.get('format_version')}")
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         for param in model.parameters():
             param.requires_grad = False
         model.eval()
