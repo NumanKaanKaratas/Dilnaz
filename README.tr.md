@@ -32,6 +32,10 @@ flowchart LR
     T -. mean geometry .-> D
 ```
 
+## Demo
+
+![Dilnaz Demo](project_demo.gif)
+
 Aktif pipeline üç pratik aşamadan oluşur:
 
 1. `DIL` eğitilir; yüzey parçaları semantic latente dönüşür ve tekrar yazılabilir hale gelir.
