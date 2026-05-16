@@ -126,10 +126,58 @@ class Naz(PreTrainedModel):
         unit_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         unit_mask = surface.unit_mask if unit_mask is None else unit_mask.to(surface.ids.device, dtype=torch.bool)
-        semantic_states = self.dil_model.encode(surface=surface).float()
-        if semantic_states.shape[:2] != unit_mask.shape:
-            raise ValueError("DIL sequence latents must match surface unit_mask shape")
+        windowed_surface = self._build_windowed_surface(surface, unit_mask)
+        semantic_states = self.dil_model.encode(surface=windowed_surface).float()
+        batch_size, unit_count = unit_mask.shape
+        if semantic_states.dim() == 3 and semantic_states.shape[1] == 1:
+            semantic_states = semantic_states.squeeze(1)
+        if semantic_states.shape[0] != batch_size * unit_count:
+            raise ValueError(
+                f"DIL encoder produced {semantic_states.shape[0]} latents; expected {batch_size * unit_count}"
+            )
+        semantic_states = semantic_states.view(batch_size, unit_count, -1)
         return semantic_states * unit_mask.unsqueeze(-1).to(semantic_states.dtype)
+
+    def _build_windowed_surface(
+        self,
+        surface: PackedSurface,
+        unit_mask: torch.Tensor,
+    ) -> PackedSurface:
+        from dilnaz.surface import pack_token_units
+
+        batch_size, unit_count = unit_mask.shape
+        context_radius = self.dil_config.context_radius
+        device = surface.ids.device
+        ids_cpu = surface.ids.detach().cpu()
+        offsets_cpu = surface.unit_offsets.detach().cpu()
+        lengths_cpu = surface.unit_lengths.detach().cpu()
+        unit_mask_cpu = unit_mask.detach().cpu()
+        rows: list[list[list[int]]] = []
+        for b in range(batch_size):
+            unit_pieces: list[list[int]] = []
+            for u in range(unit_count):
+                start = int(offsets_cpu[b, u])
+                length = int(lengths_cpu[b, u])
+                unit_pieces.append(ids_cpu[b, start : start + length].tolist())
+            for u in range(unit_count):
+                window: list[list[int]] = []
+                for offset in range(-context_radius, context_radius + 1):
+                    neighbor = u + offset
+                    if (
+                        0 <= neighbor < unit_count
+                        and bool(unit_mask_cpu[b, neighbor])
+                    ):
+                        window.append(unit_pieces[neighbor])
+                    else:
+                        window.append([])
+                rows.append(window)
+        return pack_token_units(
+            rows,
+            pad_token_id=self.dil_config.pad_token_id,
+            bucket_sizes=self.dil_config.surface_bucket_sizes,
+            max_pieces_per_unit=self.dil_config.max_surface_pieces_per_unit,
+            device=device,
+        )
 
     def embed_sequence_latents(
         self,
