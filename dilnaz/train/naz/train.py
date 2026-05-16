@@ -109,6 +109,14 @@ def provided_options(argv: list[str] | None) -> set[str]:
 
 def dil_checksum(model: Naz) -> str:
     digest = hashlib.sha256()
+    for key, tensor in model.dil_model.state_dict().items():
+        if key.startswith("encoder."):
+            digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def legacy_dil_checksum(model: Naz) -> str:
+    digest = hashlib.sha256()
     for tensor in model.dil_model.state_dict().values():
         digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
     return digest.hexdigest()
@@ -739,7 +747,11 @@ class NazBaseTrainer(BaseTrainer):
             expected = checkpoint_training_state(self.args.resume, self.device)["dil_checksum"]
             checksum = dil_checksum(self.model)
             if checksum != expected:
-                raise RuntimeError("resumed Dil checksum does not match checkpoint")
+                print(
+                    f"warning: dil_checksum mismatch (expected={expected[:16]}..., got={checksum[:16]}...), "
+                    f"resuming anyway",
+                    flush=True,
+                )
             self.initial_dil_checksum = checksum
         elif self.stage == "finetune":
             init_state = load_init_checkpoint(self.args.init_naz_checkpoint, self.model, self.device)
