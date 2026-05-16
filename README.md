@@ -34,7 +34,7 @@ flowchart LR
 
 ## Demo
 
-<video src="project_demo.mp4" width="720" controls></video>
+![Dilnaz Demo](project_demo.gif)
 
 The active pipeline has three practical stages:
 
