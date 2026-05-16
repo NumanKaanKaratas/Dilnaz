@@ -32,6 +32,10 @@ flowchart LR
     T -. mean geometry .-> D
 ```
 
+## Demo
+
+<video src="project_demo.mp4" width="720" controls></video>
+
 The active pipeline has three practical stages:
 
 1. Train `DIL` so surface pieces become semantic latents and can be written back.
