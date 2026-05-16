@@ -162,7 +162,6 @@ def pack_writer_targets(
         pad_token_id=pad_token_id,
         surface_bucket_sizes=surface_bucket_sizes,
     )
-    query_ids = torch.full_like(query.ids, pad_token_id)
     labels = torch.full_like(query.ids, -100)
     label_mask = torch.zeros_like(query.mask)
     for row_idx, row in enumerate(rows):
@@ -170,22 +169,12 @@ def pack_writer_targets(
             start = int(query.unit_offsets[row_idx, unit_idx])
             if not ids:
                 continue
-            query_ids[row_idx, start] = int(bos_token_id)
-            end_input = start + 1 + len(ids)
-            query_ids[row_idx, start + 1 : end_input] = torch.tensor(ids, dtype=torch.long)
+            input_ids = [bos_token_id] + list(ids)
             ids_with_stop = list(ids) + [stop_token_id]
             end = start + len(ids_with_stop)
+            query.ids[row_idx, start:end] = torch.tensor(input_ids, dtype=torch.long)
             labels[row_idx, start:end] = torch.tensor(ids_with_stop, dtype=torch.long)
             label_mask[row_idx, start:end] = True
-    query = PackedSurface(
-        ids=query_ids,
-        mask=query.mask,
-        unit_ids=query.unit_ids,
-        pos_in_unit=query.pos_in_unit,
-        unit_lengths=query.unit_lengths,
-        unit_offsets=query.unit_offsets,
-        unit_mask=query.unit_mask,
-    )
     target = PackedWriterTarget(
         query=query,
         labels=labels,

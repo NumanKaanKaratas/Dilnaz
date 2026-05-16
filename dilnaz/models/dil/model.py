@@ -12,7 +12,7 @@ from .configuration import DilConfig
 from .encoder import DilEncoderCore
 from .layers import DilPackedDepthwiseConv
 from .outputs import DilOutput
-from .writer import DilConditionalWriter, DilWriterGeneration, DilWriterOutput
+from .writer import DilConditionalWriter, DilWriterGeneration
 from .writer.blocks import DilPackedCausalDepthwiseConv
 
 
@@ -21,22 +21,25 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 30:
-            raise ValueError("DIL shared-embedding checkpoints require checkpoint_format_version=30")
+        if config.checkpoint_format_version != 26:
+            raise ValueError("DIL causal surface writer checkpoints require checkpoint_format_version=26")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
             raise ValueError("eos_token_id must be inside the tokenizer vocabulary")
         if config.decoder_start_token_id >= config.vocab_size:
             raise ValueError("decoder_start_token_id must be inside the tokenizer vocabulary")
+        if config.writer_stop_token_id != config.vocab_size or config.writer_vocab_size != config.vocab_size + 1:
+            raise ValueError("Writer stop token contract must be writer_stop_token_id=vocab_size")
 
-        self.shared_token_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.encoder = DilEncoderCore(config, self.shared_token_embeddings)
-        self.writer = DilConditionalWriter(config, self.shared_token_embeddings)
+        self.encoder = DilEncoderCore(config)
+        self.writer = DilConditionalWriter(config)
         self.dil_dropout = config.dil_dropout
         self.distillation_weight = config.distillation_weight
         self.mean_geometry_weight = config.mean_geometry_weight
         self.variance_weight = config.variance_weight
+        self.writer_loss_weight = config.writer_loss_weight
+
         self.post_init()
 
     def _init_weights(self, module):
@@ -59,49 +62,32 @@ class Dil(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
     def get_input_embeddings(self):
-        return self.shared_token_embeddings
+        return self.encoder.embed_tokens
 
     def set_input_embeddings(self, value):
-        self.shared_token_embeddings = value
-        object.__setattr__(self.encoder, "embed_tokens", value)
-        object.__setattr__(self.writer, "token_embeddings", value)
+        self.encoder.embed_tokens = value
 
-    def encode(self, surface: PackedSurface, output_hidden_states: bool = False):
+    def encode(self, surface: PackedSurface, output_hidden_states: bool = False, return_all: bool = False):
         compiled_forward = getattr(self, "_compiled_encoder_forward", None)
         encoded = (
-            compiled_forward(surface, output_hidden_states)
+            compiled_forward(surface, output_hidden_states, return_all)
             if compiled_forward is not None
-            else self.encoder(surface=surface, output_hidden_states=output_hidden_states)
+            else self.encoder(surface=surface, output_hidden_states=output_hidden_states, return_all=return_all)
         )
         if output_hidden_states:
             semantic, layer_vectors = encoded
             return normalize_semantic_latents(semantic), layer_vectors
         return normalize_semantic_latents(encoded)
 
-    def writer_outputs(self, semantic: torch.Tensor) -> torch.Tensor:
+    def writer_outputs(self, semantic: torch.Tensor, query_surface: PackedSurface) -> torch.Tensor:
         compiled_forward = getattr(self, "_compiled_writer_forward", None)
         if compiled_forward is not None:
-            return compiled_forward(semantic)
-        return self.writer(semantic)
+            return compiled_forward(semantic, query_surface)
+        return self.writer(semantic, query_surface)
 
-    def _transition_output(self, semantic: torch.Tensor, query_surface: Optional[PackedSurface] = None) -> DilWriterOutput:
-        compiled_forward = getattr(self, "_compiled_transition_forward", None)
-        output = (
-            compiled_forward(semantic, query_surface)
-            if compiled_forward is not None
-            else self.writer.transition(semantic, query_surface=query_surface)
-        )
-        if isinstance(output, DilWriterOutput):
-            return output
-        return DilWriterOutput(token_logits=output)
-
-    def writer_transition_outputs(self, semantic: torch.Tensor, query_surface: Optional[PackedSurface] = None) -> DilWriterOutput:
-        return self._transition_output(semantic, query_surface)
-
-    def set_compiled_forwards(self, encoder_forward=None, writer_forward=None, transition_forward=None):
+    def set_compiled_forwards(self, encoder_forward=None, writer_forward=None):
         object.__setattr__(self, "_compiled_encoder_forward", encoder_forward)
         object.__setattr__(self, "_compiled_writer_forward", writer_forward)
-        object.__setattr__(self, "_compiled_transition_forward", transition_forward)
 
     def geometry_loss(
         self,
@@ -120,26 +106,6 @@ class Dil(PreTrainedModel):
         off_diagonal = ~torch.eye(model_sim.shape[0], dtype=torch.bool, device=model_sim.device)
         return F.mse_loss(model_sim[off_diagonal], teacher_sim[off_diagonal])
 
-    def sequence_geometry_loss(
-        self,
-        semantic: torch.Tensor,
-        teacher_vectors: torch.Tensor,
-        teacher_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if semantic.dim() == 2:
-            return self.geometry_loss(semantic, teacher_vectors, teacher_mask)
-        if semantic.dim() != 3:
-            raise ValueError("semantic must be shaped [batch, latent] or [batch, units, latent]")
-        if teacher_vectors.dim() != 3:
-            raise ValueError("sequence teacher vectors must be shaped [batch, units, teacher_dim]")
-        if teacher_vectors.shape[:2] != semantic.shape[:2]:
-            raise ValueError("sequence teacher vectors must match semantic batch/unit dimensions")
-        if teacher_mask is None:
-            teacher_mask = torch.ones(semantic.shape[:2], dtype=torch.bool, device=semantic.device)
-        else:
-            teacher_mask = teacher_mask.to(semantic.device, dtype=torch.bool)
-        return self.geometry_loss(semantic[teacher_mask], teacher_vectors[teacher_mask], None)
-
     def variance_regularizer(self, model_vectors: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if mask is not None:
             model_vectors = model_vectors[mask]
@@ -156,8 +122,8 @@ class Dil(PreTrainedModel):
         labels = target.labels.to(logits.device)
         valid = target.label_mask.to(logits.device)
         predictions = logits.argmax(dim=-1)
-        byte_valid = valid & labels.ne(self.config.eos_token_id)
-        stop_valid = valid & labels.eq(self.config.eos_token_id)
+        byte_valid = valid & labels.ne(self.config.writer_stop_token_id)
+        stop_valid = valid & labels.eq(self.config.writer_stop_token_id)
         byte_acc = (predictions.eq(labels) & byte_valid).sum().float() / byte_valid.sum().clamp_min(1).float()
         stop_acc = (predictions.eq(labels) & stop_valid).sum().float() / stop_valid.sum().clamp_min(1).float()
         mismatch = (predictions.ne(labels) & valid).to(dtype=torch.long)
@@ -174,13 +140,13 @@ class Dil(PreTrainedModel):
         return_metrics: bool = False,
     ):
         target = target.to(semantic.device)
-        output = self.writer_transition_outputs(semantic, query_surface=target.query)
+        output = self.writer_outputs(semantic, query_surface=target.query)
         token_loss = F.cross_entropy(
-            output.token_logits.reshape(-1, self.config.vocab_size),
+            output.reshape(-1, self.config.writer_vocab_size),
             target.labels.reshape(-1),
             ignore_index=-100,
         )
-        byte_acc, token_exact, stop_acc = self.writer_metrics(output.token_logits, target)
+        byte_acc, token_exact, stop_acc = self.writer_metrics(output, target)
         if return_metrics:
             return {
                 "loss": token_loss,
@@ -194,6 +160,7 @@ class Dil(PreTrainedModel):
     def forward(
         self,
         surface: PackedSurface,
+        labels: Optional[PackedWriterTarget] = None,
         teacher_layers: Optional[torch.Tensor] = None,
         teacher_mask: Optional[torch.Tensor] = None,
         training_step: Optional[int] = None,
@@ -224,7 +191,7 @@ class Dil(PreTrainedModel):
                 teacher_mask = torch.ones(teacher_layers.shape[:-2], dtype=torch.bool, device=semantic.device)
             else:
                 teacher_mask = teacher_mask.to(semantic.device, dtype=torch.bool)
-            mean_geometry_loss = self.sequence_geometry_loss(semantic, teacher_layers[..., -1, :], teacher_mask)
+            mean_geometry_loss = self.geometry_loss(semantic, teacher_layers[..., -1, :], teacher_mask)
             variance_loss = self.variance_regularizer(semantic, teacher_mask)
             distill_loss = (
                 mean_geometry_loss * self.mean_geometry_weight
@@ -232,12 +199,30 @@ class Dil(PreTrainedModel):
             )
             loss = loss + distill_loss * self.distillation_weight
 
+        writer_loss = semantic.new_zeros(())
+        byte_acc = semantic.new_zeros(())
+        token_exact = semantic.new_zeros(())
+        writer_token_loss = semantic.new_zeros(())
+        stop_acc = semantic.new_zeros(())
+        if labels is not None and self.writer_loss_weight > 0.0:
+            writer_semantic = semantic.detach()
+            writer_loss, writer_token_loss, byte_acc, token_exact, stop_acc = self.writer_loss_and_metrics(
+                writer_semantic,
+                labels,
+            )
+            loss = loss + writer_loss * self.writer_loss_weight
+
         return DilOutput(
             loss=loss,
             semantic=semantic,
             distill_loss=distill_loss,
+            writer_loss=writer_loss,
+            writer_token_loss=writer_token_loss,
             mean_geometry_loss=mean_geometry_loss,
             variance_loss=variance_loss,
+            byte_acc=byte_acc,
+            token_exact=token_exact,
+            stop_acc=stop_acc,
         )
 
     @torch.no_grad()

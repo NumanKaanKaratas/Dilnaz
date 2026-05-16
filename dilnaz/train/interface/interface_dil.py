@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 from itertools import combinations
 from pathlib import Path
@@ -7,14 +9,11 @@ import torch.nn.functional as F
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from dilnaz.train.common.runtime import COMPILE_MODE_CHOICES, compile_forward, validate_compile_environment
-from dilnaz.train.data.dil_data import NLLB_LAYER_GROUPS, align_spans_to_pieces, apply_teacher_centered_add
+from dilnaz.train.data.dil_data import align_spans_to_pieces, apply_teacher_centered_add, build_nllb_layer_groups, context_windows
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
-
-
-CHECKPOINT_FORMAT_VERSION = 30
 
 
 def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
@@ -29,18 +28,14 @@ def tokenize_text(text: str, tokenizer: HybridTokenizer) -> list[TokenSegment]:
 
 
 def make_batch(segments: list[TokenSegment], tokenizer: HybridTokenizer, config: DilConfig, device: torch.device):
-    rows: list[list[list[int]]] = [[]]
+    context_radius = getattr(config, "context_radius", 2)
+    windows = context_windows(segments, context_radius)
+    rows = []
     byte_lengths = []
-
-    for row_idx, segment in enumerate(segments):
-        token_ids = segment.token_ids
-        if len(token_ids) > config.max_surface_pieces_per_unit:
-            raise ValueError(
-                f"token {row_idx} {tokenizer.decode(token_ids)!r} has {len(token_ids)} pieces; "
-                f"max_surface_pieces_per_unit={config.max_surface_pieces_per_unit}"
-            )
-        byte_lengths.append(len(token_ids))
-        rows[0].append(list(token_ids))
+    for window in windows:
+        row = [list(seg.token_ids) if seg is not None else [] for seg in window]
+        rows.append(row)
+        byte_lengths.append(len(segments[len(byte_lengths)].token_ids) if len(byte_lengths) < len(segments) else 0)
 
     return pack_token_units(
         rows,
@@ -108,28 +103,30 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
         map_location=device,
         weights_only=False,
     )
-    if checkpoint["format_version"] != CHECKPOINT_FORMAT_VERSION:
-        raise ValueError(f"unsupported checkpoint format_version={checkpoint.get('format_version')}")
     model.load_state_dict(checkpoint["model_state_dict"])
     model.set_compiled_forwards(
         encoder_forward=compile_forward(model.encoder.forward, compile_mode, "DilEncoderCore"),
         writer_forward=compile_forward(model.writer.forward, compile_mode, "DilConditionalWriter"),
-        transition_forward=compile_forward(model.writer.transition, compile_mode, "DilConditionalWriterTransition"),
     )
     model.eval()
-    return model, config, tokenizer, checkpoint["training_state"]["step"]
+    return model, config, tokenizer, checkpoint.get("training_state", {}).get("step", 0)
 
 
 @torch.no_grad()
 def encode_tokens(model: Dil, surface):
-    return model.encode(surface=surface).float()[0]
+    return model.encode(surface).float()
 
 
 @torch.no_grad()
 def decode_tokens(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor) -> list[str]:
-    from dilnaz.train.interface.writer_render import render_latents_with_unit_writer
-
-    return render_latents_with_unit_writer(model, tokenizer, latents)
+    generation = model.decode_semantic(latents)
+    tokens = []
+    for row_idx in range(generation.token_ids.shape[0]):
+        ids = generation.token_ids[row_idx]
+        mask = generation.token_mask[row_idx]
+        token = tokenizer.decode(ids[mask].detach().cpu().tolist())
+        tokens.append(token)
+    return tokens
 
 
 def similarity_matrix(latents: torch.Tensor) -> list[list[float]]:
@@ -183,9 +180,11 @@ def nllb_similarity(config: DilConfig, text: str, segments: list[TokenSegment], 
 
     outputs = nllb_model.get_encoder()(**inputs, output_hidden_states=True, return_dict=True)
     hidden_states = outputs.hidden_states
+    num_encoder_layers = nllb_model.config.encoder_layers if hasattr(nllb_model.config, "encoder_layers") else len(hidden_states) - 1
+    layer_groups = build_nllb_layer_groups(num_encoder_layers)
 
     sample_count = len(segments)
-    teacher = torch.zeros((sample_count, len(NLLB_LAYER_GROUPS), nllb_model.config.d_model), dtype=torch.float32, device=device)
+    teacher = torch.zeros((sample_count, len(layer_groups), nllb_model.config.d_model), dtype=torch.float32, device=device)
     teacher_mask = torch.zeros((sample_count,), dtype=torch.bool, device=device)
     for row_idx, positions in enumerate(alignments):
         if not positions or segments[row_idx].text.isspace():
@@ -193,7 +192,7 @@ def nllb_similarity(config: DilConfig, text: str, segments: list[TokenSegment], 
         teacher_mask[row_idx] = True
         hidden_positions = [pieces[p][3] for p in positions]
         pos_tensor = torch.tensor(hidden_positions, dtype=torch.long, device=device)
-        for group_idx, layers in enumerate(NLLB_LAYER_GROUPS):
+        for group_idx, layers in enumerate(layer_groups):
             layer_vectors = [hidden_states[layer][0, pos_tensor].float().mean(dim=0) for layer in layers]
             teacher[row_idx, group_idx] = torch.stack(layer_vectors).mean(dim=0)
 

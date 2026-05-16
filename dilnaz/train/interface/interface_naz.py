@@ -74,7 +74,6 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
     model.dil_model.set_compiled_forwards(
         encoder_forward=compile_forward(model.dil_model.encoder.forward, compile_mode, "DilEncoderCore"),
         writer_forward=compile_forward(model.dil_model.writer.forward, compile_mode, "DilConditionalWriter"),
-        transition_forward=compile_forward(model.dil_model.writer.transition, compile_mode, "DilConditionalWriterTransition"),
     )
     model.eval()
     dil_config = DilConfig.from_pretrained(dil_path)

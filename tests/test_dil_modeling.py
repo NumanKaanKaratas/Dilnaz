@@ -1,13 +1,12 @@
 import ast
 from pathlib import Path
-from types import MethodType
 
 import torch
 
 from dilnaz.models.dil import Dil, DilConfig
-from dilnaz.models.dil.writer import DilWriterOutput
 from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
+from dilnaz.train.writer.train import WRITER_METRIC_KEYS, WriterContextDataset, load_model_checkpoint, writer_only_metrics
 
 
 def tiny_config() -> DilConfig:
@@ -21,14 +20,8 @@ def tiny_config() -> DilConfig:
         latent_size=16,
         max_surface_pieces_per_unit=16,
         surface_bucket_sizes=(8, 16, 32, 64),
-        encoder_context_layers=2,
-        encoder_layer_pattern=("sliding", "global"),
-        encoder_attention_heads=4,
-        encoder_key_value_heads=2,
-        encoder_head_dim=8,
-        encoder_intermediate_size=64,
-        encoder_attention_window=4,
         byte_conv_layers=1,
+        num_encoder_layers=2,
         writer_num_layers=1,
     )
 
@@ -37,27 +30,24 @@ def test_dil_config_sequence_limit_matches_training_default():
     assert DilConfig().max_sequence_units == DIL_MODEL_DEFAULTS["max_sequence_units"]
 
 
+def test_dil_defaults_expose_only_context_radius():
+    assert "context_radius" in DIL_MODEL_DEFAULTS
+    assert "context_size" not in DIL_MODEL_DEFAULTS
+    assert "target_index" not in DIL_MODEL_DEFAULTS
+
+
 def make_writer_target(cfg: DilConfig, rows):
     return pack_writer_targets(
         rows,
         pad_token_id=cfg.pad_token_id,
         bos_token_id=cfg.decoder_start_token_id,
-        stop_token_id=cfg.eos_token_id,
+        stop_token_id=cfg.writer_stop_token_id,
         surface_bucket_sizes=cfg.surface_bucket_sizes,
         max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
     )
 
 
-def test_shared_embedding_contract():
-    cfg = tiny_config()
-    model = Dil(cfg)
-    assert model.encoder.embed_tokens is model.shared_token_embeddings
-    assert model.writer.token_embeddings is model.shared_token_embeddings
-    assert "_".join(("surface", "input", "embeddings")) not in dict(model.writer.named_modules())
-    assert not hasattr(model.writer, "_".join(("token", "head")))
-
-
-def test_writer_targets_use_single_vocab_causal_inputs_and_eos_stop():
+def test_writer_targets_use_semantic_position_queries_and_eos_stop():
     cfg = tiny_config()
     comma = make_writer_target(cfg, [[[7]]])
     araba = make_writer_target(cfg, [[[2, 3, 4, 5, 6]]])
@@ -70,11 +60,28 @@ def test_writer_targets_use_single_vocab_causal_inputs_and_eos_stop():
     assert comma.query.ids[0, 0].item() == cfg.decoder_start_token_id
     assert comma.query.ids[0, 1].item() == 7
     assert comma.labels[0, 0].item() == 7
-    assert comma.labels[0, 1].item() == cfg.eos_token_id
+    assert comma.labels[0, 1].item() == cfg.writer_stop_token_id
     assert eos.query.ids[0, 0].item() == cfg.decoder_start_token_id
     assert eos.query.ids[0, 1].item() == cfg.eos_token_id
     assert eos.labels[0, 0].item() == cfg.eos_token_id
-    assert eos.labels[0, 1].item() == cfg.eos_token_id
+    assert eos.labels[0, 1].item() == cfg.writer_stop_token_id
+
+
+def test_writer_targets_are_autoregressive_next_token_pairs():
+    cfg = tiny_config()
+    target = pack_writer_targets(
+        [[[2, 3, 4]]],
+        pad_token_id=cfg.pad_token_id,
+        bos_token_id=cfg.decoder_start_token_id,
+        stop_token_id=cfg.writer_stop_token_id,
+        surface_bucket_sizes=cfg.surface_bucket_sizes,
+        max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
+    )
+    assert target.query.unit_lengths.tolist() == [[4]]
+    assert target.query.ids[0, :4].tolist() == [cfg.decoder_start_token_id, 2, 3, 4]
+    assert target.labels[0, :4].tolist() == [2, 3, 4, cfg.writer_stop_token_id]
+    assert target.label_mask[0, :4].tolist() == [True, True, True, True]
+    assert not target.label_mask[0, 4:].any()
 
 
 def test_dil_packed_encoder_output_shape():
@@ -86,13 +93,22 @@ def test_dil_packed_encoder_output_shape():
         bucket_sizes=cfg.surface_bucket_sizes,
         max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
     )
-    semantic, layers = model.encode(surface, output_hidden_states=True)
+    semantic, layers = model.encode(surface, output_hidden_states=True, return_all=True)
     assert semantic.shape == (1, 3, cfg.latent_size)
-    assert len(layers) == cfg.encoder_context_layers
+    assert len(layers) == cfg.num_encoder_layers // 2
     assert torch.isfinite(semantic).all()
+
+    window_surface = pack_token_units(
+        [[[2], [3, 4], [5], [6], [7]]],
+        pad_token_id=cfg.pad_token_id,
+        bucket_sizes=cfg.surface_bucket_sizes,
+        max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
+    )
+    semantic_pooled = model.encode(window_surface)
+    assert semantic_pooled.shape == (1, cfg.latent_size), f"shape={semantic_pooled.shape}"
     assert torch.allclose(
-        semantic.norm(dim=-1),
-        torch.full((1, 3), cfg.latent_size**0.5),
+        semantic_pooled.norm(dim=-1),
+        torch.full((1,), cfg.latent_size**0.5),
         atol=1e-4,
         rtol=1e-4,
     )
@@ -104,7 +120,17 @@ def test_writer_packed_logits_no_nan():
     semantic = torch.randn(2, cfg.latent_size)
     target = make_writer_target(cfg, [[[2]], [[3, 4]]])
     output = model.writer.transition(semantic, query_surface=target.query)
-    assert output.token_logits.shape == (2, target.query.surface_width, cfg.vocab_size)
+    assert output.token_logits.shape == (2, target.query.surface_width, cfg.writer_vocab_size)
+    assert torch.isfinite(output.token_logits).all()
+
+
+def test_writer_accepts_unit_semantics_with_packed_query():
+    cfg = tiny_config()
+    model = Dil(cfg)
+    semantic = torch.randn(1, 2, cfg.latent_size)
+    target = make_writer_target(cfg, [[[2], [3, 4]]])
+    output = model.writer.transition(semantic, query_surface=target.query)
+    assert output.token_logits.shape == (1, target.query.surface_width, cfg.writer_vocab_size)
     assert torch.isfinite(output.token_logits).all()
 
 
@@ -131,6 +157,112 @@ def test_writer_loss_is_unit_local_token_loss():
     assert torch.equal(metrics["loss"], metrics["token_loss"])
 
 
+def test_writer_trainer_accepts_base_dil_checkpoint_format(tmp_path: Path):
+    cfg = tiny_config()
+    model = Dil(cfg)
+    cfg.save_pretrained(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "format_version": cfg.checkpoint_format_version,
+            "model_state_dict": model.state_dict(),
+            "training_state": {"step": 0},
+        },
+        checkpoint_path,
+    )
+    loaded, loaded_config, checkpoint = load_model_checkpoint(checkpoint_path, torch.device("cpu"))
+    assert isinstance(loaded, Dil)
+    assert loaded_config.checkpoint_format_version == cfg.checkpoint_format_version
+    assert checkpoint["format_version"] == cfg.checkpoint_format_version
+
+
+def test_writer_only_metrics_are_tensors():
+    cfg = tiny_config()
+    model = Dil(cfg)
+    surface = pack_token_units(
+        [[[2], [3], [4], [5], [6]]],
+        pad_token_id=cfg.pad_token_id,
+        bucket_sizes=cfg.surface_bucket_sizes,
+        max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
+    )
+    target = make_writer_target(cfg, [[[4]]])
+    metrics = writer_only_metrics(model, {"surface": surface, "writer_target": target})
+    assert all(hasattr(metrics[key], "detach") for key in WRITER_METRIC_KEYS)
+
+
+def test_writer_context_dataset_uses_writer_stop_token(tmp_path: Path):
+    cfg = tiny_config()
+    data = tmp_path / "train.jsonl"
+    data.write_text('{"text":"abc"}\n', encoding="utf-8")
+
+    class TinyTokenizer:
+        eos_token_id = cfg.eos_token_id
+
+        def encode_segments(self, text):
+            from dilnaz.tokenization.hybrid_tokenizer import TokenPiece, TokenSegment
+
+            return [
+                TokenSegment(
+                    text="abc",
+                    start=0,
+                    end=3,
+                    kind="surface",
+                    pieces=(TokenPiece(token_id=2, text="abc", start=0, end=3, kind="surface"),),
+                )
+            ]
+
+    dataset = WriterContextDataset(data, cfg, TinyTokenizer(), batch_size=8, read_chars=1024, repeat=True)
+    batch = next(dataset.iter_once(0, 1))
+    labels = batch["writer_target"].labels
+    assert labels.eq(cfg.writer_stop_token_id).any()
+
+
+def test_writer_context_dataset_aligns_center_surface_with_writer_target(tmp_path: Path):
+    cfg = tiny_config()
+    data = tmp_path / "train.jsonl"
+    data.write_text('{"text":"abc def"}\n', encoding="utf-8")
+
+    class TinyTokenizer:
+        eos_token_id = cfg.eos_token_id
+
+        def encode_segments(self, text):
+            from dilnaz.tokenization.hybrid_tokenizer import TokenPiece, TokenSegment
+
+            return [
+                TokenSegment(
+                    text="abc",
+                    start=0,
+                    end=3,
+                    kind="surface",
+                    pieces=(TokenPiece(token_id=2, text="abc", start=0, end=3, kind="surface"),),
+                ),
+                TokenSegment(
+                    text=" ",
+                    start=3,
+                    end=4,
+                    kind="space",
+                    pieces=(TokenPiece(token_id=3, text=" ", start=3, end=4, kind="space"),),
+                ),
+                TokenSegment(
+                    text="def",
+                    start=4,
+                    end=7,
+                    kind="surface",
+                    pieces=(TokenPiece(token_id=4, text="def", start=4, end=7, kind="surface"),),
+                ),
+            ]
+
+    dataset = WriterContextDataset(data, cfg, TinyTokenizer(), batch_size=8, read_chars=1024, repeat=True)
+    batch = next(dataset.iter_once(0, 1))
+    surface = batch["surface"]
+    labels = batch["writer_target"].labels
+    assert surface.unit_lengths[0].tolist() == [0, 0, 1, 1, 1]
+    assert surface.ids[0, surface.unit_offsets[0, cfg.target_index]].item() == 2
+    assert labels[0, 0].item() == 2
+    assert labels[1, 0].item() == 3
+    assert labels[2, 0].item() == 4
+
+
 def test_writer_generation_result_stops_or_hits_surface_limit():
     cfg = tiny_config()
     model = Dil(cfg)
@@ -146,7 +278,7 @@ def test_writer_generation_stops_on_eos_stop_token():
     cfg = tiny_config()
     model = Dil(cfg)
 
-    def stop_transition(self, semantic, query_surface=None):
+    def stop_forward(self, semantic, query_surface=None):
         logits = torch.zeros(
             query_surface.ids.shape[0],
             query_surface.surface_width,
@@ -154,9 +286,10 @@ def test_writer_generation_stops_on_eos_stop_token():
             device=semantic.device,
         )
         logits[..., self.stop_token_id] = 1.0
-        return DilWriterOutput(token_logits=logits, query_surface=query_surface)
+        return logits
 
-    model.writer.transition = MethodType(stop_transition, model.writer)
+    from types import MethodType
+    model.writer.forward = MethodType(stop_forward, model.writer)
     generation = model.decode_semantic(torch.randn(2, cfg.latent_size))
     assert generation.stopped.tolist() == [True, True]
     assert generation.lengths.tolist() == [0, 0]
@@ -167,7 +300,7 @@ def test_writer_generation_caps_when_stop_is_missing():
     cfg = tiny_config()
     model = Dil(cfg)
 
-    def token_transition(self, semantic, query_surface=None):
+    def token_forward(self, semantic, query_surface=None):
         logits = torch.zeros(
             query_surface.ids.shape[0],
             query_surface.surface_width,
@@ -175,9 +308,10 @@ def test_writer_generation_caps_when_stop_is_missing():
             device=semantic.device,
         )
         logits[..., 2] = 1.0
-        return DilWriterOutput(token_logits=logits, query_surface=query_surface)
+        return logits
 
-    model.writer.transition = MethodType(token_transition, model.writer)
+    from types import MethodType
+    model.writer.forward = MethodType(token_forward, model.writer)
     generation = model.decode_semantic(torch.randn(2, cfg.latent_size))
     assert generation.stopped.tolist() == [False, False]
     assert generation.lengths.tolist() == [cfg.max_surface_pieces_per_unit, cfg.max_surface_pieces_per_unit]

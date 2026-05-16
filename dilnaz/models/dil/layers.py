@@ -48,3 +48,17 @@ class DilPackedConvSwiGLUBlock(nn.Module):
         hidden_states = self.dropout(self.down_proj(hidden_states))
         hidden_states = residual + hidden_states
         return hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
+
+
+class DilLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+            nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias),
+            nn.SiLU(),
+            nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states + self.mlp(hidden_states)

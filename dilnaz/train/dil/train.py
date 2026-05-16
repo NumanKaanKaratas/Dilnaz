@@ -23,7 +23,7 @@ from dilnaz.train.common.runtime import (
     validate_compile_environment,
 )
 from dilnaz.train.data.dil_data import (
-    HybridDilBatchDataset,
+    ContextDilBatchDataset,
     NllbTeacher,
     ResidentDilBatcher,
     ResidentDilEvalLoader,
@@ -35,7 +35,7 @@ from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
-CHECKPOINT_FORMAT_VERSION = 30
+CHECKPOINT_FORMAT_VERSION = 26
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -54,7 +54,8 @@ class AsyncTeacherBatchSource:
         try:
             while not self.stop_event.is_set():
                 batch = next(self.train_iter)
-                teacher_layers, teacher_mask = self.teacher.teacher_layers(batch)
+                text_list = batch.pop("texts", None)
+                teacher_layers, teacher_mask = self.teacher.teacher_layers(batch, texts=text_list)
                 batch["teacher_layers"] = teacher_layers
                 batch["teacher_mask"] = teacher_mask
                 cuda_sync(self.device)
@@ -94,8 +95,7 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "pad_token_id": config.pad_token_id,
         "eos_token_id": config.eos_token_id,
         "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
-        "max_sequence_units": config.max_sequence_units,
-        "encoder_context_layers": config.encoder_context_layers,
+        "context_radius": config.context_radius,
         "latent_size": config.latent_size,
         "distillation_weight": config.distillation_weight,
     }
@@ -329,6 +329,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--writer-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_kernel_size"])
     parser.add_argument("--writer-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_expansion"])
     parser.add_argument("--writer-dropout", type=float, default=DIL_MODEL_DEFAULTS["writer_dropout"])
+    parser.add_argument("--num-encoder-layers", type=int, default=DIL_MODEL_DEFAULTS.get("num_encoder_layers", 6))
     parser.add_argument("--nllb-model-name", default="facebook/nllb-200-distilled-600M")
     parser.add_argument("--nllb-src-lang", default="tur_Latn")
     return parser.parse_args(argv)
@@ -373,6 +374,7 @@ def validate_args(args):
         raise ValueError("--max-eval-batches must be > 0")
     if args.data_mode == "resident" and args.max_samples > 0:
         raise ValueError("--max-samples is not supported with --data-mode resident")
+
 def build_config(args, tokenizer):
     if args.resume is not None:
         return DilConfig.from_pretrained(args.resume.parent)
@@ -382,6 +384,7 @@ def build_config(args, tokenizer):
         eos_token_id=tokenizer.eos_token_id,
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
+        num_encoder_layers=args.num_encoder_layers,
         latent_size=args.latent_size,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
@@ -391,7 +394,6 @@ def build_config(args, tokenizer):
         distillation_weight=args.distillation_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
-        max_sequence_units=DIL_MODEL_DEFAULTS["max_sequence_units"],
         writer_num_layers=args.writer_num_layers,
         writer_conv_kernel_size=args.writer_conv_kernel_size,
         writer_conv_expansion=args.writer_conv_expansion,
@@ -469,7 +471,7 @@ class DilBaseTrainer(BaseTrainer):
         )
 
     def make_train_dataset(self):
-        return HybridDilBatchDataset(
+        return ContextDilBatchDataset(
             self.args.train_file,
             self.config,
             self.tokenizer,
@@ -484,7 +486,7 @@ class DilBaseTrainer(BaseTrainer):
     def make_eval_dataset(self):
         if self.args.eval_every <= 0:
             return None
-        return HybridDilBatchDataset(
+        return ContextDilBatchDataset(
             self.args.eval_file,
             self.config,
             self.tokenizer,
@@ -576,7 +578,8 @@ class DilBaseTrainer(BaseTrainer):
             return
         if self.teacher is None:
             raise ValueError("eval batch has no teacher_layers and no NLLB teacher is available")
-        teacher_layers, teacher_mask = self.teacher.teacher_layers(batch)
+        text_list = batch.pop("texts", None)
+        teacher_layers, teacher_mask = self.teacher.teacher_layers(batch, texts=text_list)
         batch["teacher_layers"] = teacher_layers
         batch["teacher_mask"] = teacher_mask
 
