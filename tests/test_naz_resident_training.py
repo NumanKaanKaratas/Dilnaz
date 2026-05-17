@@ -3,8 +3,9 @@ from types import SimpleNamespace
 
 import torch
 
-from dilnaz.models.dil import DilConfig
-from dilnaz.models.naz import NazConfig
+from dilnaz.models.dil import DilConfig, compose_factorized_latent, normalize_semantic_latents
+from dilnaz.models.naz import Naz, NazConfig
+from dilnaz.models.naz.outputs import NazDynamicsOutput
 from dilnaz.train.naz import train as naz_train
 
 
@@ -31,6 +32,8 @@ def test_resident_source_uses_dil_surface_config(monkeypatch, tmp_path: Path):
         hidden_size=32,
         intermediate_size=64,
         latent_size=16,
+        semantic_latent_size=12,
+        surface_latent_size=4,
         max_surface_pieces_per_unit=16,
         surface_bucket_sizes=(8, 32),
         encoder_context_layers=2,
@@ -42,7 +45,12 @@ def test_resident_source_uses_dil_surface_config(monkeypatch, tmp_path: Path):
         encoder_attention_window=4,
         writer_num_layers=1,
     )
-    naz_config = NazConfig(latent_size=dil_config.latent_size, mtp_horizons=2)
+    naz_config = NazConfig(
+        latent_size=dil_config.latent_size,
+        semantic_latent_size=dil_config.semantic_latent_size,
+        surface_latent_size=dil_config.surface_latent_size,
+        mtp_horizons=2,
+    )
     seen = {}
 
     def fake_build_token_cache(*args, **kwargs):
@@ -60,7 +68,7 @@ def test_resident_source_uses_dil_surface_config(monkeypatch, tmp_path: Path):
 
     def fake_build_resident_semantic_cache(*args, **kwargs):
         semantic = torch.zeros(12, dil_config.latent_size)
-        target = torch.zeros(12, naz_config.mtp_horizons, dil_config.latent_size)
+        target = torch.zeros(12, dil_config.latent_size)
         return semantic, target
 
     monkeypatch.setattr(naz_train, "build_token_cache", fake_build_token_cache)
@@ -95,3 +103,99 @@ def test_resident_source_uses_dil_surface_config(monkeypatch, tmp_path: Path):
 
     assert seen["config"] is dil_config
     assert trainer.train_iterator is not None
+
+
+def test_naz_mixture_loss_splits_semantic_and_surface_terms():
+    config = NazConfig(
+        latent_size=16,
+        semantic_latent_size=12,
+        surface_latent_size=4,
+        mtp_horizons=1,
+        mtp_loss_weights=(1.0,),
+        num_semantic_candidates=1,
+    )
+    semantic = normalize_semantic_latents(torch.ones(1, 1, 1, config.semantic_latent_size))
+    target = compose_factorized_latent(
+        semantic,
+        torch.zeros(1, 1, 1, config.surface_latent_size),
+    )
+    selected = compose_factorized_latent(
+        semantic,
+        torch.ones(1, 1, 1, config.surface_latent_size),
+    )
+    dynamics = NazDynamicsOutput(
+        candidate_latents=selected.unsqueeze(3),
+        selected_latents=selected,
+        router_logits=torch.zeros(1, 1, 1, 1),
+        selected_indices=torch.zeros(1, 1, 1, dtype=torch.long),
+    )
+
+    class Harness:
+        def horizon_loss_weights(self, device, dtype):
+            return Naz.horizon_loss_weights(self, device, dtype)
+
+    harness = Harness()
+    harness.config = config
+    harness.mixture_sigma = torch.ones(config.mtp_horizons)
+    losses = Naz.semantic_mixture_losses(
+        harness,
+        dynamics,
+        target,
+        torch.ones(1, 1, 1, dtype=torch.bool),
+    )
+
+    assert losses["chosen_mse"].item() == 0.0
+    assert losses["surface_mse"].item() == config.surface_latent_size
+
+
+def test_naz_repetition_cosine_ignores_surface_tail():
+    config = NazConfig(
+        latent_size=16,
+        semantic_latent_size=12,
+        surface_latent_size=4,
+        mtp_horizons=1,
+        mtp_loss_weights=(1.0,),
+    )
+    semantic = normalize_semantic_latents(torch.ones(1, config.semantic_latent_size))
+    previous = compose_factorized_latent(semantic, -torch.ones(1, config.surface_latent_size))
+    predicted = compose_factorized_latent(semantic, torch.ones(1, config.surface_latent_size))
+
+    class FakeStudent:
+        def embed_semantic_states(self, states):
+            return states
+
+    class FakeTransformer:
+        def __call__(self, inputs_embeds, attention_mask, past_key_values, use_cache, max_cache_length):
+            return SimpleNamespace(last_hidden_state=inputs_embeds, past_key_values=None)
+
+    class FakeHead:
+        def __call__(self, hidden_states):
+            return NazDynamicsOutput(
+                selected_latents=predicted.view(1, 1, 1, -1),
+                selected_indices=torch.zeros(1, 1, 1, dtype=torch.long),
+            )
+
+    class Harness:
+        pass
+
+    harness = Harness()
+    harness.config = config
+    harness.min_new_tokens = 0
+    harness.repetition_cos_threshold = 0.99
+    harness.student_core = FakeStudent()
+    harness.transformer = FakeTransformer()
+    harness.semantic_head = FakeHead()
+
+    step = next(
+        Naz._generate_stream_from_semantic_states(
+            harness,
+            previous.view(1, 1, -1),
+            torch.ones(1, 1, dtype=torch.bool),
+            max_new_tokens=1,
+            min_new_tokens=0,
+            repetition_cos_threshold=0.99,
+        )
+    )
+
+    assert step.latent_cos_to_previous.item() > 0.999
+    assert step.should_stop.item()

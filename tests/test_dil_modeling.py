@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from dilnaz.models.dil import Dil, DilConfig
+from dilnaz.models.dil import Dil, DilConfig, compose_factorized_latent, split_factorized_latent
 from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
 from dilnaz.train.writer.train import WRITER_METRIC_KEYS, WriterContextDataset, load_model_checkpoint, writer_only_metrics
@@ -18,12 +18,32 @@ def tiny_config() -> DilConfig:
         hidden_size=32,
         intermediate_size=64,
         latent_size=16,
+        semantic_latent_size=12,
+        surface_latent_size=4,
         max_surface_pieces_per_unit=16,
         surface_bucket_sizes=(8, 16, 32, 64),
         byte_conv_layers=1,
         num_encoder_layers=2,
         writer_num_layers=1,
     )
+
+
+def test_factorized_latent_split_compose_and_bounds():
+    cfg = tiny_config()
+    semantic = torch.randn(2, 3, cfg.semantic_latent_size)
+    surface = torch.randn(2, 3, cfg.surface_latent_size).tanh()
+    composed = compose_factorized_latent(semantic, surface)
+    split_semantic, split_surface = split_factorized_latent(
+        composed,
+        cfg.semantic_latent_size,
+        cfg.surface_latent_size,
+    )
+    assert composed.shape == (2, 3, cfg.latent_size)
+    assert split_semantic.dtype == semantic.dtype
+    assert split_surface.dtype == surface.dtype
+    assert torch.equal(split_semantic, semantic)
+    assert torch.equal(split_surface, surface)
+    assert split_surface.abs().max() <= 1.0
 
 
 def test_dil_config_sequence_limit_matches_training_default():
@@ -106,12 +126,18 @@ def test_dil_packed_encoder_output_shape():
     )
     semantic_pooled = model.encode(window_surface)
     assert semantic_pooled.shape == (1, cfg.latent_size), f"shape={semantic_pooled.shape}"
+    semantic_part, surface_part = split_factorized_latent(
+        semantic_pooled,
+        cfg.semantic_latent_size,
+        cfg.surface_latent_size,
+    )
     assert torch.allclose(
-        semantic_pooled.norm(dim=-1),
-        torch.full((1,), cfg.latent_size**0.5),
+        semantic_part.norm(dim=-1),
+        torch.full((1,), cfg.semantic_latent_size**0.5),
         atol=1e-4,
         rtol=1e-4,
     )
+    assert surface_part.abs().max() <= 1.0
 
 
 def test_writer_packed_logits_no_nan():
@@ -147,6 +173,32 @@ def test_writer_causal_surface_path_does_not_see_future_inputs():
     assert torch.allclose(left_logits[:, 1], right_logits[:, 1], atol=1e-6, rtol=1e-5)
 
 
+def test_writer_incremental_step_matches_full_causal_forward():
+    cfg = tiny_config()
+    model = Dil(cfg).eval()
+    semantic = torch.randn(1, cfg.latent_size)
+    target = make_writer_target(cfg, [[[2, 3, 4]]])
+    with torch.no_grad():
+        full_logits = model.writer.transition(semantic, query_surface=target.query).token_logits
+        caches = [None for _ in model.writer.blocks]
+        stepped = []
+        for position in range(target.query.surface_width):
+            logits, caches = model.writer.step(
+                semantic,
+                target.query.ids[:, position],
+                target.query.pos_in_unit[:, position],
+                caches,
+            )
+            stepped.append(logits)
+    step_logits = torch.stack(stepped, dim=1)
+    assert torch.allclose(
+        step_logits[target.query.mask],
+        full_logits[target.query.mask],
+        atol=1e-5,
+        rtol=1e-4,
+    )
+
+
 def test_writer_loss_is_unit_local_token_loss():
     cfg = tiny_config()
     model = Dil(cfg)
@@ -155,6 +207,30 @@ def test_writer_loss_is_unit_local_token_loss():
     metrics = model.writer_loss_and_metrics(semantic, target, return_metrics=True)
     assert torch.isfinite(metrics["loss"])
     assert torch.equal(metrics["loss"], metrics["token_loss"])
+
+
+def test_writer_surface_loss_does_not_backprop_to_semantic_trunk():
+    cfg = tiny_config()
+    model = Dil(cfg).eval()
+    surface = pack_token_units(
+        [[[2], [3], [4], [5], [6]]],
+        pad_token_id=cfg.pad_token_id,
+        bucket_sizes=cfg.surface_bucket_sizes,
+        max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
+    )
+    target = make_writer_target(cfg, [[[4]]])
+    output = model(surface, labels=target)
+    output.loss.backward()
+
+    def has_no_effective_grad(parameter: torch.nn.Parameter) -> bool:
+        return parameter.grad is None or not parameter.grad.abs().gt(0).any()
+
+    assert has_no_effective_grad(model.encoder.semantic_head.weight)
+    assert has_no_effective_grad(model.encoder.embed_tokens.weight)
+    assert model.encoder.surface_head.weight.grad is not None
+    assert model.writer.surface_proj.weight.grad is not None
+    assert model.encoder.surface_head.weight.grad.abs().gt(0).any()
+    assert model.writer.surface_proj.weight.grad.abs().gt(0).any()
 
 
 def test_writer_trainer_accepts_base_dil_checkpoint_format(tmp_path: Path):
@@ -278,18 +354,13 @@ def test_writer_generation_stops_on_eos_stop_token():
     cfg = tiny_config()
     model = Dil(cfg)
 
-    def stop_forward(self, semantic, query_surface=None):
-        logits = torch.zeros(
-            query_surface.ids.shape[0],
-            query_surface.surface_width,
-            self.vocab_size,
-            device=semantic.device,
-        )
-        logits[..., self.stop_token_id] = 1.0
-        return logits
+    def stop_step(self, semantic, token_ids, positions, caches):
+        logits = torch.zeros(semantic.shape[0], self.vocab_size, device=semantic.device)
+        logits[:, self.stop_token_id] = 1.0
+        return logits, caches
 
     from types import MethodType
-    model.writer.forward = MethodType(stop_forward, model.writer)
+    model.writer.step = MethodType(stop_step, model.writer)
     generation = model.decode_semantic(torch.randn(2, cfg.latent_size))
     assert generation.stopped.tolist() == [True, True]
     assert generation.lengths.tolist() == [0, 0]
@@ -300,18 +371,13 @@ def test_writer_generation_caps_when_stop_is_missing():
     cfg = tiny_config()
     model = Dil(cfg)
 
-    def token_forward(self, semantic, query_surface=None):
-        logits = torch.zeros(
-            query_surface.ids.shape[0],
-            query_surface.surface_width,
-            self.vocab_size,
-            device=semantic.device,
-        )
-        logits[..., 2] = 1.0
-        return logits
+    def token_step(self, semantic, token_ids, positions, caches):
+        logits = torch.zeros(semantic.shape[0], self.vocab_size, device=semantic.device)
+        logits[:, 2] = 1.0
+        return logits, caches
 
     from types import MethodType
-    model.writer.forward = MethodType(token_forward, model.writer)
+    model.writer.step = MethodType(token_step, model.writer)
     generation = model.decode_semantic(torch.randn(2, cfg.latent_size))
     assert generation.stopped.tolist() == [False, False]
     assert generation.lengths.tolist() == [cfg.max_surface_pieces_per_unit, cfg.max_surface_pieces_per_unit]

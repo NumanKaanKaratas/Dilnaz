@@ -14,6 +14,10 @@ class DilConfig(PretrainedConfig):
         intermediate_size=1280,
         num_encoder_layers=6,
         latent_size=512,
+        semantic_latent_size=480,
+        surface_latent_size=32,
+        encoder_context_layers=2,
+        max_sequence_units=4096,
         max_surface_pieces_per_unit=256,
         surface_bucket_sizes=(64, 128, 256, 512, 1024, 2048, 4096, 8192),
         context_radius=2,
@@ -36,7 +40,7 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=26,
+        checkpoint_format_version=31,
         **kwargs,
     ):
         self.surface_bucket_sizes = tuple(int(bucket) for bucket in surface_bucket_sizes)
@@ -64,6 +68,14 @@ class DilConfig(PretrainedConfig):
             raise ValueError("num_encoder_layers must be > 0")
         if num_encoder_layers % 2 != 0:
             raise ValueError("num_encoder_layers must be even")
+        if encoder_context_layers <= 0:
+            raise ValueError("encoder_context_layers must be > 0")
+        if semantic_latent_size <= 0 or surface_latent_size <= 0:
+            raise ValueError("semantic_latent_size and surface_latent_size must be > 0")
+        if latent_size != semantic_latent_size + surface_latent_size:
+            raise ValueError("latent_size must equal semantic_latent_size + surface_latent_size")
+        if checkpoint_format_version != 31:
+            raise ValueError("DIL factorized latent v2 requires checkpoint_format_version=31")
 
         self.byte_vocab_size = byte_vocab_size
         self.vocab_size = vocab_size
@@ -72,9 +84,12 @@ class DilConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_encoder_layers = num_encoder_layers
+        self.encoder_context_layers = encoder_context_layers
         self.latent_size = latent_size
+        self.semantic_latent_size = semantic_latent_size
+        self.surface_latent_size = surface_latent_size
         self.max_surface_pieces_per_unit = max_surface_pieces_per_unit
-        self.max_sequence_units = 4096
+        self.max_sequence_units = max_sequence_units
         self.context_radius = context_radius
         self.context_size = 2 * context_radius + 1
         self.target_index = context_radius

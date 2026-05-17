@@ -35,7 +35,7 @@ from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
-CHECKPOINT_FORMAT_VERSION = 26
+CHECKPOINT_FORMAT_VERSION = 31
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -97,6 +97,8 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
         "context_radius": config.context_radius,
         "latent_size": config.latent_size,
+        "semantic_latent_size": config.semantic_latent_size,
+        "surface_latent_size": config.surface_latent_size,
         "distillation_weight": config.distillation_weight,
     }
 
@@ -187,17 +189,20 @@ def is_dataloader_worker_exit(error: RuntimeError) -> bool:
 
 
 def model_inputs(batch: dict) -> dict:
-    return {
+    inputs = {
         "surface": batch["surface"],
         "teacher_layers": batch["teacher_layers"],
         "teacher_mask": batch["teacher_mask"],
     }
+    if "labels" in batch:
+        inputs["labels"] = batch["labels"]
+    return inputs
 
 
-def freeze_writer_for_encoder_training(model: Dil) -> None:
-    model.writer.eval()
+def prepare_writer_for_surface_training(model: Dil) -> None:
+    model.writer.train()
     for param in model.writer.parameters():
-        param.requires_grad_(False)
+        param.requires_grad_(True)
 
 
 class AsyncTeacherIterator:
@@ -227,8 +232,14 @@ def empty_metric_sums() -> dict:
     return {
         "loss": 0.0,
         "distill": 0.0,
+        "sem_loss": 0.0,
+        "sem_cos": 0.0,
+        "surface_loss": 0.0,
+        "surface_norm": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
+        "writer_token_exact": 0.0,
+        "writer_stop_acc": 0.0,
         "batches": 0,
         "source_line_ids": set(),
     }
@@ -237,8 +248,14 @@ def empty_metric_sums() -> dict:
 def accumulate_output_metrics(total: dict, outputs, batch: dict) -> None:
     total["loss"] += float(outputs.loss.detach().cpu())
     total["distill"] += float(outputs.distill_loss.detach().cpu())
+    total["sem_loss"] += float(outputs.semantic_loss.detach().cpu())
+    total["sem_cos"] += float(outputs.semantic_cos.detach().cpu())
+    total["surface_loss"] += float(outputs.surface_loss.detach().cpu())
+    total["surface_norm"] += float(outputs.surface_norm.detach().cpu())
     total["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     total["var"] += float(outputs.variance_loss.detach().cpu())
+    total["writer_token_exact"] += float(outputs.token_exact.detach().cpu())
+    total["writer_stop_acc"] += float(outputs.stop_acc.detach().cpu())
     total["batches"] += 1
     if "source_line_ids" in batch:
         total["source_line_ids"].update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
@@ -261,8 +278,14 @@ def format_log(step, metrics):
         f"step={step}",
         f"loss={metrics['loss']:.4f}",
         f"distill={metrics['distill']:.4f}",
+        f"sem_loss={metrics['sem_loss']:.4f}",
+        f"sem_cos={metrics['sem_cos']:.4f}",
+        f"surface_loss={metrics['surface_loss']:.4f}",
+        f"surface_norm={metrics['surface_norm']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
+        f"writer_token_exact={metrics['writer_token_exact']:.4f}",
+        f"writer_stop_acc={metrics['writer_stop_acc']:.4f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -317,6 +340,9 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
+    parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
+    parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
+    parser.add_argument("--encoder-context-layers", type=int, default=DIL_MODEL_DEFAULTS["encoder_context_layers"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -348,6 +374,12 @@ def validate_args(args):
         raise ValueError("--text-read-chars must be > 0")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
+    if args.semantic_latent_size <= 0 or args.surface_latent_size <= 0:
+        raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
+    if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
+        raise ValueError("--latent-size must equal semantic + surface latent sizes")
+    if args.encoder_context_layers <= 0:
+        raise ValueError("--encoder-context-layers must be > 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
@@ -386,6 +418,9 @@ def build_config(args, tokenizer):
         intermediate_size=args.intermediate_size,
         num_encoder_layers=args.num_encoder_layers,
         latent_size=args.latent_size,
+        semantic_latent_size=args.semantic_latent_size,
+        surface_latent_size=args.surface_latent_size,
+        encoder_context_layers=args.encoder_context_layers,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -425,7 +460,7 @@ class DilBaseTrainer(BaseTrainer):
         self.cuda_prefetch = bool(self.device.type == "cuda" and not args.no_cuda_prefetch)
         self.model = Dil(self.config).to(self.device)
         self.model.train()
-        freeze_writer_for_encoder_training(self.model)
+        prepare_writer_for_surface_training(self.model)
         self.optimizer = AdamW(
             self.optimizer_param_groups(args.weight_decay),
             lr=args.learning_rate,
@@ -644,6 +679,7 @@ class DilBaseTrainer(BaseTrainer):
             f"device={self.device.type} bf16={int(self.autocast_enabled)} compile_mode={self.compile_mode} "
             f"data_mode={self.args.data_mode} resume_step={self.start_step} teacher_source=online_nllb "
             f"vocab_size={self.config.vocab_size} latent_size={self.config.latent_size} "
+            f"semantic_latent_size={self.config.semantic_latent_size} surface_latent_size={self.config.surface_latent_size} "
             f"hidden_size={self.config.hidden_size}",
             flush=True,
         )

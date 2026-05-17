@@ -43,8 +43,8 @@ from dilnaz.models.dil import Dil
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 30
-WRITER_OBJECTIVE = "writer_v5"
+CHECKPOINT_FORMAT_VERSION = 31
+WRITER_OBJECTIVE = "factorized_writer_v1"
 WRITER_METRIC_KEYS = (
     "loss",
     "token_loss",
@@ -241,6 +241,8 @@ def save_checkpoint(
         "writer_stop_token_id": config.writer_stop_token_id,
         "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
         "latent_size": config.latent_size,
+        "semantic_latent_size": config.semantic_latent_size,
+        "surface_latent_size": config.surface_latent_size,
     }
     import os as _os
 
@@ -266,8 +268,7 @@ def load_model_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[
     config = DilConfig.from_pretrained(checkpoint_path.parent)
     model = Dil(config).to(device)
     checkpoint = load_checkpoint(checkpoint_path, device)
-    supported_formats = {config.checkpoint_format_version, CHECKPOINT_FORMAT_VERSION}
-    if checkpoint["format_version"] not in supported_formats:
+    if checkpoint["format_version"] != CHECKPOINT_FORMAT_VERSION:
         raise ValueError(f"unsupported Dil checkpoint format_version={checkpoint.get('format_version')}")
     model.load_state_dict(checkpoint["model_state_dict"])
     return model, config, checkpoint

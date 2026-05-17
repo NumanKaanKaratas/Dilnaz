@@ -30,6 +30,22 @@ class DilPackedCausalDepthwiseConv(nn.Module):
             output = output + self.bias.view(1, 1, hidden_size)
         return output * mask.unsqueeze(-1).to(output.dtype)
 
+    def step(self, hidden_state: torch.Tensor, cache: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, hidden_size = hidden_state.shape
+        history_width = self.kernel_size - 1
+        if cache is None:
+            cache = hidden_state.new_zeros((batch_size, 0, hidden_size))
+        if cache.shape[1] < history_width:
+            pad = hidden_state.new_zeros((batch_size, history_width - cache.shape[1], hidden_size))
+            cache_window = torch.cat([pad, cache, hidden_state.unsqueeze(1)], dim=1)
+        else:
+            cache_window = torch.cat([cache[:, -history_width:], hidden_state.unsqueeze(1)], dim=1)
+        output = (cache_window * self.weight.T.view(1, self.kernel_size, hidden_size)).sum(dim=1)
+        if self.bias is not None:
+            output = output + self.bias.view(1, hidden_size)
+        new_cache = cache_window[:, -history_width:] if history_width > 0 else cache_window[:, :0]
+        return output, new_cache
+
 
 class DilCausalConvSwiGLUBlock(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, kernel_size: int, eps: float, bias: bool, dropout: float = 0.0):
@@ -58,3 +74,11 @@ class DilCausalConvSwiGLUBlock(nn.Module):
         if mask is not None:
             hidden_states = hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
         return hidden_states
+
+    def step(self, hidden_state: torch.Tensor, cache: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        residual = hidden_state
+        hidden_state = self.norm(hidden_state)
+        hidden_state, cache = self.depthwise.step(hidden_state, cache)
+        hidden_state = F.silu(self.gate_proj(hidden_state)) * self.up_proj(hidden_state)
+        hidden_state = self.dropout(self.down_proj(hidden_state))
+        return residual + hidden_state, cache

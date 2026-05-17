@@ -12,7 +12,10 @@ class NazConfig(PretrainedConfig):
         pad_token_id=256,
         eos_token_id=257,
         latent_size=512,
+        semantic_latent_size=480,
+        surface_latent_size=32,
         reconstruction_loss_weight=1.0,
+        surface_loss_weight=0.05,
         num_semantic_candidates=4,
         mtp_horizons=3,
         mtp_loss_weights=(1.0, 0.3, 0.15),
@@ -57,11 +60,18 @@ class NazConfig(PretrainedConfig):
     ):
         if "max_word_bytes" in kwargs:
             raise ValueError("fixed-width surface config is not supported by Naz")
+        if semantic_latent_size <= 0 or surface_latent_size <= 0:
+            raise ValueError("semantic_latent_size and surface_latent_size must be > 0")
+        if latent_size != semantic_latent_size + surface_latent_size:
+            raise ValueError("latent_size must equal semantic_latent_size + surface_latent_size")
         self.dil_path = dil_path
         self.byte_vocab_size = byte_vocab_size
         self.vocab_size = vocab_size
         self.latent_size = latent_size
+        self.semantic_latent_size = semantic_latent_size
+        self.surface_latent_size = surface_latent_size
         self.reconstruction_loss_weight = reconstruction_loss_weight
+        self.surface_loss_weight = surface_loss_weight
         self.num_semantic_candidates = num_semantic_candidates
         self.mtp_horizons = mtp_horizons
         self.mtp_loss_weights = tuple(float(weight) for weight in mtp_loss_weights)

@@ -23,10 +23,10 @@ from dilnaz.train.common.runtime import (
 from dilnaz.train.data.dil_data import load_hybrid_tokenizer, make_dil_batch_loader, segment_piece_ids, trainable_segments
 from dilnaz.surface import pack_token_units
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
-from dilnaz.models.dil import DilConfig
+from dilnaz.models.dil import DilConfig, split_factorized_latent
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import HybridTokenizer, TokenSegment, default_vocab_path
-from dilnaz.train.dil.train import freeze_writer_for_encoder_training, is_dataloader_worker_exit, restore_checkpoint, save_checkpoint
+from dilnaz.train.dil.train import prepare_writer_for_surface_training, is_dataloader_worker_exit, restore_checkpoint, save_checkpoint
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
@@ -373,6 +373,9 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
+    parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
+    parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
+    parser.add_argument("--encoder-context-layers", type=int, default=DIL_MODEL_DEFAULTS["encoder_context_layers"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -411,6 +414,12 @@ def validate_args(args) -> None:
         raise ValueError("--shuffle-buffer-size must be >= --batch-size")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
+    if args.semantic_latent_size <= 0 or args.surface_latent_size <= 0:
+        raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
+    if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
+        raise ValueError("--latent-size must equal semantic + surface latent sizes")
+    if args.encoder_context_layers <= 0:
+        raise ValueError("--encoder-context-layers must be > 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
@@ -456,6 +465,9 @@ def build_config(args, tokenizer: HybridTokenizer) -> DilConfig:
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         latent_size=args.latent_size,
+        semantic_latent_size=args.semantic_latent_size,
+        surface_latent_size=args.surface_latent_size,
+        encoder_context_layers=args.encoder_context_layers,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -559,7 +571,7 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
         self.cuda_prefetch = bool(self.device.type == "cuda" and not args.no_cuda_prefetch)
         self.model = Dil(self.config).to(self.device)
         self.model.train()
-        freeze_writer_for_encoder_training(self.model)
+        prepare_writer_for_surface_training(self.model)
         self.optimizer = AdamW(
             self.optimizer_param_groups(args.weight_decay),
             lr=args.learning_rate,
@@ -644,6 +656,11 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
         surface = batch[f"{prefix}_surface"]
         unit_mask = batch[f"{prefix}_unit_mask"]
         latents = self.model.encode(surface).float()
+        latents, _ = split_factorized_latent(
+            latents,
+            self.config.semantic_latent_size,
+            self.config.surface_latent_size,
+        )
         if latents.shape[:2] != unit_mask.shape:
             raise ValueError("encoded sequence latents must match unit_mask shape")
         return latents * unit_mask.unsqueeze(-1).to(latents.dtype)

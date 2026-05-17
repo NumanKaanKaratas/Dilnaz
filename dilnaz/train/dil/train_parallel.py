@@ -34,7 +34,7 @@ from dilnaz.train.data.parallel_dil_data import (
 )
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.dil.train import (
-    freeze_writer_for_encoder_training,
+    prepare_writer_for_surface_training,
     is_dataloader_worker_exit,
     make_scheduler,
     model_inputs,
@@ -119,6 +119,9 @@ def parse_args():
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
+    parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
+    parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
+    parser.add_argument("--encoder-context-layers", type=int, default=DIL_MODEL_DEFAULTS["encoder_context_layers"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -152,6 +155,12 @@ def validate_args(args):
         raise ValueError("--parallel-alignment-weight must be >= 0")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
+    if args.semantic_latent_size <= 0 or args.surface_latent_size <= 0:
+        raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
+    if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
+        raise ValueError("--latent-size must equal semantic + surface latent sizes")
+    if args.encoder_context_layers <= 0:
+        raise ValueError("--encoder-context-layers must be > 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
@@ -187,6 +196,9 @@ def build_config(args, tokenizer):
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         latent_size=args.latent_size,
+        semantic_latent_size=args.semantic_latent_size,
+        surface_latent_size=args.surface_latent_size,
+        encoder_context_layers=args.encoder_context_layers,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -281,7 +293,13 @@ def evaluate_parallel(
         cudagraph_step_begin(device, compile_mode)
         with autocast_context(autocast_enabled):
             outputs = model(**model_inputs(batch))
-            loss, parallel_loss = parallel_total_loss(outputs, batch, parallel_alignment_weight)
+            loss, parallel_loss = parallel_total_loss(
+                outputs,
+                batch,
+                parallel_alignment_weight,
+                model.config.semantic_latent_size,
+                model.config.surface_latent_size,
+            )
         accumulate_metrics(total, loss, outputs, parallel_loss, batch, model.config, parallel_alignment_weight)
         batches += 1
         if batch_idx >= max_batches:
@@ -316,7 +334,7 @@ def main():
 
     base_model = Dil(config).to(device)
     base_model.train()
-    freeze_writer_for_encoder_training(base_model)
+    prepare_writer_for_surface_training(base_model)
     base_model.set_compiled_forwards(
         encoder_forward=compile_forward(base_model.encoder.forward, compile_mode, "DilEncoderCore"),
     )
@@ -430,7 +448,13 @@ def main():
                 model_batch["training_step"] = step
                 with autocast_context(autocast_enabled):
                     outputs = model(**model_batch)
-                    loss, parallel_loss = parallel_total_loss(outputs, batch, args.parallel_alignment_weight)
+                    loss, parallel_loss = parallel_total_loss(
+                        outputs,
+                        batch,
+                        args.parallel_alignment_weight,
+                        model.config.semantic_latent_size,
+                        model.config.surface_latent_size,
+                    )
 
                 (loss / args.gradient_accumulation_steps).backward()
                 token_count = int(batch["surface"].mask.sum().detach().cpu())

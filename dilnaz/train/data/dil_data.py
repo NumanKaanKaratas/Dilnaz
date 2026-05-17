@@ -8,7 +8,7 @@ from typing import Iterator
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from dilnaz.surface import pack_token_units
+from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.surface.types import PackedSurface
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
@@ -308,6 +308,7 @@ class ContextDilBatchDataset(IterableDataset):
     def make_batch(
         self,
         unit_rows: list[list[list[int]]],
+        target_rows: list[list[list[int]]],
         texts: list[str],
         line_ids: list[int],
         text_indices: list[int],
@@ -323,6 +324,14 @@ class ContextDilBatchDataset(IterableDataset):
         )
         batch: dict = {
             "surface": surface,
+            "labels": pack_writer_targets(
+                target_rows,
+                pad_token_id=self.pad_token_id,
+                bos_token_id=self.config.decoder_start_token_id,
+                stop_token_id=self.config.writer_stop_token_id,
+                surface_bucket_sizes=self.surface_bucket_sizes,
+                max_pieces_per_unit=self.max_pieces_per_unit,
+            ),
             "teacher_texts": texts,
             "teacher_text_indices": torch.tensor(text_indices, dtype=torch.long),
             "teacher_starts": torch.tensor(starts, dtype=torch.long),
@@ -334,6 +343,7 @@ class ContextDilBatchDataset(IterableDataset):
 
     def iter_once(self, worker_id: int, worker_count: int):
         unit_rows: list[list[list[int]]] = []
+        target_rows: list[list[list[int]]] = []
         texts: list[str] = []
         line_ids: list[int] = []
         text_indices: list[int] = []
@@ -362,6 +372,7 @@ class ContextDilBatchDataset(IterableDataset):
                 text_idx = len(texts)
                 texts.append(text)
                 unit_rows.append(row)
+                target_rows.append([segment_piece_ids(segment)])
                 line_ids.append(source_line_id)
                 text_indices.append(text_idx)
                 starts.append(segment.start)
@@ -369,8 +380,9 @@ class ContextDilBatchDataset(IterableDataset):
                 distill_mask.append(teacher_distill_segment(segment))
                 produced += 1
                 if len(unit_rows) >= self.batch_size:
-                    yield self.make_batch(unit_rows, texts, line_ids, text_indices, starts, ends, distill_mask)
+                    yield self.make_batch(unit_rows, target_rows, texts, line_ids, text_indices, starts, ends, distill_mask)
                     unit_rows = []
+                    target_rows = []
                     texts = []
                     line_ids = []
                     text_indices = []
@@ -379,11 +391,11 @@ class ContextDilBatchDataset(IterableDataset):
                     distill_mask = []
                 if self.max_samples > 0 and produced >= self.max_samples:
                     if unit_rows:
-                        yield self.make_batch(unit_rows, texts, line_ids, text_indices, starts, ends, distill_mask)
+                        yield self.make_batch(unit_rows, target_rows, texts, line_ids, text_indices, starts, ends, distill_mask)
                     return
 
         if unit_rows:
-            yield self.make_batch(unit_rows, texts, line_ids, text_indices, starts, ends, distill_mask)
+            yield self.make_batch(unit_rows, target_rows, texts, line_ids, text_indices, starts, ends, distill_mask)
 
     def __iter__(self):
         worker = get_worker_info()

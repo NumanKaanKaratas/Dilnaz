@@ -9,7 +9,7 @@ from transformers.modeling_utils import PreTrainedModel
 
 from dilnaz.surface import PackedSurface
 
-from ..common.latents import angular_noise_like
+from ..common.latents import angular_noise_like, compose_factorized_latent, split_factorized_latent
 from ..dil import Dil, DilConfig
 from .configuration import NazConfig
 from .outputs import NazDynamicsOutput, NazGenerationOutput, NazGenerationStep, NazOutput
@@ -29,6 +29,7 @@ class Naz(PreTrainedModel):
         self.student_core = NazStudentCore(config)
         self.pad_token_id = config.pad_token_id
         self.reconstruction_loss_weight = config.reconstruction_loss_weight
+        self.surface_loss_weight = config.surface_loss_weight
         self.repetition_cos_threshold = config.repetition_cos_threshold
         self.min_new_tokens = config.min_new_tokens
         if config.mtp_horizons <= 0:
@@ -74,6 +75,14 @@ class Naz(PreTrainedModel):
             raise ValueError(
                 f"Naz latent_size={config.latent_size} does not match Dil latent_size={dil_config.latent_size}"
             )
+        if config.semantic_latent_size != dil_config.semantic_latent_size:
+            raise ValueError(
+                f"Naz semantic_latent_size={config.semantic_latent_size} does not match Dil semantic_latent_size={dil_config.semantic_latent_size}"
+            )
+        if config.surface_latent_size != dil_config.surface_latent_size:
+            raise ValueError(
+                f"Naz surface_latent_size={config.surface_latent_size} does not match Dil surface_latent_size={dil_config.surface_latent_size}"
+            )
         if config.vocab_size != dil_config.vocab_size:
             raise ValueError(
                 f"Naz vocab_size={config.vocab_size} does not match Dil vocab_size={dil_config.vocab_size}"
@@ -86,10 +95,9 @@ class Naz(PreTrainedModel):
     def _load_dil(self, dil_path: Path, dil_config: DilConfig):
         model = Dil(dil_config)
         checkpoint = torch.load(dil_path / "checkpoint.pt", map_location="cpu", weights_only=False)
-        supported_versions = {dil_config.checkpoint_format_version, 30}
-        if checkpoint["format_version"] not in supported_versions:
+        if checkpoint["format_version"] != dil_config.checkpoint_format_version:
             raise ValueError(f"unsupported Dil checkpoint format_version={checkpoint.get('format_version')}")
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
         for param in model.parameters():
             param.requires_grad = False
         model.eval()
@@ -225,7 +233,12 @@ class Naz(PreTrainedModel):
         )
         if not jitter_mask.any():
             return semantic_states
-        noised = semantic_states.float().clone()
+        semantic_part, surface_part = split_factorized_latent(
+            semantic_states.float(),
+            self.config.semantic_latent_size,
+            self.config.surface_latent_size,
+        )
+        noised_semantic = semantic_part.clone()
         min_cos = torch.full(
             jitter_mask.shape,
             self.config.naz_input_jitter_min_cos,
@@ -238,8 +251,8 @@ class Naz(PreTrainedModel):
             device=semantic_states.device,
             dtype=torch.float32,
         )[jitter_mask]
-        noised[jitter_mask] = angular_noise_like(noised[jitter_mask], min_cos, max_cos)
-        return noised.to(semantic_states.dtype)
+        noised_semantic[jitter_mask] = angular_noise_like(noised_semantic[jitter_mask], min_cos, max_cos)
+        return compose_factorized_latent(noised_semantic, surface_part).to(semantic_states.dtype)
 
     def predict_next_latents_from_surface(
         self,
@@ -268,16 +281,26 @@ class Naz(PreTrainedModel):
         candidates = dynamics.candidate_latents.float()
         logits = dynamics.router_logits.float()
         target = target_latents.float()
+        semantic_candidates, surface_candidates = split_factorized_latent(
+            candidates,
+            self.config.semantic_latent_size,
+            self.config.surface_latent_size,
+        )
+        semantic_target, surface_target = split_factorized_latent(
+            target,
+            self.config.semantic_latent_size,
+            self.config.surface_latent_size,
+        )
         mask = target_mask.bool()
         weights = self.horizon_loss_weights(target.device, target.dtype).view(1, 1, -1)
         weighted_mask = mask.to(target.dtype) * weights
         normalizer = weighted_mask.sum().clamp_min(1.0)
 
-        sq_dist = (candidates - target.unsqueeze(3)).square().sum(dim=-1)
+        sq_dist = (semantic_candidates - semantic_target.unsqueeze(3)).square().sum(dim=-1)
         sigma = self.mixture_sigma.to(device=target.device, dtype=target.dtype).view(1, 1, -1, 1)
         sigma_sq = sigma.square()
         log_prob = -0.5 * sq_dist / sigma_sq
-        log_prob = log_prob - 0.5 * self.config.latent_size * torch.log(
+        log_prob = log_prob - 0.5 * self.config.semantic_latent_size * torch.log(
             target.new_tensor(2.0 * torch.pi) * sigma_sq
         )
         log_pi = F.log_softmax(logits, dim=-1)
@@ -298,9 +321,16 @@ class Naz(PreTrainedModel):
 
         entropy = (-(probs * probs.clamp_min(1e-8).log()).sum(dim=-1) * weighted_mask).sum() / normalizer
         selected = dynamics.selected_latents.float()
-        chosen_sq_dist = (selected - target).square().sum(dim=-1)
+        selected_semantic, selected_surface = split_factorized_latent(
+            selected,
+            self.config.semantic_latent_size,
+            self.config.surface_latent_size,
+        )
+        chosen_sq_dist = (selected_semantic - semantic_target).square().sum(dim=-1)
+        surface_sq_dist = (selected_surface - surface_target).square().sum(dim=-1)
         min_sq_dist = sq_dist.min(dim=-1).values
         chosen_mse = (chosen_sq_dist * weighted_mask).sum() / normalizer
+        surface_mse = (surface_sq_dist * weighted_mask).sum() / normalizer
         min_mse = (min_sq_dist * weighted_mask).sum() / normalizer
 
         return {
@@ -309,10 +339,12 @@ class Naz(PreTrainedModel):
             "usage_balance_loss": usage_balance_loss,
             "router_entropy": entropy,
             "chosen_mse": chosen_mse,
+            "surface_mse": surface_mse,
             "min_mse": min_mse,
             "candidate_usage": usage.detach(),
             "sq_dist": sq_dist,
             "chosen_sq_dist": chosen_sq_dist,
+            "surface_sq_dist": surface_sq_dist,
             "weighted_mask": weighted_mask,
             "normalizer": normalizer,
         }
@@ -352,15 +384,27 @@ class Naz(PreTrainedModel):
         mse_mean = losses["chosen_mse"]
         active_predicted = dynamics.selected_latents[target_mask]
         active_target = target_latents[target_mask]
-        cosine = F.cosine_similarity(dynamics.selected_latents.float(), target_latents.float(), dim=-1)
+        predicted_semantic, _ = split_factorized_latent(
+            dynamics.selected_latents.float(),
+            self.config.semantic_latent_size,
+            self.config.surface_latent_size,
+        )
+        target_semantic, _ = split_factorized_latent(
+            target_latents.float(),
+            self.config.semantic_latent_size,
+            self.config.surface_latent_size,
+        )
+        cosine = F.cosine_similarity(predicted_semantic, target_semantic, dim=-1)
         weighted_mask = losses["weighted_mask"]
         normalizer = losses["normalizer"]
         latent_cos = (cosine * weighted_mask).sum() / normalizer
         cosine_loss = ((1.0 - cosine) * weighted_mask).sum() / normalizer
+        surface_loss = losses["surface_mse"] * self.surface_loss_weight
         loss = self.reconstruction_loss_weight * (
             mixture_nll
             + self.router_responsibility_weight * responsibility_loss
             + self.usage_balance_weight * usage_balance_loss
+            + surface_loss
             + self.moe_balance_weight * moe_balance_loss
         )
         return NazOutput(
@@ -369,6 +413,9 @@ class Naz(PreTrainedModel):
             mse_loss=mse_loss,
             mse_mean=mse_mean,
             mixture_nll=mixture_nll,
+            semantic_mse=losses["chosen_mse"],
+            surface_mse=losses["surface_mse"],
+            surface_loss=surface_loss,
             responsibility_loss=responsibility_loss,
             usage_balance_loss=usage_balance_loss,
             moe_balance_loss=moe_balance_loss,
@@ -473,11 +520,22 @@ class Naz(PreTrainedModel):
             dynamics = self.semantic_head(outputs.last_hidden_state[:, -1:])
             model_latent = dynamics.selected_latents[:, 0, 0]
             candidate_index = dynamics.selected_indices[:, 0, 0]
-            repeated = F.cosine_similarity(previous_model_latent, model_latent, dim=-1).ge(repetition_cos_threshold)
+            previous_semantic, _ = split_factorized_latent(
+                previous_model_latent,
+                self.config.semantic_latent_size,
+                self.config.surface_latent_size,
+            )
+            model_semantic, _ = split_factorized_latent(
+                model_latent,
+                self.config.semantic_latent_size,
+                self.config.surface_latent_size,
+            )
+            latent_cos = F.cosine_similarity(previous_semantic, model_semantic, dim=-1)
+            repeated = latent_cos.ge(repetition_cos_threshold)
             should_stop = repeated & torch.full_like(repeated, generated_idx + 1 >= min_new_tokens)
             yield NazGenerationStep(
                 latent=model_latent,
-                latent_cos_to_previous=F.cosine_similarity(previous_model_latent, model_latent, dim=-1),
+                latent_cos_to_previous=latent_cos,
                 should_stop=should_stop,
                 candidate_index=candidate_index,
             )

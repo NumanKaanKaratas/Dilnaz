@@ -7,7 +7,7 @@ from transformers.modeling_utils import PreTrainedModel
 
 from dilnaz.surface import PackedSurface, PackedWriterTarget
 
-from ..common.latents import normalize_semantic_latents
+from ..common.latents import compose_factorized_latent, normalize_factorized_latents, split_factorized_latent
 from .configuration import DilConfig
 from .encoder import DilEncoderCore
 from .layers import DilPackedDepthwiseConv
@@ -21,8 +21,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 26:
-            raise ValueError("DIL causal surface writer checkpoints require checkpoint_format_version=26")
+        if config.checkpoint_format_version != 31:
+            raise ValueError("DIL factorized latent v2 checkpoints require checkpoint_format_version=31")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
@@ -75,9 +75,24 @@ class Dil(PreTrainedModel):
             else self.encoder(surface=surface, output_hidden_states=output_hidden_states, return_all=return_all)
         )
         if output_hidden_states:
-            semantic, layer_vectors = encoded
-            return normalize_semantic_latents(semantic), layer_vectors
-        return normalize_semantic_latents(encoded)
+            latent, layer_vectors = encoded
+            return normalize_factorized_latents(
+                latent,
+                self.config.semantic_latent_size,
+                self.config.surface_latent_size,
+            ), layer_vectors
+        return normalize_factorized_latents(
+            encoded,
+            self.config.semantic_latent_size,
+            self.config.surface_latent_size,
+        )
+
+    def split_latent(self, latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return split_factorized_latent(
+            latents,
+            self.config.semantic_latent_size,
+            self.config.surface_latent_size,
+        )
 
     def writer_outputs(self, semantic: torch.Tensor, query_surface: PackedSurface) -> torch.Tensor:
         compiled_forward = getattr(self, "_compiled_writer_forward", None)
@@ -179,10 +194,15 @@ class Dil(PreTrainedModel):
             )
 
         semantic = self.encode(surface=encoder_surface)
+        semantic_part, surface_part = self.split_latent(semantic)
         loss = semantic.new_zeros(())
         distill_loss = semantic.new_zeros(())
+        semantic_loss = semantic.new_zeros(())
+        semantic_cos = semantic.new_zeros(())
         mean_geometry_loss = semantic.new_zeros(())
         variance_loss = semantic.new_zeros(())
+        surface_loss = semantic.new_zeros(())
+        surface_norm = surface_part.float().norm(dim=-1).mean().to(semantic.dtype)
 
         if teacher_layers is not None:
             teacher_layers = teacher_layers.to(semantic.device, dtype=torch.float32)
@@ -190,12 +210,18 @@ class Dil(PreTrainedModel):
                 teacher_mask = torch.ones(teacher_layers.shape[:-2], dtype=torch.bool, device=semantic.device)
             else:
                 teacher_mask = teacher_mask.to(semantic.device, dtype=torch.bool)
-            mean_geometry_loss = self.geometry_loss(semantic, teacher_layers[..., -1, :], teacher_mask)
-            variance_loss = self.variance_regularizer(semantic, teacher_mask)
-            distill_loss = (
+            teacher_target = teacher_layers[..., -1, :]
+            mean_geometry_loss = self.geometry_loss(semantic_part, teacher_target, teacher_mask)
+            variance_loss = self.variance_regularizer(semantic_part, teacher_mask)
+            semantic_loss = (
                 mean_geometry_loss * self.mean_geometry_weight
                 + variance_loss * self.variance_weight
             )
+            distill_loss = semantic_loss
+            if teacher_target.shape[-1] == semantic_part.shape[-1]:
+                active_cos = F.cosine_similarity(semantic_part.float(), teacher_target.float(), dim=-1)
+                cos_mask = teacher_mask.to(active_cos.dtype)
+                semantic_cos = (active_cos * cos_mask).sum() / cos_mask.sum().clamp_min(1.0)
             loss = loss + distill_loss * self.distillation_weight
 
         writer_loss = semantic.new_zeros(())
@@ -204,17 +230,22 @@ class Dil(PreTrainedModel):
         writer_token_loss = semantic.new_zeros(())
         stop_acc = semantic.new_zeros(())
         if labels is not None and self.writer_loss_weight > 0.0:
-            writer_semantic = semantic.detach()
+            writer_semantic = compose_factorized_latent(semantic_part.detach(), surface_part)
             writer_loss, writer_token_loss, byte_acc, token_exact, stop_acc = self.writer_loss_and_metrics(
                 writer_semantic,
                 labels,
             )
-            loss = loss + writer_loss * self.writer_loss_weight
+            surface_loss = writer_loss
+            loss = loss + surface_loss * self.writer_loss_weight
 
         return DilOutput(
             loss=loss,
             semantic=semantic,
             distill_loss=distill_loss,
+            semantic_loss=semantic_loss,
+            semantic_cos=semantic_cos,
+            surface_loss=surface_loss,
+            surface_norm=surface_norm,
             writer_loss=writer_loss,
             writer_token_loss=writer_token_loss,
             mean_geometry_loss=mean_geometry_loss,

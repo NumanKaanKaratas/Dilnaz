@@ -12,6 +12,9 @@ class NazOutput(ModelOutput):
     mse_loss: Optional[torch.FloatTensor] = None
     mse_mean: Optional[torch.FloatTensor] = None
     mixture_nll: Optional[torch.FloatTensor] = None
+    semantic_mse: Optional[torch.FloatTensor] = None
+    surface_mse: Optional[torch.FloatTensor] = None
+    surface_loss: Optional[torch.FloatTensor] = None
     responsibility_loss: Optional[torch.FloatTensor] = None
     usage_balance_loss: Optional[torch.FloatTensor] = None
     moe_balance_loss: Optional[torch.FloatTensor] = None

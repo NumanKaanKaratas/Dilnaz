@@ -40,10 +40,10 @@ from dilnaz.tokenization import HybridTokenizer
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 28
-OBJECTIVE = "semantic_dynamics_moe_mtp_v1"
+CHECKPOINT_FORMAT_VERSION = 29
+OBJECTIVE = "factorized_semantic_dynamics_moe_mtp_v1"
 DATALOADER_WORKER_EXIT = "DataLoader worker"
-SEMANTIC_CACHE_FORMAT_VERSION = 2
+SEMANTIC_CACHE_FORMAT_VERSION = 3
 STAGES = ("pretrain", "finetune")
 RUNTIME_STATE_FIELDS = (
     "data_mode",
@@ -98,6 +98,7 @@ MODEL_OVERRIDE_OPTIONS = frozenset(
         "--naz-input-jitter-prob",
         "--naz-input-jitter-min-cos",
         "--naz-input-jitter-max-cos",
+        "--surface-loss-weight",
     }
 )
 
@@ -112,13 +113,6 @@ def dil_checksum(model: Naz) -> str:
     for key, tensor in model.dil_model.state_dict().items():
         if key.startswith("encoder."):
             digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
-    return digest.hexdigest()
-
-
-def legacy_dil_checksum(model: Naz) -> str:
-    digest = hashlib.sha256()
-    for tensor in model.dil_model.state_dict().values():
-        digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
     return digest.hexdigest()
 
 
@@ -159,7 +153,11 @@ def json_training_state(
         "compile_mode": compile_mode,
         "max_surface_pieces_per_unit": getattr(config, "max_surface_pieces_per_unit", 0),
         "latent_size": config.latent_size,
-        "semantic_space": "dil_normalized_latent",
+        "semantic_latent_size": config.semantic_latent_size,
+        "surface_latent_size": config.surface_latent_size,
+        "latent_layout": "factorized_v2",
+        "semantic_space": "dil_factorized_latent_v2",
+        "surface_loss_weight": config.surface_loss_weight,
         "objective": OBJECTIVE,
         "byte_vocab_size": config.byte_vocab_size,
         "vocab_size": config.vocab_size,
@@ -272,6 +270,9 @@ def add_output_metrics(total: dict[str, float], outputs) -> None:
     total["reconstruction"] += float(outputs.reconstruction_loss.detach().cpu())
     total["mse"] += float(outputs.mse_loss.detach().cpu())
     total["mixture_nll"] += float(outputs.mixture_nll.detach().cpu())
+    total["semantic_mse"] += float(outputs.semantic_mse.detach().cpu()) * targets
+    total["surface_mse"] += float(outputs.surface_mse.detach().cpu()) * targets
+    total["surface_loss"] += float(outputs.surface_loss.detach().cpu())
     total["responsibility"] += float(outputs.responsibility_loss.detach().cpu())
     total["usage_balance"] += float(outputs.usage_balance_loss.detach().cpu())
     total["moe_balance"] += float(outputs.moe_balance_loss.detach().cpu())
@@ -296,6 +297,9 @@ def reduce_output_metrics(total: dict[str, float]) -> dict[str, float]:
         "reconstruction": total["reconstruction"] / batches,
         "mse": total["mse"] / batches,
         "mixture_nll": total["mixture_nll"] / batches,
+        "semantic_mse": total["semantic_mse"] / targets,
+        "surface_mse": total["surface_mse"] / targets,
+        "surface_loss": total["surface_loss"] / batches,
         "responsibility": total["responsibility"] / batches,
         "usage_balance": total["usage_balance"] / batches,
         "moe_balance": total["moe_balance"] / batches,
@@ -390,6 +394,9 @@ def build_memmap_semantic_cache(
         "format_version": SEMANTIC_CACHE_FORMAT_VERSION,
         "token_count": token_count,
         "latent_size": model.config.latent_size,
+        "semantic_latent_size": model.config.semantic_latent_size,
+        "surface_latent_size": model.config.surface_latent_size,
+        "latent_layout": "factorized_v2",
         "surface_cache": "packed_flat_offsets",
         "dil_checksum": checksum,
         "ids_path": str(ids_path.resolve()),
@@ -529,6 +536,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--naz-input-jitter-prob", type=float, default=NAZ_MODEL_DEFAULTS["naz_input_jitter_prob"])
     parser.add_argument("--naz-input-jitter-min-cos", type=float, default=NAZ_MODEL_DEFAULTS["naz_input_jitter_min_cos"])
     parser.add_argument("--naz-input-jitter-max-cos", type=float, default=NAZ_MODEL_DEFAULTS["naz_input_jitter_max_cos"])
+    parser.add_argument("--surface-loss-weight", type=float, default=NAZ_MODEL_DEFAULTS["surface_loss_weight"])
     args = parser.parse_args(argv)
     args.provided_options = provided_options(argv)
     return args
@@ -595,6 +603,8 @@ def validate_common_args(args) -> None:
         raise ValueError("--naz-input-jitter cosine values must satisfy 0 < cos <= 1")
     if args.naz_input_jitter_min_cos > args.naz_input_jitter_max_cos:
         raise ValueError("--naz-input-jitter-min-cos must be <= --naz-input-jitter-max-cos")
+    if args.surface_loss_weight < 0.0:
+        raise ValueError("--surface-loss-weight must be >= 0")
     if args.full_attention_interval <= 0:
         raise ValueError("--full-attention-interval must be > 0")
     if args.num_attention_heads <= 0 or args.num_key_value_heads <= 0:
@@ -660,7 +670,10 @@ def build_config(args, dil_config: DilConfig | None) -> NazConfig:
         pad_token_id=dil_config.pad_token_id,
         eos_token_id=dil_config.eos_token_id,
         latent_size=dil_config.latent_size,
+        semantic_latent_size=dil_config.semantic_latent_size,
+        surface_latent_size=dil_config.surface_latent_size,
         reconstruction_loss_weight=args.reconstruction_loss_weight,
+        surface_loss_weight=args.surface_loss_weight,
         num_semantic_candidates=args.num_semantic_candidates,
         mtp_horizons=args.mtp_horizons,
         mtp_loss_weights=tuple(args.mtp_loss_weights),
@@ -950,6 +963,9 @@ class NazBaseTrainer(BaseTrainer):
             "reconstruction": 0.0,
             "mse": 0.0,
             "mixture_nll": 0.0,
+            "semantic_mse": 0.0,
+            "surface_mse": 0.0,
+            "surface_loss": 0.0,
             "responsibility": 0.0,
             "usage_balance": 0.0,
             "moe_balance": 0.0,
@@ -1013,8 +1029,10 @@ class NazBaseTrainer(BaseTrainer):
             f"resp={metrics['responsibility']:.4f}",
             f"usage={metrics['usage_balance']:.4f}",
             f"moe={metrics['moe_balance']:.4f}",
-            f"mse_sum={metrics['mse']:.4f}",
-            f"mse_mean={metrics['mse_mean']:.4f}",
+            f"semantic_mse_sum={metrics['mse']:.4f}",
+            f"semantic_mse={metrics['semantic_mse']:.4f}",
+            f"surface_mse={metrics['surface_mse']:.4f}",
+            f"surface_loss={metrics['surface_loss']:.4f}",
             f"min_mse={metrics['min_mse']:.4f}",
             f"chosen_mse={metrics['chosen_mse']:.4f}",
             f"router_h={metrics['router_entropy']:.4f}",

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from dilnaz.models.dil import DilConfig
+from dilnaz.models.dil import DilConfig, compose_factorized_latent, normalize_semantic_latents
 from dilnaz.surface import PackedSurface
 from dilnaz.tokenization import HybridTokenizer
 from dilnaz.train.data.dil_data import (
@@ -14,7 +14,7 @@ from dilnaz.train.data.dil_data import (
     stream_text_items,
     trainable_segments,
 )
-from dilnaz.train.data.parallel_dil_data import ParallelDilBatchDataset
+from dilnaz.train.data.parallel_dil_data import ParallelDilBatchDataset, parallel_alignment_loss
 from dilnaz.train.dil.train_teacherless_parallel import TeacherlessParallelJsonlDataset
 
 
@@ -37,6 +37,8 @@ def tiny_config(tokenizer: HybridTokenizer) -> DilConfig:
         hidden_size=32,
         intermediate_size=64,
         latent_size=16,
+        semantic_latent_size=12,
+        surface_latent_size=4,
         max_surface_pieces_per_unit=16,
         surface_bucket_sizes=(8, 16, 32),
         num_encoder_layers=2,
@@ -85,6 +87,31 @@ def test_teacherless_parallel_dataset_uses_packed_surface(tmp_path: Path):
     assert "en_labels" not in batch
     assert batch["tr_unit_mask"].dtype == torch.bool
     assert batch["en_unit_mask"].dtype == torch.bool
+
+
+def test_parallel_alignment_loss_uses_only_semantic_split():
+    tokenizer = tiny_tokenizer()
+    config = tiny_config(tokenizer)
+    semantic = normalize_semantic_latents(torch.ones(2, config.semantic_latent_size))
+    latents = compose_factorized_latent(
+        semantic,
+        torch.tensor([[-1.0, -1.0, -1.0, -1.0], [1.0, 1.0, 1.0, 1.0]]),
+    )
+    batch = {
+        "row_batch_indices": torch.zeros(2, dtype=torch.long),
+        "row_unit_indices": torch.arange(2, dtype=torch.long),
+        "parallel_source_rows": torch.tensor([[0]], dtype=torch.long),
+        "parallel_target_rows": torch.tensor([[1]], dtype=torch.long),
+        "parallel_source_mask": torch.ones(1, 1, dtype=torch.bool),
+        "parallel_target_mask": torch.ones(1, 1, dtype=torch.bool),
+    }
+    loss = parallel_alignment_loss(
+        latents.unsqueeze(0),
+        batch,
+        config.semantic_latent_size,
+        config.surface_latent_size,
+    )
+    assert torch.isclose(loss, torch.zeros_like(loss), atol=1e-6)
 
 
 def test_trainable_segments_filters_by_surface_piece_limit():

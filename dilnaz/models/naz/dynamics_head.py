@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..common.latents import normalize_semantic_latents
+from ..common.latents import compose_factorized_latent, normalize_semantic_latents, split_factorized_latent
 from .configuration import NazConfig
 from .outputs import NazDynamicsOutput
 
@@ -12,6 +12,8 @@ class SemanticDynamicsMixtureHead(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.latent_size = config.latent_size
+        self.semantic_latent_size = config.semantic_latent_size
+        self.surface_latent_size = config.surface_latent_size
         self.num_candidates = config.num_semantic_candidates
         self.horizons = config.mtp_horizons
         expert_size = config.hidden_size
@@ -57,7 +59,16 @@ class SemanticDynamicsMixtureHead(nn.Module):
         offset_gate = torch.sigmoid(
             self.offset_gate(shared).view(batch_size, sequence_length, self.horizons, self.num_candidates)
         ).unsqueeze(-1)
-        candidate_latents = normalize_semantic_latents(base.unsqueeze(3) + offset_gate * offsets)
+        raw_latents = base.unsqueeze(3) + offset_gate * offsets
+        raw_semantic, raw_surface = split_factorized_latent(
+            raw_latents,
+            self.semantic_latent_size,
+            self.surface_latent_size,
+        )
+        candidate_latents = compose_factorized_latent(
+            normalize_semantic_latents(raw_semantic),
+            raw_surface.tanh(),
+        )
         router_logits = self.router(shared).view(batch_size, sequence_length, self.horizons, self.num_candidates)
         selected_indices = router_logits.argmax(dim=-1)
         gather_index = selected_indices.unsqueeze(-1).unsqueeze(-1).expand(

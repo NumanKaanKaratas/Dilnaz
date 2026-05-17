@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, get_worker_info
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
+from dilnaz.models.common.latents import split_factorized_latent
+from dilnaz.models.dil import DilConfig
 from dilnaz.train.data.dil_data import (
     NLLB_DEFAULT_MAX_ENCODER_TOKENS,
     NLLB_LAYER_GROUPS,
@@ -21,7 +23,6 @@ from dilnaz.train.data.dil_data import (
     teacher_distill_segment,
     trainable_segments,
 )
-from dilnaz.models.dil import DilConfig
 from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
@@ -630,7 +631,13 @@ def grouped_mean(vectors: torch.Tensor, row_indices: torch.Tensor, row_mask: tor
     return (gathered * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
 
 
-def semantic_row_vectors(semantic: torch.Tensor, batch: dict) -> torch.Tensor:
+def semantic_row_vectors(
+    latents: torch.Tensor,
+    batch: dict,
+    semantic_latent_size: int,
+    surface_latent_size: int,
+) -> torch.Tensor:
+    semantic, _ = split_factorized_latent(latents, semantic_latent_size, surface_latent_size)
     if semantic.dim() == 2:
         return semantic
     if semantic.dim() != 3:
@@ -640,8 +647,13 @@ def semantic_row_vectors(semantic: torch.Tensor, batch: dict) -> torch.Tensor:
     return semantic[batch_indices, unit_indices]
 
 
-def parallel_alignment_loss(mean: torch.Tensor, batch: dict) -> torch.Tensor:
-    row_vectors = semantic_row_vectors(mean, batch)
+def parallel_alignment_loss(
+    mean: torch.Tensor,
+    batch: dict,
+    semantic_latent_size: int,
+    surface_latent_size: int,
+) -> torch.Tensor:
+    row_vectors = semantic_row_vectors(mean, batch, semantic_latent_size, surface_latent_size)
     source_rows = batch["parallel_source_rows"].to(row_vectors.device)
     target_rows = batch["parallel_target_rows"].to(row_vectors.device)
     if source_rows.shape[0] == 0:
@@ -651,10 +663,21 @@ def parallel_alignment_loss(mean: torch.Tensor, batch: dict) -> torch.Tensor:
     return (1.0 - F.cosine_similarity(source_vectors.float(), target_vectors.float(), dim=-1)).mean()
 
 
-def parallel_total_loss(outputs, batch: dict, parallel_alignment_weight: float) -> tuple[torch.Tensor, torch.Tensor]:
+def parallel_total_loss(
+    outputs,
+    batch: dict,
+    parallel_alignment_weight: float,
+    semantic_latent_size: int,
+    surface_latent_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if outputs.loss is None:
         raise ValueError("DIL outputs.loss is required for parallel training")
-    alignment_loss = parallel_alignment_loss(outputs.semantic, batch)
+    alignment_loss = parallel_alignment_loss(
+        outputs.semantic,
+        batch,
+        semantic_latent_size,
+        surface_latent_size,
+    )
     return outputs.loss + alignment_loss * parallel_alignment_weight, alignment_loss
 
 
