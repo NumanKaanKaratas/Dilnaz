@@ -120,12 +120,15 @@ def parse_args():
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
+    parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
+    parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
     parser.add_argument("--byte-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_expansion"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
+    parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
     parser.add_argument("--writer-loss-weight", type=float, default=None)
@@ -155,8 +158,12 @@ def validate_args(args):
         raise ValueError("--parallel-alignment-weight must be >= 0")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
-    if args.latent_size <= 0:
-        raise ValueError("--latent-size must be > 0")
+    if args.semantic_latent_size <= 0 or args.surface_latent_size <= 0:
+        raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
+    if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
+        raise ValueError("--latent-size must equal semantic + surface latent sizes")
+    if args.layer_geometry_weight < 0.0:
+        raise ValueError("--layer-geometry-weight must be >= 0")
     if args.writer_loss_weight is not None and args.writer_loss_weight < 0.0:
         raise ValueError("--writer-loss-weight must be >= 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
@@ -197,12 +204,15 @@ def build_config(args, tokenizer):
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         latent_size=args.latent_size,
+        semantic_latent_size=args.semantic_latent_size,
+        surface_latent_size=args.surface_latent_size,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
         byte_conv_expansion=args.byte_conv_expansion,
         dil_dropout=args.dil_dropout,
         distillation_weight=args.distillation_weight,
+        layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
         writer_loss_weight=writer_loss_weight,
@@ -232,6 +242,10 @@ def format_parallel_log(step: int, metrics: dict) -> str:
         f"parallel={metrics['parallel']:.4f}",
         f"parallel_w={metrics['parallel_weighted']:.4f}",
         f"distill={metrics['distill']:.4f}",
+        f"geom_l1={metrics['geom_l1']:.4f}",
+        f"geom_l2={metrics['geom_l2']:.4f}",
+        f"geom_l3={metrics['geom_l3']:.4f}",
+        f"geom_l4={metrics['geom_l4']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
         f"surface_loss={metrics['surface_loss']:.4f}",
@@ -245,8 +259,10 @@ def format_parallel_log(step: int, metrics: dict) -> str:
         f"w/s={metrics['windows_per_second']:.1f}",
         f"step/s={metrics['steps_per_second']:.2f}",
     ]
-    if "source_lines_seen" in metrics:
-        fields.append(f"total/row={int(metrics['source_lines_seen'])}")
+    if "rows_total" in metrics:
+        fields.append(f"t/r={int(metrics['rows_total'])}")
+    if "units_total" in metrics:
+        fields.append(f"t/u={int(metrics['units_total'])}")
     for key in sorted(k for k in metrics if k.startswith("eval_")):
         fields.append(f"{key}={metrics[key]:.4f}")
     return " ".join(fields)
@@ -259,6 +275,10 @@ def empty_metric_sums() -> dict[str, float]:
         "parallel": 0.0,
         "parallel_weighted": 0.0,
         "distill": 0.0,
+        "geom_l1": 0.0,
+        "geom_l2": 0.0,
+        "geom_l3": 0.0,
+        "geom_l4": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
         "surface_loss": 0.0,
@@ -274,6 +294,9 @@ def accumulate_metrics(metric_sums: dict[str, float], loss, outputs, parallel_lo
     metric_sums["parallel"] += float(parallel_loss.detach().cpu())
     metric_sums["parallel_weighted"] += float((parallel_loss * weight).detach().cpu())
     metric_sums["distill"] += float(outputs.distill_loss.detach().cpu())
+    layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
+    for idx in range(4):
+        metric_sums[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
     metric_sums["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
     metric_sums["surface_loss"] += float(outputs.surface_loss.detach().cpu())
@@ -306,6 +329,8 @@ def evaluate_parallel(
                 outputs,
                 batch,
                 parallel_alignment_weight,
+                model.config.semantic_latent_size,
+                model.config.surface_latent_size,
             )
         accumulate_metrics(total, loss, outputs, parallel_loss, batch, model.config, parallel_alignment_weight)
         batches += 1
@@ -424,9 +449,10 @@ def main():
     log_windows = 0
     log_steps = 0
     log_micro_steps = 0
+    rows_total = int(last_metrics.get("rows_total", 0))
+    units_total = int(last_metrics.get("units_total", 0))
     data_seconds = 0.0
     compute_seconds = 0.0
-    source_lines_seen: set[int] = set()
     metric_sums = empty_metric_sums()
     completed_step = start_step
     current_batch, current_batch_seen, initial_wait = batch_source.first()
@@ -461,15 +487,18 @@ def main():
                         outputs,
                         batch,
                         args.parallel_alignment_weight,
+                        model.config.semantic_latent_size,
+                        model.config.surface_latent_size,
                     )
 
                 (loss / args.gradient_accumulation_steps).backward()
                 token_count = int(batch["surface"].mask.sum().detach().cpu())
                 window_count = int(batch["surface"].unit_mask.sum().detach().cpu())
+                rows_total += int(batch["source_row_count"])
+                units_total += int(batch["target_unit_count"])
                 log_tokens += token_count
                 log_windows += window_count
                 log_micro_steps += 1
-                source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
                 accumulate_metrics(
                     metric_sums,
                     loss,
@@ -503,8 +532,8 @@ def main():
                 averaged["tokens_per_second"] = log_tokens / elapsed
                 averaged["windows_per_second"] = log_windows / elapsed
                 averaged["steps_per_second"] = log_steps / elapsed
-                if source_lines_seen:
-                    averaged["source_lines_seen"] = len(source_lines_seen)
+                averaged["rows_total"] = rows_total
+                averaged["units_total"] = units_total
                 if should_eval:
                     averaged.update(
                         evaluate_parallel(

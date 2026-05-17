@@ -21,6 +21,7 @@ from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
 NLLB_DEFAULT_NUM_GROUPS = 8
 NLLB_DEFAULT_MAX_ENCODER_TOKENS = 1024
 NLLB_TEACHER_CACHE_VERSION = 1
+NLLB_TEXT_CHUNKING = "offset-token-budget-v1"
 TEACHER_CENTERED_ADD_WEIGHT = 0.5
 
 
@@ -179,9 +180,119 @@ def apply_teacher_centered_add(
 
 
 @dataclass(frozen=True)
+class NllbTextChunk:
+    text: str
+    start: int
+
+
+@dataclass(frozen=True)
 class NllbEncodedText:
     group_hidden: torch.Tensor
     pieces: tuple[tuple[str, int, int, int], ...]
+
+
+NLLB_SENTENCE_BOUNDARY_CHARS = frozenset(".!?\u2026")
+NLLB_CLAUSE_BOUNDARY_CHARS = frozenset(",;:")
+
+
+def nllb_token_count(tokenizer, text: str) -> int:
+    encoded = tokenizer(text)
+    input_ids = encoded["input_ids"]
+    if hasattr(input_ids, "shape"):
+        return int(input_ids.shape[-1])
+    if input_ids and isinstance(input_ids[0], (list, tuple)):
+        return len(input_ids[0])
+    return len(input_ids)
+
+
+def nllb_content_budget(tokenizer, max_encoder_tokens: int) -> int:
+    special_count = tokenizer.num_special_tokens_to_add(pair=False) if hasattr(tokenizer, "num_special_tokens_to_add") else 2
+    budget = int(max_encoder_tokens) - int(special_count)
+    if budget <= 0:
+        raise ValueError("max_encoder_tokens must leave room for NLLB content tokens")
+    return budget
+
+
+def nllb_content_offsets(tokenizer, text: str) -> list[tuple[int, int]]:
+    encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    return [
+        (int(start), int(end))
+        for start, end in encoded["offset_mapping"]
+        if int(start) != int(end)
+    ]
+
+
+def nllb_split_boundary_rank(text: str, previous_end: int, next_start: int | None) -> int:
+    gap = text[previous_end:next_start] if next_start is not None else text[previous_end:]
+    left = text[:previous_end].rstrip()
+    last = left[-1] if left else ""
+    if "\n" in gap or last in NLLB_SENTENCE_BOUNDARY_CHARS:
+        return 3
+    if last in NLLB_CLAUSE_BOUNDARY_CHARS:
+        return 2
+    if gap and gap.strip() == "":
+        return 1
+    return 0
+
+
+def choose_nllb_split_end(text: str, offsets: list[tuple[int, int]], start_idx: int, max_end_idx: int) -> int:
+    if max_end_idx >= len(offsets):
+        return len(offsets)
+    min_end_idx = start_idx + max(1, (max_end_idx - start_idx) // 2)
+    best_end_idx = max_end_idx
+    best_rank = 0
+    for end_idx in range(max_end_idx, min_end_idx - 1, -1):
+        previous_end = offsets[end_idx - 1][1]
+        next_start = offsets[end_idx][0]
+        rank = nllb_split_boundary_rank(text, previous_end, next_start)
+        if rank > best_rank:
+            best_rank = rank
+            best_end_idx = end_idx
+            if rank == 3:
+                break
+    return best_end_idx
+
+
+def split_text_for_nllb(text: str, tokenizer, max_encoder_tokens: int) -> tuple[NllbTextChunk, ...]:
+    offsets = nllb_content_offsets(tokenizer, text)
+    if not offsets:
+        return (NllbTextChunk(text=text, start=0),)
+
+    budget = nllb_content_budget(tokenizer, max_encoder_tokens)
+    if len(offsets) <= budget and nllb_token_count(tokenizer, text) <= max_encoder_tokens:
+        return (NllbTextChunk(text=text, start=0),)
+
+    chunks: list[NllbTextChunk] = []
+    start_idx = 0
+    while start_idx < len(offsets):
+        max_end_idx = min(start_idx + budget, len(offsets))
+        end_idx = choose_nllb_split_end(text, offsets, start_idx, max_end_idx)
+        while end_idx > start_idx:
+            chunk_start = offsets[start_idx][0]
+            chunk_end = offsets[end_idx - 1][1]
+            chunk_text = text[chunk_start:chunk_end]
+            if nllb_token_count(tokenizer, chunk_text) <= max_encoder_tokens:
+                chunks.append(NllbTextChunk(text=chunk_text, start=chunk_start))
+                start_idx = end_idx
+                break
+            end_idx -= 1
+        else:
+            raise ValueError("NLLB chunking failed to make progress")
+    return tuple(chunks)
+
+
+def nllb_piece_positions(tokenizer, input_ids: list[int], offsets, offset_shift: int = 0, index_shift: int = 0):
+    pieces = tokenizer.convert_ids_to_tokens(input_ids)
+    return tuple(
+        (
+            piece,
+            int(offset[0]) + offset_shift,
+            int(offset[1]) + offset_shift,
+            token_idx + index_shift,
+        )
+        for token_idx, (piece, offset) in enumerate(zip(pieces, offsets))
+        if int(offset[0]) != int(offset[1])
+    )
 
 
 class NllbTeacherTextCache:
@@ -190,13 +301,18 @@ class NllbTeacherTextCache:
         cache_dir: Path,
         contract: dict,
         memory_items: int = 128,
+        max_disk_bytes: int = 0,
     ):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.contract = dict(contract)
         self.memory_items = int(memory_items)
+        self.max_disk_bytes = int(max_disk_bytes)
         self.memory_cache: dict[str, NllbEncodedText] = {}
         self.memory_order: list[str] = []
+        self._remove_stale_tmp_files()
+        self.disk_bytes = self._scan_disk_bytes()
+        self._prune_disk_cache()
 
     def key(self, lang: str, text: str) -> str:
         payload = {
@@ -223,6 +339,7 @@ class NllbTeacherTextCache:
         metadata = payload.get("metadata", {})
         if metadata.get("cache_key") != key or metadata.get("contract") != self.contract:
             raise ValueError(f"NLLB teacher cache metadata mismatch: {path}")
+        os.utime(path, None)
         encoded = NllbEncodedText(
             group_hidden=payload["group_hidden"].contiguous(),
             pieces=tuple(tuple(piece) for piece in payload["pieces"]),
@@ -246,7 +363,10 @@ class NllbTeacherTextCache:
             "pieces": tuple(encoded.pieces),
         }
         torch.save(payload, tmp_path)
+        old_size = path.stat().st_size if path.exists() else 0
         os.replace(str(tmp_path), str(path))
+        self.disk_bytes += path.stat().st_size - old_size
+        self._prune_disk_cache()
 
     def _remember(self, key: str, encoded: NllbEncodedText) -> None:
         if self.memory_items <= 0:
@@ -259,6 +379,32 @@ class NllbTeacherTextCache:
             old_key = self.memory_order.pop(0)
             self.memory_cache.pop(old_key, None)
 
+    def _scan_disk_bytes(self) -> int:
+        return sum(path.stat().st_size for path in self.cache_dir.glob("*.pt") if path.is_file())
+
+    def _remove_stale_tmp_files(self) -> None:
+        for path in self.cache_dir.glob("*.tmp"):
+            if path.is_file():
+                path.unlink()
+
+    def _prune_disk_cache(self) -> None:
+        if self.max_disk_bytes <= 0 or self.disk_bytes <= self.max_disk_bytes:
+            return
+        files = sorted(
+            (path for path in self.cache_dir.glob("*.pt") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+        )
+        for path in files:
+            if self.disk_bytes <= self.max_disk_bytes:
+                break
+            key = path.stem
+            size = path.stat().st_size
+            path.unlink()
+            self.disk_bytes -= size
+            self.memory_cache.pop(key, None)
+            if key in self.memory_order:
+                self.memory_order.remove(key)
+
 
 class NllbTeacher:
     def __init__(
@@ -270,6 +416,7 @@ class NllbTeacher:
         batch_size: int = 64,
         cache_dir: Path | None = None,
         cache_memory_items: int = 128,
+        cache_max_bytes: int = 0,
     ):
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
@@ -298,10 +445,12 @@ class NllbTeacher:
                     "model_name": model_name,
                     "layer_groups": tuple(tuple(int(layer) for layer in group) for group in self.layer_groups),
                     "max_encoder_tokens": self.max_encoder_tokens,
+                    "text_chunking": NLLB_TEXT_CHUNKING,
                     "hidden_size": int(self.model.config.d_model),
                     "dtype": str(dtype),
                 },
                 memory_items=cache_memory_items,
+                max_disk_bytes=cache_max_bytes,
             )
         self.last_stats: dict[str, float] = {}
 
@@ -396,9 +545,23 @@ class NllbTeacher:
 
     def encode_missing_texts(self, texts: list[str], stats: dict[str, float]) -> dict[str, NllbEncodedText]:
         encoded_texts: dict[str, NllbEncodedText] = {}
-        length_sorted = sorted(texts, key=len)
+        records: list[tuple[str, int, NllbTextChunk]] = []
+        chunk_count_by_text: dict[str, int] = {}
+        for text in texts:
+            chunks = split_text_for_nllb(text, self.tokenizer, self.max_encoder_tokens)
+            chunk_count_by_text[text] = len(chunks)
+            records.extend((text, chunk_idx, chunk) for chunk_idx, chunk in enumerate(chunks))
+
+        grouped_chunks: dict[str, list[torch.Tensor | None]] = {
+            text: [None] * chunk_count for text, chunk_count in chunk_count_by_text.items()
+        }
+        piece_chunks: dict[str, list[tuple[tuple[str, int, int, int], ...] | None]] = {
+            text: [None] * chunk_count for text, chunk_count in chunk_count_by_text.items()
+        }
+        length_sorted = sorted(records, key=lambda record: len(record[2].text))
         for batch_start in range(0, len(length_sorted), self.batch_size):
-            texts_batch = length_sorted[batch_start : batch_start + self.batch_size]
+            records_batch = length_sorted[batch_start : batch_start + self.batch_size]
+            texts_batch = [record[2].text for record in records_batch]
             tokenize_start = time.perf_counter()
             encoded = self.tokenizer(
                 texts_batch,
@@ -422,19 +585,6 @@ class NllbTeacher:
                 stats["input_tokens"] += float(encoded["input_ids"].numel())
                 stats["padded_tokens"] += float(encoded["input_ids"].numel())
             inputs = {key: value.to(self.device, non_blocking=True) for key, value in encoded.items()}
-            pieces = [
-                tuple(
-                    (
-                        self.tokenizer.convert_ids_to_tokens(int(input_ids_batch[row][pos])),
-                        int(offsets[row, pos, 0]),
-                        int(offsets[row, pos, 1]),
-                        int(pos),
-                    )
-                    for pos in range(int(encoded["input_ids"].shape[1]))
-                    if int(offsets[row, pos, 0]) != int(offsets[row, pos, 1])
-                )
-                for row in range(len(texts_batch))
-            ]
             forward_start = time.perf_counter()
             with torch.inference_mode():
                 outputs = self.model.get_encoder()(**inputs, output_hidden_states=True, return_dict=True)
@@ -449,11 +599,38 @@ class NllbTeacher:
                 ],
                 dim=1,
             ).to(dtype=self.dtype)
-            for local_idx, text in enumerate(texts_batch):
-                encoded_texts[text] = NllbEncodedText(
-                    group_hidden=grouped[local_idx].detach().cpu().contiguous(),
-                    pieces=pieces[local_idx],
+            for local_idx, (text, chunk_idx, chunk) in enumerate(records_batch):
+                seq_len = (
+                    int(attention_mask[local_idx].sum().item())
+                    if attention_mask is not None
+                    else int(encoded["input_ids"].shape[1])
                 )
+                grouped_chunks[text][chunk_idx] = grouped[local_idx, :, :seq_len].detach().cpu().contiguous()
+                piece_chunks[text][chunk_idx] = nllb_piece_positions(
+                    self.tokenizer,
+                    input_ids_batch[local_idx],
+                    offsets[local_idx].tolist(),
+                    offset_shift=chunk.start,
+                )
+        for text in texts:
+            text_group_chunks = grouped_chunks[text]
+            text_piece_chunks = piece_chunks[text]
+            group_hidden_parts: list[torch.Tensor] = []
+            pieces: list[tuple[str, int, int, int]] = []
+            index_shift = 0
+            for group_hidden, piece_chunk in zip(text_group_chunks, text_piece_chunks):
+                if group_hidden is None or piece_chunk is None:
+                    raise ValueError("missing NLLB encoded chunk")
+                pieces.extend(
+                    (piece, start, end, encoder_index + index_shift)
+                    for piece, start, end, encoder_index in piece_chunk
+                )
+                group_hidden_parts.append(group_hidden)
+                index_shift += int(group_hidden.shape[1])
+            encoded_texts[text] = NllbEncodedText(
+                group_hidden=torch.cat(group_hidden_parts, dim=1).contiguous(),
+                pieces=tuple(pieces),
+            )
         return encoded_texts
 
 
@@ -496,6 +673,7 @@ class ContextDilBatchDataset(IterableDataset):
         starts: list[int],
         ends: list[int],
         distill_mask: list[bool],
+        source_row_starts: list[bool],
     ) -> dict:
         surface = pack_token_units(
             unit_rows,
@@ -519,6 +697,8 @@ class ContextDilBatchDataset(IterableDataset):
             "teacher_ends": torch.tensor(ends, dtype=torch.long),
             "teacher_distill_mask": torch.tensor(distill_mask, dtype=torch.bool),
             "source_line_ids": torch.tensor(line_ids, dtype=torch.long),
+            "source_row_count": sum(1 for value in source_row_starts if value),
+            "target_unit_count": len(target_rows),
         }
         return batch
 
@@ -531,6 +711,7 @@ class ContextDilBatchDataset(IterableDataset):
         starts: list[int] = []
         ends: list[int] = []
         distill_mask: list[bool] = []
+        source_row_starts: list[bool] = []
         produced = 0
 
         for item_idx, (source_line_id, text, add_eos) in enumerate(
@@ -559,9 +740,20 @@ class ContextDilBatchDataset(IterableDataset):
                 starts.append(segment.start)
                 ends.append(segment.end)
                 distill_mask.append(teacher_distill_segment(segment))
+                source_row_starts.append(target_idx == 0)
                 produced += 1
                 if len(unit_rows) >= self.batch_size:
-                    yield self.make_batch(unit_rows, target_rows, texts, line_ids, text_indices, starts, ends, distill_mask)
+                    yield self.make_batch(
+                        unit_rows,
+                        target_rows,
+                        texts,
+                        line_ids,
+                        text_indices,
+                        starts,
+                        ends,
+                        distill_mask,
+                        source_row_starts,
+                    )
                     unit_rows = []
                     target_rows = []
                     texts = []
@@ -570,13 +762,34 @@ class ContextDilBatchDataset(IterableDataset):
                     starts = []
                     ends = []
                     distill_mask = []
+                    source_row_starts = []
                 if self.max_samples > 0 and produced >= self.max_samples:
                     if unit_rows:
-                        yield self.make_batch(unit_rows, target_rows, texts, line_ids, text_indices, starts, ends, distill_mask)
+                        yield self.make_batch(
+                            unit_rows,
+                            target_rows,
+                            texts,
+                            line_ids,
+                            text_indices,
+                            starts,
+                            ends,
+                            distill_mask,
+                            source_row_starts,
+                        )
                     return
 
         if unit_rows:
-            yield self.make_batch(unit_rows, target_rows, texts, line_ids, text_indices, starts, ends, distill_mask)
+            yield self.make_batch(
+                unit_rows,
+                target_rows,
+                texts,
+                line_ids,
+                text_indices,
+                starts,
+                ends,
+                distill_mask,
+                source_row_starts,
+            )
 
     def __iter__(self):
         worker = get_worker_info()

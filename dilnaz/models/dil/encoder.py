@@ -5,7 +5,7 @@ from dilnaz.surface import PackedSurface
 from dilnaz.surface.ops import scatter_softmax_by_unit
 
 from ..common.norms import DilRMSNorm
-from ..common.latents import normalize_semantic_latents
+from ..common.latents import compose_factorized_latent, normalize_semantic_latents
 from .layers import DilPackedConvSwiGLUBlock, DilLayer
 
 
@@ -43,6 +43,8 @@ class DilEncoderCore(nn.Module):
         self.context_size = config.context_size
         self.target_index = config.target_index
         self.latent_size = config.latent_size
+        self.semantic_latent_size = config.semantic_latent_size
+        self.surface_latent_size = config.surface_latent_size
         self.context_attention_heads = dil_context_attention_heads(config.hidden_size)
         self.context_head_dim = config.hidden_size // self.context_attention_heads
 
@@ -61,7 +63,8 @@ class DilEncoderCore(nn.Module):
         self.context_v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.context_out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.context_gate = nn.Linear(config.hidden_size * 4, config.hidden_size)
-        self.hidden_to_semantic = nn.Linear(config.hidden_size, config.latent_size)
+        self.semantic_head = nn.Linear(config.hidden_size, config.semantic_latent_size)
+        self.surface_head = nn.Linear(config.hidden_size, config.surface_latent_size)
         self.norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.semantic_norm_reduction_dtype: torch.dtype | None = torch.float32
         indices = torch.arange(config.context_size)
@@ -130,11 +133,13 @@ class DilEncoderCore(nn.Module):
         gate = torch.sigmoid(self.context_gate(gate_input))
         return target_state + gate * context_delta
 
-    def semantic_latent(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return normalize_semantic_latents(
-            self.hidden_to_semantic(hidden_states),
+    def factorized_latent(self, context_states: torch.Tensor, surface_states: torch.Tensor) -> torch.Tensor:
+        semantic = normalize_semantic_latents(
+            self.semantic_head(context_states),
             reduction_dtype=self.semantic_norm_reduction_dtype,
         )
+        surface = self.surface_head(surface_states.detach())
+        return compose_factorized_latent(semantic, surface)
 
     def forward(
         self,
@@ -157,9 +162,10 @@ class DilEncoderCore(nn.Module):
                 layer_vectors.append(self.pooled_target_vector(hidden_states, surface))
 
         token_states = self.pool_unit_states(hidden_states, surface)
+        surface_states = token_states
         if return_all or token_states.shape[1] != self.context_size:
             hidden_states = self.norm(token_states)
-            semantic = self.semantic_latent(hidden_states)
+            semantic = self.factorized_latent(hidden_states, surface_states)
             if output_hidden_states:
                 return semantic, tuple(layer_vectors)
             return semantic
@@ -168,6 +174,7 @@ class DilEncoderCore(nn.Module):
         context_states = token_states + self.context_offset_embeddings(offsets).unsqueeze(0)
         token_mask = surface.unit_mask
         hidden_states = self.target_conditioned_by_context(context_states, token_mask)
+        surface_states = surface_states[:, self.target_index]
 
         for layer_idx in range(self.num_stage_layers):
             encoder_idx = self.num_stage_layers + layer_idx
@@ -176,7 +183,7 @@ class DilEncoderCore(nn.Module):
                 layer_vectors.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
-        semantic = self.semantic_latent(hidden_states)
+        semantic = self.factorized_latent(hidden_states, surface_states)
         if output_hidden_states:
             return semantic, tuple(layer_vectors)
         return semantic

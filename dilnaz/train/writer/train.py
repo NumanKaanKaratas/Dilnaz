@@ -44,7 +44,7 @@ from dilnaz.models.dil import Dil
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 34
+CHECKPOINT_FORMAT_VERSION = 33
 WRITER_METRIC_KEYS = (
     "loss",
     "token_loss",
@@ -86,6 +86,7 @@ class WriterContextDataset(IterableDataset):
         context_rows: list[list[list[int]]],
         target_rows: list[list[list[int]]],
         line_ids: list[int],
+        source_row_starts: list[bool],
     ) -> dict:
         from dilnaz.surface import pack_token_units
 
@@ -107,12 +108,15 @@ class WriterContextDataset(IterableDataset):
             "surface": surface,
             "writer_target": target,
             "source_line_ids": torch.tensor(line_ids, dtype=torch.long),
+            "source_row_count": sum(1 for value in source_row_starts if value),
+            "target_unit_count": len(target_rows),
         }
 
     def iter_once(self, worker_id: int, worker_count: int):
         context_rows: list[list[list[int]]] = []
         target_rows: list[list[list[int]]] = []
         line_ids: list[int] = []
+        source_row_starts: list[bool] = []
 
         for item_idx, (source_line_id, text, add_eos) in enumerate(
             stream_text_items(self.train_file, self.read_chars)
@@ -127,24 +131,26 @@ class WriterContextDataset(IterableDataset):
             )
             if not segments:
                 continue
-            for window in context_windows(segments, self.context_radius):
+            for target_idx, window in enumerate(context_windows(segments, self.context_radius)):
                 target_segment = window[self.context_radius]
                 context_rows.append([segment_piece_ids(segment) for segment in window])
                 target_rows.append([segment_piece_ids(target_segment)])
                 line_ids.append(source_line_id)
+                source_row_starts.append(target_idx == 0)
                 self.produced += 1
                 if len(context_rows) >= self.batch_size:
-                    yield self.make_batch(context_rows, target_rows, line_ids)
+                    yield self.make_batch(context_rows, target_rows, line_ids, source_row_starts)
                     context_rows = []
                     target_rows = []
                     line_ids = []
+                    source_row_starts = []
                 if self.max_samples > 0 and self.produced >= self.max_samples:
                     if context_rows:
-                        yield self.make_batch(context_rows, target_rows, line_ids)
+                        yield self.make_batch(context_rows, target_rows, line_ids, source_row_starts)
                     return
 
         if context_rows:
-            yield self.make_batch(context_rows, target_rows, line_ids)
+            yield self.make_batch(context_rows, target_rows, line_ids, source_row_starts)
 
     def __iter__(self):
         from torch.utils.data import get_worker_info
@@ -199,7 +205,7 @@ def writer_only_metrics(
 
 
 def materialize_writer_batches(dataset, device: torch.device, batch_size: int, seed: int):
-    keep_keys = {"surface", "writer_target", "source_line_ids"}
+    keep_keys = {"surface", "writer_target", "source_line_ids", "source_row_count", "target_unit_count"}
     batches = [
         {
             key: value.detach().cpu() if hasattr(value, "detach") else value
@@ -247,6 +253,8 @@ def save_checkpoint(
         "writer_stop_token_id": config.writer_stop_token_id,
         "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
         "latent_size": config.latent_size,
+        "semantic_latent_size": config.semantic_latent_size,
+        "surface_latent_size": config.surface_latent_size,
     }
     import os as _os
 
@@ -322,8 +330,10 @@ def format_log(step: int, metrics: dict) -> str:
         f"t/s={metrics['tokens_per_second']:.1f}",
         f"step/s={metrics['steps_per_second']:.2f}",
     ]
-    if "source_lines_seen" in metrics:
-        fields.append(f"total/row={int(metrics['source_lines_seen'])}")
+    if "rows_total" in metrics:
+        fields.append(f"t/r={int(metrics['rows_total'])}")
+    if "units_total" in metrics:
+        fields.append(f"t/u={int(metrics['units_total'])}")
     for key in sorted(k for k in metrics if k.startswith("eval_")):
         fields.append(f"{key}={metrics[key]:.4f}")
     return " ".join(fields)
@@ -496,9 +506,10 @@ def main():
     log_micro_steps = 0
     data_seconds = 0.0
     compute_seconds = 0.0
-    source_lines_seen: set[int] = set()
     metric_sums = {key: 0.0 for key in WRITER_METRIC_KEYS}
-    last_metrics = {}
+    last_metrics = dict(source_training_state.get("metrics", {})) if writer_resume else {}
+    rows_total = int(last_metrics.get("rows_total", 0))
+    units_total = int(last_metrics.get("units_total", 0))
     completed_step = checkpoint.get("training_state", {}).get("step", 0) if writer_resume else 0
 
     def save_current(checkpoint_name: str = ""):
@@ -535,8 +546,8 @@ def main():
                 (loss / args.gradient_accumulation_steps).backward()
                 log_tokens += int(metrics.get("tokens_processed", 0))
                 log_micro_steps += 1
-                if "source_line_ids" in batch:
-                    source_lines_seen.update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
+                rows_total += int(batch["source_row_count"])
+                units_total += int(batch["target_unit_count"])
                 for key in WRITER_METRIC_KEYS:
                     metric_sums[key] += float(metrics[key].detach().cpu())
             torch.nn.utils.clip_grad_norm_(model.writer.parameters(), args.max_grad_norm)
@@ -556,8 +567,8 @@ def main():
                 averaged["compute_seconds"] = compute_seconds / max(log_micro_steps, 1)
                 averaged["tokens_per_second"] = log_tokens / elapsed
                 averaged["steps_per_second"] = log_micro_steps / elapsed
-                if source_lines_seen:
-                    averaged["source_lines_seen"] = len(source_lines_seen)
+                averaged["rows_total"] = rows_total
+                averaged["units_total"] = units_total
                 if should_eval:
                     averaged.update(
                         evaluate(

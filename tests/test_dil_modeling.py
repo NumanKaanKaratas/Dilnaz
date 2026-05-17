@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch.optim import AdamW
 
-from dilnaz.models.dil import Dil, DilConfig
+from dilnaz.models.dil import Dil, DilConfig, compose_factorized_latent, split_factorized_latent
 from dilnaz.models.common.norms import DilRMSNorm
 from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
@@ -31,6 +31,8 @@ def tiny_config() -> DilConfig:
         hidden_size=32,
         intermediate_size=64,
         latent_size=16,
+        semantic_latent_size=12,
+        surface_latent_size=4,
         max_surface_pieces_per_unit=16,
         surface_bucket_sizes=(8, 16, 32, 64),
         byte_conv_layers=1,
@@ -52,6 +54,24 @@ def test_encoder_bf16_runtime_is_scoped_to_encoder_reductions():
     assert {module.reduction_dtype for module in encoder_norms} == {None}
     assert {module.reduction_dtype for module in writer_norms} == {torch.float32}
     assert model.encoder.semantic_norm_reduction_dtype is None
+
+
+def test_factorized_latent_split_compose_and_bounds():
+    cfg = tiny_config()
+    semantic = torch.randn(2, 3, cfg.semantic_latent_size)
+    surface = torch.randn(2, 3, cfg.surface_latent_size).tanh()
+    composed = compose_factorized_latent(semantic, surface)
+    split_semantic, split_surface = split_factorized_latent(
+        composed,
+        cfg.semantic_latent_size,
+        cfg.surface_latent_size,
+    )
+    assert composed.shape == (2, 3, cfg.latent_size)
+    assert split_semantic.dtype == semantic.dtype
+    assert split_surface.dtype == surface.dtype
+    assert torch.equal(split_semantic, semantic)
+    assert torch.equal(split_surface, surface)
+    assert split_surface.abs().max() <= 1.0
 
 
 def test_dil_config_sequence_limit_matches_training_default():
@@ -149,12 +169,47 @@ def test_dil_packed_encoder_output_shape():
     )
     semantic_pooled = model.encode(window_surface)
     assert semantic_pooled.shape == (1, cfg.latent_size), f"shape={semantic_pooled.shape}"
+    semantic_part, surface_part = split_factorized_latent(
+        semantic_pooled,
+        cfg.semantic_latent_size,
+        cfg.surface_latent_size,
+    )
     assert torch.allclose(
-        semantic_pooled.norm(dim=-1),
-        torch.full((1,), cfg.latent_size**0.5),
+        semantic_part.norm(dim=-1),
+        torch.full((1,), cfg.semantic_latent_size**0.5),
         atol=1e-4,
         rtol=1e-4,
     )
+    assert surface_part.abs().max() <= 1.0
+
+
+def test_dil_distillation_includes_intermediate_layer_geometry():
+    cfg = tiny_config()
+    cfg.writer_loss_weight = 0.0
+    model = Dil(cfg)
+    surface = pack_token_units(
+        [
+            [[2], [3], [4], [5], [6]],
+            [[7], [8], [9], [10], [11]],
+        ],
+        pad_token_id=cfg.pad_token_id,
+        bucket_sizes=cfg.surface_bucket_sizes,
+        max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
+    )
+    teacher_layers = torch.randn(2, 4, cfg.hidden_size + 7)
+    teacher_mask = torch.ones(2, dtype=torch.bool)
+
+    output = model(surface, teacher_layers=teacher_layers, teacher_mask=teacher_mask)
+
+    assert output.layer_geometry_losses.shape == (cfg.num_encoder_layers,)
+    assert torch.isfinite(output.layer_geometry_losses).all()
+    expected_semantic = (
+        output.layer_geometry_losses.mean() * cfg.layer_geometry_weight
+        + output.mean_geometry_loss * cfg.mean_geometry_weight
+        + output.variance_loss * cfg.variance_weight
+    )
+    assert torch.allclose(output.semantic_loss, expected_semantic)
+    assert torch.allclose(output.loss, expected_semantic * cfg.distillation_weight)
 
 
 def test_writer_packed_logits_no_nan():
@@ -282,7 +337,7 @@ def test_writer_loss_is_unit_local_token_loss():
     assert torch.equal(metrics["loss"], metrics["token_loss"])
 
 
-def test_writer_loss_uses_detached_semantic_and_encoder_prior():
+def test_writer_surface_loss_does_not_backprop_to_semantic_trunk():
     cfg = tiny_config()
     model = Dil(cfg).eval()
     surface = pack_token_units(
@@ -298,16 +353,18 @@ def test_writer_loss_uses_detached_semantic_and_encoder_prior():
     def has_no_effective_grad(parameter: torch.nn.Parameter) -> bool:
         return parameter.grad is None or not parameter.grad.abs().gt(0).any()
 
-    assert has_no_effective_grad(model.encoder.hidden_to_semantic.weight)
+    assert has_no_effective_grad(model.encoder.semantic_head.weight)
     assert has_no_effective_grad(model.encoder.embed_tokens.weight)
+    assert model.encoder.surface_head.weight.grad is not None
     assert model.writer.token_embeddings.weight.grad is not None
     assert model.writer.encoder_prior_proj.weight.grad is not None
     assert model.writer.encoder_prior_gate.weight.grad is not None
-    assert model.writer.semantic_proj.weight.grad is not None
+    assert model.writer.surface_proj.weight.grad is not None
+    assert model.encoder.surface_head.weight.grad.abs().gt(0).any()
     assert model.writer.token_embeddings.weight.grad.abs().gt(0).any()
     assert model.writer.encoder_prior_proj.weight.grad.abs().gt(0).any()
     assert model.writer.encoder_prior_gate.weight.grad.abs().gt(0).any()
-    assert model.writer.semantic_proj.weight.grad.abs().gt(0).any()
+    assert model.writer.surface_proj.weight.grad.abs().gt(0).any()
 
 
 def test_writer_loss_weight_zero_freezes_writer_training():
@@ -317,13 +374,13 @@ def test_writer_loss_weight_zero_freezes_writer_training():
     prepare_writer_for_surface_training(model)
     assert all(not param.requires_grad for param in model.writer.parameters())
 
-    target = make_writer_target(cfg, [[[4]]])
     surface = pack_token_units(
         [[[2], [3], [4], [5], [6]]],
         pad_token_id=cfg.pad_token_id,
         bucket_sizes=cfg.surface_bucket_sizes,
         max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
     )
+    target = make_writer_target(cfg, [[[4]]])
     output = model(surface, writer_target=target)
     assert output.surface_loss.item() == 0.0
     assert output.writer_loss.item() == 0.0

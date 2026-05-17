@@ -4,6 +4,7 @@ from torch import nn
 
 from dilnaz.surface import PackedSurface, writer_query_from_lengths
 
+from ...common.latents import split_factorized_latent
 from ..configuration import DilConfig
 from ...common.norms import DilRMSNorm
 from .blocks import DilCausalConvSwiGLUBlock
@@ -18,13 +19,17 @@ class DilConditionalWriter(nn.Module):
         self.stop_token_id = config.writer_stop_token_id
         self.vocab_size = config.writer_vocab_size
         self.encoder_vocab_size = config.vocab_size
+        self.semantic_latent_size = config.semantic_latent_size
+        self.surface_latent_size = config.surface_latent_size
         self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
 
         self.token_embeddings = nn.Embedding(config.writer_vocab_size, config.hidden_size)
         self.encoder_prior_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.encoder_prior_gate = nn.Linear(config.hidden_size * 2, config.hidden_size)
-        self.semantic_proj = nn.Linear(config.latent_size, config.hidden_size)
+        self.semantic_proj = nn.Linear(config.semantic_latent_size, config.hidden_size)
+        self.surface_proj = nn.Linear(config.surface_latent_size, config.hidden_size)
+        self.surface_gate = nn.Linear(config.semantic_latent_size, config.hidden_size)
         self.position_embeddings = nn.Embedding(config.max_surface_pieces_per_unit + 1, config.hidden_size)
         intermediate_size = config.hidden_size * config.writer_conv_expansion
         self.blocks = nn.ModuleList(
@@ -68,7 +73,14 @@ class DilConditionalWriter(nn.Module):
             semantic = semantic.unsqueeze(1)
         if semantic.dim() != 3:
             raise ValueError("writer semantic must be shaped [batch, latent] or [batch, units, latent]")
-        unit_states = self.semantic_proj(semantic)
+        semantic_part, surface_part = split_factorized_latent(
+            semantic,
+            self.semantic_latent_size,
+            self.surface_latent_size,
+        )
+        unit_states = self.semantic_proj(semantic_part) + torch.sigmoid(
+            self.surface_gate(semantic_part)
+        ) * self.surface_proj(surface_part)
         unit_index = query_surface.unit_ids.unsqueeze(-1).expand(-1, -1, unit_states.shape[-1])
         hidden_states = self.token_condition(query_surface.ids, encoder_embedding_weight)
         hidden_states = hidden_states + torch.gather(unit_states, 1, unit_index)
@@ -90,7 +102,14 @@ class DilConditionalWriter(nn.Module):
     def unit_condition(self, semantic: torch.Tensor) -> torch.Tensor:
         if semantic.dim() != 2:
             raise ValueError("writer unit_condition expects [batch, latent]")
-        return self.semantic_proj(semantic)
+        semantic_part, surface_part = split_factorized_latent(
+            semantic,
+            self.semantic_latent_size,
+            self.surface_latent_size,
+        )
+        return self.semantic_proj(semantic_part) + torch.sigmoid(
+            self.surface_gate(semantic_part)
+        ) * self.surface_proj(surface_part)
 
     def step(
         self,

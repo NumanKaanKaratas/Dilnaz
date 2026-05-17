@@ -36,7 +36,7 @@ from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
-CHECKPOINT_FORMAT_VERSION = 34
+CHECKPOINT_FORMAT_VERSION = 33
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -99,7 +99,12 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
         "context_radius": config.context_radius,
         "latent_size": config.latent_size,
+        "semantic_latent_size": config.semantic_latent_size,
+        "surface_latent_size": config.surface_latent_size,
         "distillation_weight": config.distillation_weight,
+        "layer_geometry_weight": config.layer_geometry_weight,
+        "mean_geometry_weight": config.mean_geometry_weight,
+        "variance_weight": config.variance_weight,
         "writer_loss_weight": config.writer_loss_weight,
     }
 
@@ -111,7 +116,7 @@ def runtime_training_state(args) -> dict:
         "eval_batch_size": args.eval_batch_size,
         "nllb_batch_size": args.nllb_batch_size,
         "teacher_cache_dir": str(args.teacher_cache_dir) if args.teacher_cache_dir is not None else None,
-        "no_teacher_cache": args.no_teacher_cache,
+        "teacher_cache_max_gb": args.teacher_cache_max_gb,
         "max_batch_reuse": args.max_batch_reuse,
         "text_read_chars": args.text_read_chars,
         "prefetch_factor": args.prefetch_factor,
@@ -120,6 +125,11 @@ def runtime_training_state(args) -> dict:
         "adam_beta1": args.adam_beta1,
         "adam_beta2": args.adam_beta2,
         "warmup_steps": args.warmup_steps,
+        "layer_geometry_weight": args.layer_geometry_weight,
+        "mean_geometry_weight": args.mean_geometry_weight,
+        "variance_weight": args.variance_weight,
+        "writer_loss_weight": effective_writer_loss_weight(args, DIL_MODEL_DEFAULTS["writer_loss_weight"]),
+        "no_writer_training": args.no_writer_training,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "max_grad_norm": args.max_grad_norm,
         "log_every": args.log_every,
@@ -259,6 +269,11 @@ def empty_metric_sums() -> dict:
         "distill": 0.0,
         "sem_loss": 0.0,
         "surface_loss": 0.0,
+        "surface_norm": 0.0,
+        "geom_l1": 0.0,
+        "geom_l2": 0.0,
+        "geom_l3": 0.0,
+        "geom_l4": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
         "writer_token_exact": 0.0,
@@ -275,7 +290,6 @@ def empty_metric_sums() -> dict:
         "teacher_cache_misses": 0.0,
         "teacher_batches": 0,
         "batches": 0,
-        "source_line_ids": set(),
     }
 
 
@@ -284,6 +298,10 @@ def accumulate_output_metrics(total: dict, outputs, batch: dict) -> None:
     total["distill"] += float(outputs.distill_loss.detach().cpu())
     total["sem_loss"] += float(outputs.semantic_loss.detach().cpu())
     total["surface_loss"] += float(outputs.surface_loss.detach().cpu())
+    total["surface_norm"] += float(outputs.surface_norm.detach().cpu())
+    layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
+    for idx in range(4):
+        total[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
     total["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     total["var"] += float(outputs.variance_loss.detach().cpu())
     total["writer_token_exact"] += float(outputs.token_exact.detach().cpu())
@@ -302,16 +320,13 @@ def accumulate_output_metrics(total: dict, outputs, batch: dict) -> None:
         total["teacher_cache_hits"] += float(stats.get("cache_hits", 0.0))
         total["teacher_cache_misses"] += float(stats.get("cache_misses", 0.0))
         total["teacher_batches"] += 1
-    if "source_line_ids" in batch:
-        total["source_line_ids"].update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
-
 
 def reduce_metric_sums(total: dict) -> dict[str, float]:
     batches = max(total["batches"], 1)
     metrics = {
         key: value / batches
         for key, value in total.items()
-        if key not in {"batches", "source_line_ids", "teacher_batches"}
+        if key not in {"batches", "teacher_batches"}
     }
     teacher_batches = total.get("teacher_batches", 0)
     if teacher_batches > 0:
@@ -328,8 +343,6 @@ def reduce_metric_sums(total: dict) -> dict[str, float]:
             "teacher_cache_misses",
         ):
             metrics[key] = total[key] / teacher_batches
-    if total["source_line_ids"]:
-        metrics["source_lines_seen"] = len(total["source_line_ids"])
     return metrics
 
 
@@ -340,6 +353,11 @@ def format_log(step, metrics):
         f"distill={metrics['distill']:.4f}",
         f"sem_loss={metrics['sem_loss']:.4f}",
         f"surface_loss={metrics['surface_loss']:.4f}",
+        f"surface_norm={metrics['surface_norm']:.4f}",
+        f"geom_l1={metrics['geom_l1']:.4f}",
+        f"geom_l2={metrics['geom_l2']:.4f}",
+        f"geom_l3={metrics['geom_l3']:.4f}",
+        f"geom_l4={metrics['geom_l4']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
         f"writer_token_exact={metrics['writer_token_exact']:.4f}",
@@ -351,8 +369,10 @@ def format_log(step, metrics):
         f"w/s={metrics['windows_per_second']:.1f}",
         f"step/s={metrics['steps_per_second']:.2f}",
     ]
-    if "source_lines_seen" in metrics:
-        fields.append(f"total/row={int(metrics['source_lines_seen'])}")
+    if "rows_total" in metrics:
+        fields.append(f"t/r={int(metrics['rows_total'])}")
+    if "units_total" in metrics:
+        fields.append(f"t/u={int(metrics['units_total'])}")
     if "teacher_total_seconds" in metrics:
         fields.extend(
             [
@@ -387,7 +407,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--eval-batch-size", type=int, default=DIL_TRAIN_DEFAULTS["eval_batch_size"])
     parser.add_argument("--nllb-batch-size", type=int, default=DIL_TRAIN_DEFAULTS["nllb_batch_size"])
     parser.add_argument("--teacher-cache-dir", type=Path, default=None)
-    parser.add_argument("--no-teacher-cache", action="store_true")
+    parser.add_argument("--teacher-cache-max-gb", type=float, default=DIL_TRAIN_DEFAULTS["teacher_cache_max_gb"])
     parser.add_argument("--max-batch-reuse", type=int, default=DIL_TRAIN_DEFAULTS["max_batch_reuse"])
     parser.add_argument("--text-read-chars", type=int, default=DIL_TRAIN_DEFAULTS["text_read_chars"])
     parser.add_argument("--prefetch-factor", type=int, default=DIL_TRAIN_DEFAULTS["prefetch_factor"])
@@ -411,12 +431,15 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
+    parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
+    parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
     parser.add_argument("--byte-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_expansion"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
+    parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
     parser.add_argument("--writer-loss-weight", type=float, default=None)
@@ -438,16 +461,20 @@ def validate_args(args):
         raise ValueError("--batch-size and --eval-batch-size must be > 0")
     if args.nllb_batch_size <= 0:
         raise ValueError("--nllb-batch-size must be > 0")
-    if args.no_teacher_cache and args.teacher_cache_dir is not None:
-        raise ValueError("--no-teacher-cache cannot be used with --teacher-cache-dir")
+    if args.teacher_cache_max_gb < 0.0:
+        raise ValueError("--teacher-cache-max-gb must be >= 0")
     if args.max_batch_reuse <= 0:
         raise ValueError("--max-batch-reuse must be > 0")
     if args.text_read_chars <= 0:
         raise ValueError("--text-read-chars must be > 0")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
-    if args.latent_size <= 0:
-        raise ValueError("--latent-size must be > 0")
+    if args.semantic_latent_size <= 0 or args.surface_latent_size <= 0:
+        raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
+    if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
+        raise ValueError("--latent-size must equal semantic + surface latent sizes")
+    if args.layer_geometry_weight < 0.0:
+        raise ValueError("--layer-geometry-weight must be >= 0")
     if args.writer_loss_weight is not None and args.writer_loss_weight < 0.0:
         raise ValueError("--writer-loss-weight must be >= 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
@@ -491,12 +518,15 @@ def build_config(args, tokenizer):
         intermediate_size=args.intermediate_size,
         num_encoder_layers=args.num_encoder_layers,
         latent_size=args.latent_size,
+        semantic_latent_size=args.semantic_latent_size,
+        surface_latent_size=args.surface_latent_size,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
         byte_conv_expansion=args.byte_conv_expansion,
         dil_dropout=args.dil_dropout,
         distillation_weight=args.distillation_weight,
+        layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
         writer_loss_weight=writer_loss_weight,
@@ -568,8 +598,8 @@ class DilBaseTrainer(BaseTrainer):
             raise ValueError("fixed surface parquet caches are not part of the packed surface training contract")
 
     def build_teacher(self):
-        cache_dir = None if self.args.no_teacher_cache else self.args.teacher_cache_dir
-        if cache_dir is None and not self.args.no_teacher_cache:
+        cache_dir = self.args.teacher_cache_dir
+        if cache_dir is None:
             cache_dir = self.args.output_dir / "nllb_teacher_cache"
         return NllbTeacher(
             self.config.nllb_model_name,
@@ -578,6 +608,7 @@ class DilBaseTrainer(BaseTrainer):
             self.teacher_dtype,
             batch_size=self.args.nllb_batch_size,
             cache_dir=cache_dir,
+            cache_max_bytes=int(self.args.teacher_cache_max_gb * 1024**3),
         )
 
     def make_train_dataset(self):
@@ -704,11 +735,15 @@ class DilBaseTrainer(BaseTrainer):
         outputs = self.forward_batch(batch, step)
         token_count = int(batch["surface"].mask.sum().detach().cpu())
         window_count = int(batch["surface"].unit_mask.sum().detach().cpu())
+        row_count = int(batch["source_row_count"])
+        unit_count = int(batch["target_unit_count"])
         return StepResult(
             loss=outputs.loss,
             outputs=outputs,
             token_count=token_count,
             window_count=window_count,
+            row_count=row_count,
+            unit_count=unit_count,
             batch=batch,
         )
 
@@ -755,7 +790,9 @@ class DilBaseTrainer(BaseTrainer):
             f"device={self.device.type} bf16={int(self.autocast_enabled)} compile_mode={self.compile_mode} "
             f"data_mode={self.args.data_mode} resume_step={self.start_step} teacher_source=online_nllb "
             f"teacher_dtype={str(self.teacher_dtype).replace('torch.', '')} nllb_batch={self.args.nllb_batch_size} "
+            f"teacher_cache_max_gb={self.args.teacher_cache_max_gb:g} "
             f"vocab_size={self.config.vocab_size} latent_size={self.config.latent_size} "
+            f"semantic_latent_size={self.config.semantic_latent_size} surface_latent_size={self.config.surface_latent_size} "
             f"hidden_size={self.config.hidden_size} writer_loss_weight={self.config.writer_loss_weight:g}",
             flush=True,
         )

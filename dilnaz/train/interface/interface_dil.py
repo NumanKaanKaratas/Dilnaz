@@ -9,8 +9,16 @@ import torch.nn.functional as F
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from dilnaz.train.common.runtime import COMPILE_MODE_CHOICES, compile_forward, validate_compile_environment
-from dilnaz.train.data.dil_data import align_spans_to_pieces, apply_teacher_centered_add, build_nllb_layer_groups, context_windows
-from dilnaz.models.dil import DilConfig
+from dilnaz.train.data.dil_data import (
+    NLLB_DEFAULT_MAX_ENCODER_TOKENS,
+    align_spans_to_pieces,
+    apply_teacher_centered_add,
+    build_nllb_layer_groups,
+    context_windows,
+    nllb_piece_positions,
+    split_text_for_nllb,
+)
+from dilnaz.models.dil import DilConfig, split_factorized_latent
 from dilnaz.models.dil import Dil
 from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
@@ -130,7 +138,8 @@ def decode_tokens(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor)
 
 
 def similarity_matrix(latents: torch.Tensor, config: DilConfig | None = None) -> list[list[float]]:
-    del config
+    if config is not None:
+        latents, _ = split_factorized_latent(latents, config.semantic_latent_size, config.surface_latent_size)
     normalized = F.normalize(latents, dim=-1)
     return (normalized @ normalized.T).detach().cpu().tolist()
 
@@ -168,19 +177,35 @@ def nllb_similarity(config: DilConfig, text: str, segments: list[TokenSegment], 
     starts = [segment.start for segment in segments]
     ends = [segment.end for segment in segments]
 
-    encoded = nllb_tokenizer(text, return_tensors="pt", return_offsets_mapping=True)
-    offsets = encoded.pop("offset_mapping")[0].tolist()
-    input_ids = encoded["input_ids"][0].tolist()
-    pieces = [
-        (piece, int(offset[0]), int(offset[1]), token_idx)
-        for token_idx, (piece, offset) in enumerate(zip(nllb_tokenizer.convert_ids_to_tokens(input_ids), offsets))
-        if int(offset[0]) != int(offset[1])
-    ]
-    alignments = align_spans_to_pieces(starts, ends, pieces)
-    inputs = {key: value.to(device) for key, value in encoded.items()}
+    max_encoder_tokens = int(getattr(nllb_model.config, "max_position_embeddings", NLLB_DEFAULT_MAX_ENCODER_TOKENS))
+    hidden_chunks = []
+    pieces = []
+    index_shift = 0
+    for chunk in split_text_for_nllb(text, nllb_tokenizer, max_encoder_tokens):
+        encoded = nllb_tokenizer(chunk.text, return_tensors="pt", return_offsets_mapping=True)
+        offsets = encoded.pop("offset_mapping")[0].tolist()
+        input_ids = encoded["input_ids"][0].tolist()
+        inputs = {key: value.to(device) for key, value in encoded.items()}
+        outputs = nllb_model.get_encoder()(**inputs, output_hidden_states=True, return_dict=True)
+        attention_mask = encoded.get("attention_mask")
+        seq_len = int(attention_mask[0].sum().item()) if attention_mask is not None else int(encoded["input_ids"].shape[1])
+        hidden_chunks.append(tuple(state[0, :seq_len] for state in outputs.hidden_states))
+        pieces.extend(
+            nllb_piece_positions(
+                nllb_tokenizer,
+                input_ids,
+                offsets,
+                offset_shift=chunk.start,
+                index_shift=index_shift,
+            )
+        )
+        index_shift += seq_len
 
-    outputs = nllb_model.get_encoder()(**inputs, output_hidden_states=True, return_dict=True)
-    hidden_states = outputs.hidden_states
+    alignments = align_spans_to_pieces(starts, ends, pieces)
+    hidden_states = tuple(
+        torch.cat([chunk[layer_idx] for chunk in hidden_chunks], dim=0).unsqueeze(0)
+        for layer_idx in range(len(hidden_chunks[0]))
+    )
     num_encoder_layers = nllb_model.config.encoder_layers if hasattr(nllb_model.config, "encoder_layers") else len(hidden_states) - 1
     layer_groups = build_nllb_layer_groups(num_encoder_layers)
 

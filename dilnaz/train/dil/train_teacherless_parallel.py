@@ -23,7 +23,7 @@ from dilnaz.train.common.runtime import (
 from dilnaz.train.data.dil_data import load_hybrid_tokenizer, make_dil_batch_loader, segment_piece_ids, trainable_segments
 from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
-from dilnaz.models.dil import DilConfig
+from dilnaz.models.dil import DilConfig, split_factorized_latent
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import HybridTokenizer, TokenSegment, default_vocab_path
 from dilnaz.train.dil.train import (
@@ -394,6 +394,8 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
+    parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
+    parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -434,8 +436,10 @@ def validate_args(args) -> None:
         raise ValueError("--shuffle-buffer-size must be >= --batch-size")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
-    if args.latent_size <= 0:
-        raise ValueError("--latent-size must be > 0")
+    if args.semantic_latent_size <= 0 or args.surface_latent_size <= 0:
+        raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
+    if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
+        raise ValueError("--latent-size must equal semantic + surface latent sizes")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
@@ -486,6 +490,8 @@ def build_config(args, tokenizer: HybridTokenizer) -> DilConfig:
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         latent_size=args.latent_size,
+        semantic_latent_size=args.semantic_latent_size,
+        surface_latent_size=args.surface_latent_size,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -521,7 +527,6 @@ def empty_metric_sums() -> dict:
         "covariance_weight": 0.0,
         "writer_loss_weight": 0.0,
         "batches": 0,
-        "source_line_ids": set(),
     }
 
 
@@ -541,7 +546,6 @@ def accumulate_output_metrics(total: dict, outputs: TeacherlessDilOutput, batch:
     total["covariance_weight"] += outputs.covariance_weight
     total["writer_loss_weight"] += outputs.writer_loss_weight
     total["batches"] += 1
-    total["source_line_ids"].update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
 
 
 def reduce_metric_sums(total: dict) -> dict[str, float]:
@@ -549,10 +553,8 @@ def reduce_metric_sums(total: dict) -> dict[str, float]:
     metrics = {
         key: value / batches
         for key, value in total.items()
-        if key not in {"batches", "source_line_ids"}
+        if key != "batches"
     }
-    if total["source_line_ids"]:
-        metrics["source_lines_seen"] = len(total["source_line_ids"])
     return metrics
 
 
@@ -579,8 +581,10 @@ def format_log(step: int, metrics: dict[str, float]) -> str:
         f"w/s={metrics['windows_per_second']:.1f}",
         f"step/s={metrics['steps_per_second']:.2f}",
     ]
-    if "source_lines_seen" in metrics:
-        fields.append(f"total/row={int(metrics['source_lines_seen'])}")
+    if "rows_total" in metrics:
+        fields.append(f"t/r={int(metrics['rows_total'])}")
+    if "units_total" in metrics:
+        fields.append(f"t/u={int(metrics['units_total'])}")
     for key in sorted(k for k in metrics if k.startswith("eval_")):
         fields.append(f"{key}={metrics[key]:.4f}")
     return " ".join(fields)
@@ -690,9 +694,14 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
         surface = batch[f"{prefix}_surface"]
         unit_mask = batch[f"{prefix}_unit_mask"]
         full_latents = self.model.encode(surface)
-        if full_latents.shape[:2] != unit_mask.shape:
+        semantic_latents, _ = split_factorized_latent(
+            full_latents,
+            self.config.semantic_latent_size,
+            self.config.surface_latent_size,
+        )
+        if semantic_latents.shape[:2] != unit_mask.shape:
             raise ValueError("encoded sequence latents must match unit_mask shape")
-        masked_semantic = full_latents.float() * unit_mask.unsqueeze(-1).to(full_latents.dtype)
+        masked_semantic = semantic_latents.float() * unit_mask.unsqueeze(-1).to(semantic_latents.dtype)
         return full_latents, masked_semantic
 
     def writer_metrics_for_side(self, latents: torch.Tensor, batch: dict, prefix: str) -> dict[str, torch.Tensor]:
@@ -774,7 +783,17 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
         outputs = self.forward_batch(batch, step)
         token_count = int(batch["tr_surface"].mask.sum().detach().cpu() + batch["en_surface"].mask.sum().detach().cpu())
         window_count = int(batch["tr_unit_mask"].sum().detach().cpu() + batch["en_unit_mask"].sum().detach().cpu())
-        return StepResult(outputs.loss, outputs, token_count=token_count, window_count=window_count, batch=batch)
+        row_count = int(batch["source_line_ids"].numel())
+        unit_count = window_count
+        return StepResult(
+            outputs.loss,
+            outputs,
+            token_count=token_count,
+            window_count=window_count,
+            row_count=row_count,
+            unit_count=unit_count,
+            batch=batch,
+        )
 
     def eval_step(self, batch: dict) -> StepResult:
         outputs = self.forward_batch(batch, self.completed_step)

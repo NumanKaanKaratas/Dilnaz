@@ -12,8 +12,10 @@ class DilOutput(ModelOutput):
     distill_loss: Optional[torch.FloatTensor] = None
     semantic_loss: Optional[torch.FloatTensor] = None
     surface_loss: Optional[torch.FloatTensor] = None
+    surface_norm: Optional[torch.FloatTensor] = None
     writer_loss: Optional[torch.FloatTensor] = None
     writer_token_loss: Optional[torch.FloatTensor] = None
+    layer_geometry_losses: Optional[torch.FloatTensor] = None
     mean_geometry_loss: Optional[torch.FloatTensor] = None
     variance_loss: Optional[torch.FloatTensor] = None
     byte_acc: Optional[torch.FloatTensor] = None

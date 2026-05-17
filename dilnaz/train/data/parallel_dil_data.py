@@ -11,14 +11,17 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, get_worker_info
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
+from dilnaz.models.common.latents import split_factorized_latent
 from dilnaz.models.dil import DilConfig
 from dilnaz.train.data.dil_data import (
     NLLB_DEFAULT_MAX_ENCODER_TOKENS,
     NLLB_LAYER_GROUPS,
     align_spans_to_pieces,
     apply_teacher_centered_add_by_group,
+    nllb_piece_positions,
     overlaps,
     segment_piece_ids,
+    split_text_for_nllb,
     teacher_distill_segment,
     trainable_segments,
 )
@@ -291,6 +294,8 @@ class ParallelDilBatchDataset(IterableDataset):
             "row_token_indices": torch.tensor(row_token_indices, dtype=torch.long),
             "row_texts": row_texts,
             "source_line_ids": torch.tensor([item.pair.index for item in items], dtype=torch.long),
+            "source_row_count": len(items),
+            "target_unit_count": len(row_unit_indices),
         }
 
     def iter_once(self, worker_id: int, worker_count: int):
@@ -641,21 +646,26 @@ def grouped_mean(vectors: torch.Tensor, row_indices: torch.Tensor, row_mask: tor
 def semantic_row_vectors(
     latents: torch.Tensor,
     batch: dict,
+    semantic_latent_size: int,
+    surface_latent_size: int,
 ) -> torch.Tensor:
-    if latents.dim() == 2:
-        return latents
-    if latents.dim() != 3:
+    semantic, _ = split_factorized_latent(latents, semantic_latent_size, surface_latent_size)
+    if semantic.dim() == 2:
+        return semantic
+    if semantic.dim() != 3:
         raise ValueError("parallel DIL semantic output must be shaped [rows, latent] or [batch, units, latent]")
-    batch_indices = batch["row_batch_indices"].to(latents.device, dtype=torch.long)
-    unit_indices = batch["row_unit_indices"].to(latents.device, dtype=torch.long)
-    return latents[batch_indices, unit_indices]
+    batch_indices = batch["row_batch_indices"].to(semantic.device, dtype=torch.long)
+    unit_indices = batch["row_unit_indices"].to(semantic.device, dtype=torch.long)
+    return semantic[batch_indices, unit_indices]
 
 
 def parallel_alignment_loss(
     mean: torch.Tensor,
     batch: dict,
+    semantic_latent_size: int,
+    surface_latent_size: int,
 ) -> torch.Tensor:
-    row_vectors = semantic_row_vectors(mean, batch)
+    row_vectors = semantic_row_vectors(mean, batch, semantic_latent_size, surface_latent_size)
     source_rows = batch["parallel_source_rows"].to(row_vectors.device)
     target_rows = batch["parallel_target_rows"].to(row_vectors.device)
     if source_rows.shape[0] == 0:
@@ -669,10 +679,17 @@ def parallel_total_loss(
     outputs,
     batch: dict,
     parallel_alignment_weight: float,
+    semantic_latent_size: int,
+    surface_latent_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if outputs.loss is None:
         raise ValueError("DIL outputs.loss is required for parallel training")
-    alignment_loss = parallel_alignment_loss(outputs.semantic, batch)
+    alignment_loss = parallel_alignment_loss(
+        outputs.semantic,
+        batch,
+        semantic_latent_size,
+        surface_latent_size,
+    )
     return outputs.loss + alignment_loss * parallel_alignment_weight, alignment_loss
 
 
@@ -709,10 +726,27 @@ class ParallelNllbTeacher:
     def encode_texts(self, text_indices: list[int], texts: list[str], lang: str) -> dict[int, EncodedText]:
         encoded_texts = {}
         self.set_lang(lang)
-        length_sorted_indices = sorted(text_indices, key=lambda idx: len(texts[idx]))
-        for batch_start in range(0, len(length_sorted_indices), self.batch_size):
-            chunk_indices = length_sorted_indices[batch_start : batch_start + self.batch_size]
-            batch_texts = [texts[text_idx] for text_idx in chunk_indices]
+        records = []
+        chunk_counts: dict[int, int] = {}
+        for text_idx in text_indices:
+            chunks = split_text_for_nllb(texts[text_idx], self.tokenizer, self.max_encoder_tokens)
+            chunk_counts[text_idx] = len(chunks)
+            records.extend((text_idx, chunk_idx, chunk) for chunk_idx, chunk in enumerate(chunks))
+
+        hidden_chunks: dict[int, list[tuple[torch.Tensor, ...] | None]] = {
+            text_idx: [None] * chunk_count for text_idx, chunk_count in chunk_counts.items()
+        }
+        align_chunks: dict[int, list[torch.Tensor | None]] = {
+            text_idx: [None] * chunk_count for text_idx, chunk_count in chunk_counts.items()
+        }
+        piece_chunks: dict[int, list[list[EncoderPiece] | None]] = {
+            text_idx: [None] * chunk_count for text_idx, chunk_count in chunk_counts.items()
+        }
+
+        length_sorted_records = sorted(records, key=lambda record: len(record[2].text))
+        for batch_start in range(0, len(length_sorted_records), self.batch_size):
+            records_batch = length_sorted_records[batch_start : batch_start + self.batch_size]
+            batch_texts = [record[2].text for record in records_batch]
             encoded = self.tokenizer(
                 batch_texts,
                 padding=True,
@@ -726,6 +760,7 @@ class ParallelNllbTeacher:
                 )
             offsets_batch = encoded.pop("offset_mapping").tolist()
             input_ids_batch = encoded["input_ids"].tolist()
+            attention_mask = encoded.get("attention_mask")
             inputs = {key: value.to(self.device) for key, value in encoded.items()}
             with torch.inference_mode():
                 outputs = self.model.get_encoder()(
@@ -734,13 +769,48 @@ class ParallelNllbTeacher:
                     return_dict=True,
                 )
             hidden_states = tuple(state.detach() for state in outputs.hidden_states)
-            for local_idx, text_idx in enumerate(chunk_indices):
-                text_hidden_states = tuple(layer[local_idx] for layer in hidden_states)
-                encoded_texts[text_idx] = EncodedText(
-                    hidden_states=text_hidden_states,
-                    align_hidden=hidden_states[self.align_layer][local_idx],
-                    pieces=piece_positions(self.tokenizer, input_ids_batch[local_idx], offsets_batch[local_idx]),
+            for local_idx, (text_idx, chunk_idx, chunk) in enumerate(records_batch):
+                seq_len = (
+                    int(attention_mask[local_idx].sum().item())
+                    if attention_mask is not None
+                    else int(encoded["input_ids"].shape[1])
                 )
+                hidden_chunks[text_idx][chunk_idx] = tuple(layer[local_idx, :seq_len] for layer in hidden_states)
+                align_chunks[text_idx][chunk_idx] = hidden_states[self.align_layer][local_idx, :seq_len]
+                piece_chunks[text_idx][chunk_idx] = [
+                    EncoderPiece(piece, start, end, encoder_index)
+                    for piece, start, end, encoder_index in nllb_piece_positions(
+                        self.tokenizer,
+                        input_ids_batch[local_idx],
+                        offsets_batch[local_idx],
+                        offset_shift=chunk.start,
+                    )
+                ]
+        for text_idx in text_indices:
+            hidden_parts = hidden_chunks[text_idx]
+            align_parts = align_chunks[text_idx]
+            piece_parts = piece_chunks[text_idx]
+            layer_count = len(next(part for part in hidden_parts if part is not None))
+            layerwise: list[list[torch.Tensor]] = [[] for _ in range(layer_count)]
+            align_hidden_parts: list[torch.Tensor] = []
+            pieces: list[EncoderPiece] = []
+            index_shift = 0
+            for hidden_part, align_part, piece_part in zip(hidden_parts, align_parts, piece_parts):
+                if hidden_part is None or align_part is None or piece_part is None:
+                    raise ValueError("missing parallel NLLB encoded chunk")
+                for layer_idx, layer in enumerate(hidden_part):
+                    layerwise[layer_idx].append(layer)
+                align_hidden_parts.append(align_part)
+                pieces.extend(
+                    EncoderPiece(piece.text, piece.start, piece.end, piece.encoder_index + index_shift)
+                    for piece in piece_part
+                )
+                index_shift += int(hidden_part[0].shape[0])
+            encoded_texts[text_idx] = EncodedText(
+                hidden_states=tuple(torch.cat(parts, dim=0) for parts in layerwise),
+                align_hidden=torch.cat(align_hidden_parts, dim=0),
+                pieces=pieces,
+            )
         return encoded_texts
 
     def encode_batch_texts(self, batch: dict) -> dict[int, EncodedText]:

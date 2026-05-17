@@ -17,6 +17,8 @@ class StepResult:
     outputs: Any
     token_count: int
     window_count: int = 0
+    row_count: int = 0
+    unit_count: int = 0
     batch: Any = None
 
 
@@ -160,6 +162,8 @@ class BaseTrainer:
         log_tokens = 0
         log_windows = 0
         log_steps = 0
+        rows_total = int(self.last_metrics.get("rows_total", 0))
+        units_total = int(self.last_metrics.get("units_total", 0))
         data_seconds = 0.0
         transfer_seconds = 0.0
         compute_seconds = 0.0
@@ -186,6 +190,8 @@ class BaseTrainer:
                     (result.loss / accumulation_steps).backward()
                     log_tokens += result.token_count
                     log_windows += result.window_count
+                    rows_total += result.row_count
+                    units_total += result.unit_count
                     self.accumulate_metrics(metric_sums, result)
 
                 torch.nn.utils.clip_grad_norm_(self.trainable_parameters(), self.args.max_grad_norm)
@@ -210,6 +216,8 @@ class BaseTrainer:
                     averaged["tokens_per_second"] = log_tokens / elapsed
                     averaged["windows_per_second"] = log_windows / elapsed
                     averaged["steps_per_second"] = log_steps / elapsed
+                    averaged["rows_total"] = rows_total
+                    averaged["units_total"] = units_total
                     if should_eval:
                         averaged.update(self.evaluate(self.args.max_eval_batches))
                     print(self.format_log(step, averaged), flush=True)
