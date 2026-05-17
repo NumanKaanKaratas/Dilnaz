@@ -40,7 +40,7 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=31,
+        checkpoint_format_version=32,
         **kwargs,
     ):
         self.surface_bucket_sizes = tuple(int(bucket) for bucket in surface_bucket_sizes)
@@ -74,8 +74,8 @@ class DilConfig(PretrainedConfig):
             raise ValueError("semantic_latent_size and surface_latent_size must be > 0")
         if latent_size != semantic_latent_size + surface_latent_size:
             raise ValueError("latent_size must equal semantic_latent_size + surface_latent_size")
-        if checkpoint_format_version != 31:
-            raise ValueError("DIL factorized latent v2 requires checkpoint_format_version=31")
+        if checkpoint_format_version != 32:
+            raise ValueError("DIL writer encoder-prior v1 requires checkpoint_format_version=32")
 
         self.byte_vocab_size = byte_vocab_size
         self.vocab_size = vocab_size

@@ -21,8 +21,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 31:
-            raise ValueError("DIL factorized latent v2 checkpoints require checkpoint_format_version=31")
+        if config.checkpoint_format_version != 32:
+            raise ValueError("DIL writer encoder-prior v1 checkpoints require checkpoint_format_version=32")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
@@ -94,11 +94,15 @@ class Dil(PreTrainedModel):
             self.config.surface_latent_size,
         )
 
+    def writer_encoder_embedding_weight(self) -> torch.Tensor:
+        return self.encoder.embed_tokens.weight.detach()
+
     def writer_outputs(self, semantic: torch.Tensor, query_surface: PackedSurface) -> torch.Tensor:
         compiled_forward = getattr(self, "_compiled_writer_forward", None)
+        encoder_embedding_weight = self.writer_encoder_embedding_weight()
         if compiled_forward is not None:
-            return compiled_forward(semantic, query_surface)
-        return self.writer(semantic, query_surface)
+            return compiled_forward(semantic, query_surface, encoder_embedding_weight)
+        return self.writer(semantic, query_surface, encoder_embedding_weight)
 
     def set_compiled_forwards(self, encoder_forward=None, writer_forward=None):
         object.__setattr__(self, "_compiled_encoder_forward", encoder_forward)
@@ -257,4 +261,4 @@ class Dil(PreTrainedModel):
 
     @torch.no_grad()
     def decode_semantic(self, semantic: torch.Tensor) -> DilWriterGeneration:
-        return self.writer.generate(semantic)
+        return self.writer.generate(semantic, self.writer_encoder_embedding_weight())

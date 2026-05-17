@@ -35,7 +35,7 @@ from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
-CHECKPOINT_FORMAT_VERSION = 31
+CHECKPOINT_FORMAT_VERSION = 32
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 

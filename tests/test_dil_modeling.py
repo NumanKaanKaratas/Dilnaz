@@ -1,12 +1,19 @@
 import ast
 from pathlib import Path
 
+import pytest
 import torch
 
 from dilnaz.models.dil import Dil, DilConfig, compose_factorized_latent, split_factorized_latent
 from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
-from dilnaz.train.writer.train import WRITER_METRIC_KEYS, WriterContextDataset, load_model_checkpoint, writer_only_metrics
+from dilnaz.train.writer.train import (
+    WRITER_METRIC_KEYS,
+    WriterContextDataset,
+    freeze_for_writer_only,
+    load_model_checkpoint,
+    writer_only_metrics,
+)
 
 
 def tiny_config() -> DilConfig:
@@ -145,7 +152,11 @@ def test_writer_packed_logits_no_nan():
     model = Dil(cfg)
     semantic = torch.randn(2, cfg.latent_size)
     target = make_writer_target(cfg, [[[2]], [[3, 4]]])
-    output = model.writer.transition(semantic, query_surface=target.query)
+    output = model.writer.transition(
+        semantic,
+        query_surface=target.query,
+        encoder_embedding_weight=model.writer_encoder_embedding_weight(),
+    )
     assert output.token_logits.shape == (2, target.query.surface_width, cfg.writer_vocab_size)
     assert torch.isfinite(output.token_logits).all()
 
@@ -155,7 +166,11 @@ def test_writer_accepts_unit_semantics_with_packed_query():
     model = Dil(cfg)
     semantic = torch.randn(1, 2, cfg.latent_size)
     target = make_writer_target(cfg, [[[2], [3, 4]]])
-    output = model.writer.transition(semantic, query_surface=target.query)
+    output = model.writer.transition(
+        semantic,
+        query_surface=target.query,
+        encoder_embedding_weight=model.writer_encoder_embedding_weight(),
+    )
     assert output.token_logits.shape == (1, target.query.surface_width, cfg.writer_vocab_size)
     assert torch.isfinite(output.token_logits).all()
 
@@ -167,8 +182,17 @@ def test_writer_causal_surface_path_does_not_see_future_inputs():
     left = make_writer_target(cfg, [[[2, 3, 4]]])
     right = make_writer_target(cfg, [[[2, 9, 9]]])
     with torch.no_grad():
-        left_logits = model.writer.transition(semantic, query_surface=left.query).token_logits
-        right_logits = model.writer.transition(semantic, query_surface=right.query).token_logits
+        encoder_weight = model.writer_encoder_embedding_weight()
+        left_logits = model.writer.transition(
+            semantic,
+            query_surface=left.query,
+            encoder_embedding_weight=encoder_weight,
+        ).token_logits
+        right_logits = model.writer.transition(
+            semantic,
+            query_surface=right.query,
+            encoder_embedding_weight=encoder_weight,
+        ).token_logits
     assert torch.allclose(left_logits[:, 0], right_logits[:, 0], atol=1e-6, rtol=1e-5)
     assert torch.allclose(left_logits[:, 1], right_logits[:, 1], atol=1e-6, rtol=1e-5)
 
@@ -179,7 +203,12 @@ def test_writer_incremental_step_matches_full_causal_forward():
     semantic = torch.randn(1, cfg.latent_size)
     target = make_writer_target(cfg, [[[2, 3, 4]]])
     with torch.no_grad():
-        full_logits = model.writer.transition(semantic, query_surface=target.query).token_logits
+        encoder_weight = model.writer_encoder_embedding_weight()
+        full_logits = model.writer.transition(
+            semantic,
+            query_surface=target.query,
+            encoder_embedding_weight=encoder_weight,
+        ).token_logits
         caches = [None for _ in model.writer.blocks]
         stepped = []
         for position in range(target.query.surface_width):
@@ -188,6 +217,7 @@ def test_writer_incremental_step_matches_full_causal_forward():
                 target.query.ids[:, position],
                 target.query.pos_in_unit[:, position],
                 caches,
+                encoder_weight,
             )
             stepped.append(logits)
     step_logits = torch.stack(stepped, dim=1)
@@ -197,6 +227,39 @@ def test_writer_incremental_step_matches_full_causal_forward():
         atol=1e-5,
         rtol=1e-4,
     )
+
+
+def test_writer_encoder_prior_changes_logits_without_sharing_parameters():
+    cfg = tiny_config()
+    model = Dil(cfg).eval()
+    semantic = torch.randn(1, cfg.latent_size)
+    target = make_writer_target(cfg, [[[2, 3, 4]]])
+    encoder_weight = model.writer_encoder_embedding_weight()
+    altered_weight = encoder_weight.clone()
+    altered_weight[1:5] = altered_weight[1:5] + 5.0
+    with torch.no_grad():
+        base_logits = model.writer.transition(
+            semantic,
+            query_surface=target.query,
+            encoder_embedding_weight=encoder_weight,
+        ).token_logits
+        altered_logits = model.writer.transition(
+            semantic,
+            query_surface=target.query,
+            encoder_embedding_weight=altered_weight,
+        ).token_logits
+    assert not torch.allclose(base_logits[target.query.mask], altered_logits[target.query.mask])
+
+
+def test_writer_stop_token_has_zero_encoder_prior():
+    cfg = tiny_config()
+    model = Dil(cfg).eval()
+    token_ids = torch.tensor([cfg.writer_stop_token_id])
+    encoder_weight = model.writer_encoder_embedding_weight()
+    with torch.no_grad():
+        token_state = model.writer.token_condition(token_ids, encoder_weight)
+        writer_only = model.writer.token_embeddings(token_ids)
+    assert torch.allclose(token_state, writer_only, atol=1e-6, rtol=1e-6)
 
 
 def test_writer_loss_is_unit_local_token_loss():
@@ -228,8 +291,14 @@ def test_writer_surface_loss_does_not_backprop_to_semantic_trunk():
     assert has_no_effective_grad(model.encoder.semantic_head.weight)
     assert has_no_effective_grad(model.encoder.embed_tokens.weight)
     assert model.encoder.surface_head.weight.grad is not None
+    assert model.writer.token_embeddings.weight.grad is not None
+    assert model.writer.encoder_prior_proj.weight.grad is not None
+    assert model.writer.encoder_prior_gate.weight.grad is not None
     assert model.writer.surface_proj.weight.grad is not None
     assert model.encoder.surface_head.weight.grad.abs().gt(0).any()
+    assert model.writer.token_embeddings.weight.grad.abs().gt(0).any()
+    assert model.writer.encoder_prior_proj.weight.grad.abs().gt(0).any()
+    assert model.writer.encoder_prior_gate.weight.grad.abs().gt(0).any()
     assert model.writer.surface_proj.weight.grad.abs().gt(0).any()
 
 
@@ -252,6 +321,23 @@ def test_writer_trainer_accepts_base_dil_checkpoint_format(tmp_path: Path):
     assert checkpoint["format_version"] == cfg.checkpoint_format_version
 
 
+def test_writer_trainer_rejects_previous_dil_checkpoint_format(tmp_path: Path):
+    cfg = tiny_config()
+    model = Dil(cfg)
+    cfg.save_pretrained(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "format_version": 31,
+            "model_state_dict": model.state_dict(),
+            "training_state": {"step": 0},
+        },
+        checkpoint_path,
+    )
+    with pytest.raises(ValueError, match="unsupported Dil checkpoint format_version=31"):
+        load_model_checkpoint(checkpoint_path, torch.device("cpu"))
+
+
 def test_writer_only_metrics_are_tensors():
     cfg = tiny_config()
     model = Dil(cfg)
@@ -264,6 +350,26 @@ def test_writer_only_metrics_are_tensors():
     target = make_writer_target(cfg, [[[4]]])
     metrics = writer_only_metrics(model, {"surface": surface, "writer_target": target})
     assert all(hasattr(metrics[key], "detach") for key in WRITER_METRIC_KEYS)
+
+
+def test_writer_only_training_does_not_update_encoder_embedding():
+    cfg = tiny_config()
+    model = Dil(cfg)
+    freeze_for_writer_only(model)
+    surface = pack_token_units(
+        [[[2], [3], [4], [5], [6]]],
+        pad_token_id=cfg.pad_token_id,
+        bucket_sizes=cfg.surface_bucket_sizes,
+        max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
+    )
+    target = make_writer_target(cfg, [[[4]]])
+    metrics = writer_only_metrics(model, {"surface": surface, "writer_target": target})
+    metrics["loss"].backward()
+
+    assert model.encoder.embed_tokens.weight.grad is None
+    assert model.writer.token_embeddings.weight.grad is not None
+    assert model.writer.encoder_prior_proj.weight.grad is not None
+    assert model.writer.encoder_prior_gate.weight.grad is not None
 
 
 def test_writer_context_dataset_uses_writer_stop_token(tmp_path: Path):
@@ -354,7 +460,8 @@ def test_writer_generation_stops_on_eos_stop_token():
     cfg = tiny_config()
     model = Dil(cfg)
 
-    def stop_step(self, semantic, token_ids, positions, caches):
+    def stop_step(self, semantic, token_ids, positions, caches, encoder_embedding_weight):
+        del encoder_embedding_weight
         logits = torch.zeros(semantic.shape[0], self.vocab_size, device=semantic.device)
         logits[:, self.stop_token_id] = 1.0
         return logits, caches
@@ -371,7 +478,8 @@ def test_writer_generation_caps_when_stop_is_missing():
     cfg = tiny_config()
     model = Dil(cfg)
 
-    def token_step(self, semantic, token_ids, positions, caches):
+    def token_step(self, semantic, token_ids, positions, caches, encoder_embedding_weight):
+        del encoder_embedding_weight
         logits = torch.zeros(semantic.shape[0], self.vocab_size, device=semantic.device)
         logits[:, 2] = 1.0
         return logits, caches

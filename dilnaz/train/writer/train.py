@@ -43,8 +43,8 @@ from dilnaz.models.dil import Dil
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 31
-WRITER_OBJECTIVE = "factorized_writer_v1"
+CHECKPOINT_FORMAT_VERSION = 32
+WRITER_OBJECTIVE = "factorized_writer_encoder_prior_v1"
 WRITER_METRIC_KEYS = (
     "loss",
     "token_loss",
