@@ -695,6 +695,8 @@ class ParallelNllbTeacher:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name, dtype=dtype).to(device)
         self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad_(False)
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.device = device
@@ -712,8 +714,9 @@ class ParallelNllbTeacher:
     def encode_texts(self, text_indices: list[int], texts: list[str], lang: str) -> dict[int, EncodedText]:
         encoded_texts = {}
         self.set_lang(lang)
-        for batch_start in range(0, len(text_indices), self.batch_size):
-            chunk_indices = text_indices[batch_start : batch_start + self.batch_size]
+        length_sorted_indices = sorted(text_indices, key=lambda idx: len(texts[idx]))
+        for batch_start in range(0, len(length_sorted_indices), self.batch_size):
+            chunk_indices = length_sorted_indices[batch_start : batch_start + self.batch_size]
             batch_texts = [texts[text_idx] for text_idx in chunk_indices]
             encoded = self.tokenizer(
                 batch_texts,
@@ -729,13 +732,13 @@ class ParallelNllbTeacher:
             offsets_batch = encoded.pop("offset_mapping").tolist()
             input_ids_batch = encoded["input_ids"].tolist()
             inputs = {key: value.to(self.device) for key, value in encoded.items()}
-            with torch.no_grad():
+            with torch.inference_mode():
                 outputs = self.model.get_encoder()(
                     **inputs,
                     output_hidden_states=True,
                     return_dict=True,
                 )
-            hidden_states = tuple(state.float() for state in outputs.hidden_states)
+            hidden_states = tuple(state.detach() for state in outputs.hidden_states)
             for local_idx, text_idx in enumerate(chunk_indices):
                 text_hidden_states = tuple(layer[local_idx] for layer in hidden_states)
                 encoded_texts[text_idx] = EncodedText(

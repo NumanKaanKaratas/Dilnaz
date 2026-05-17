@@ -54,10 +54,10 @@ class AsyncTeacherBatchSource:
         try:
             while not self.stop_event.is_set():
                 batch = next(self.train_iter)
-                text_list = batch.pop("texts", None)
-                teacher_layers, teacher_mask = self.teacher.teacher_layers(batch, texts=text_list)
+                teacher_layers, teacher_mask = self.teacher.teacher_layers(batch)
                 batch["teacher_layers"] = teacher_layers
                 batch["teacher_mask"] = teacher_mask
+                batch["_teacher_stats"] = dict(getattr(self.teacher, "last_stats", {}))
                 cuda_sync(self.device)
                 self.ready.put(batch)
         except BaseException as error:
@@ -109,6 +109,7 @@ def runtime_training_state(args) -> dict:
         "batch_size": args.batch_size,
         "eval_batch_size": args.eval_batch_size,
         "nllb_batch_size": args.nllb_batch_size,
+        "teacher_cache_dir": str(args.teacher_cache_dir) if args.teacher_cache_dir is not None else None,
         "max_batch_reuse": args.max_batch_reuse,
         "text_read_chars": args.text_read_chars,
         "prefetch_factor": args.prefetch_factor,
@@ -224,6 +225,7 @@ class AsyncTeacherIterator:
                 self.current_batch,
                 self.current_batch_seen,
             )
+        self.current_batch["_teacher_reuse_count"] = self.current_batch_seen
         self.last_transfer_seconds = 0.0
         return self.current_batch
 
@@ -240,6 +242,17 @@ def empty_metric_sums() -> dict:
         "var": 0.0,
         "writer_token_exact": 0.0,
         "writer_stop_acc": 0.0,
+        "teacher_total_seconds": 0.0,
+        "teacher_tokenize_seconds": 0.0,
+        "teacher_forward_seconds": 0.0,
+        "teacher_pool_seconds": 0.0,
+        "teacher_cache_hit_rate": 0.0,
+        "teacher_padding_ratio": 0.0,
+        "teacher_nllb_tokens_per_second": 0.0,
+        "teacher_unique_texts": 0.0,
+        "teacher_cache_hits": 0.0,
+        "teacher_cache_misses": 0.0,
+        "teacher_batches": 0,
         "batches": 0,
         "source_line_ids": set(),
     }
@@ -257,6 +270,19 @@ def accumulate_output_metrics(total: dict, outputs, batch: dict) -> None:
     total["writer_token_exact"] += float(outputs.token_exact.detach().cpu())
     total["writer_stop_acc"] += float(outputs.stop_acc.detach().cpu())
     total["batches"] += 1
+    stats = batch.get("_teacher_stats")
+    if stats and int(batch.get("_teacher_reuse_count", 1)) == 1:
+        total["teacher_total_seconds"] += float(stats.get("total_seconds", 0.0))
+        total["teacher_tokenize_seconds"] += float(stats.get("tokenize_seconds", 0.0))
+        total["teacher_forward_seconds"] += float(stats.get("forward_seconds", 0.0))
+        total["teacher_pool_seconds"] += float(stats.get("pool_seconds", 0.0))
+        total["teacher_cache_hit_rate"] += float(stats.get("cache_hit_rate", 0.0))
+        total["teacher_padding_ratio"] += float(stats.get("padding_ratio", 0.0))
+        total["teacher_nllb_tokens_per_second"] += float(stats.get("nllb_tokens_per_second", 0.0))
+        total["teacher_unique_texts"] += float(stats.get("unique_texts", 0.0))
+        total["teacher_cache_hits"] += float(stats.get("cache_hits", 0.0))
+        total["teacher_cache_misses"] += float(stats.get("cache_misses", 0.0))
+        total["teacher_batches"] += 1
     if "source_line_ids" in batch:
         total["source_line_ids"].update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
 
@@ -266,8 +292,23 @@ def reduce_metric_sums(total: dict) -> dict[str, float]:
     metrics = {
         key: value / batches
         for key, value in total.items()
-        if key not in {"batches", "source_line_ids"}
+        if key not in {"batches", "source_line_ids", "teacher_batches"}
     }
+    teacher_batches = total.get("teacher_batches", 0)
+    if teacher_batches > 0:
+        for key in (
+            "teacher_total_seconds",
+            "teacher_tokenize_seconds",
+            "teacher_forward_seconds",
+            "teacher_pool_seconds",
+            "teacher_cache_hit_rate",
+            "teacher_padding_ratio",
+            "teacher_nllb_tokens_per_second",
+            "teacher_unique_texts",
+            "teacher_cache_hits",
+            "teacher_cache_misses",
+        ):
+            metrics[key] = total[key] / teacher_batches
     if total["source_line_ids"]:
         metrics["source_lines_seen"] = len(total["source_line_ids"])
     return metrics
@@ -295,6 +336,17 @@ def format_log(step, metrics):
     ]
     if "source_lines_seen" in metrics:
         fields.append(f"total/row={int(metrics['source_lines_seen'])}")
+    if "teacher_total_seconds" in metrics:
+        fields.extend(
+            [
+                f"teacher_s={metrics['teacher_total_seconds']:.4f}",
+                f"nllb_fwd_s={metrics['teacher_forward_seconds']:.4f}",
+                f"nllb_tok_s={metrics['teacher_tokenize_seconds']:.4f}",
+                f"teacher_cache={metrics['teacher_cache_hit_rate']:.2f}",
+                f"nllb_pad={metrics['teacher_padding_ratio']:.2f}",
+                f"nllb_tok/s={metrics['teacher_nllb_tokens_per_second']:.1f}",
+            ]
+        )
     for key in sorted(k for k in metrics if k.startswith("eval_")):
         fields.append(f"{key}={metrics[key]:.4f}")
     return " ".join(fields)
@@ -317,6 +369,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--batch-size", type=int, default=DIL_TRAIN_DEFAULTS["batch_size"])
     parser.add_argument("--eval-batch-size", type=int, default=DIL_TRAIN_DEFAULTS["eval_batch_size"])
     parser.add_argument("--nllb-batch-size", type=int, default=DIL_TRAIN_DEFAULTS["nllb_batch_size"])
+    parser.add_argument("--teacher-cache-dir", type=Path, default=None)
     parser.add_argument("--max-batch-reuse", type=int, default=DIL_TRAIN_DEFAULTS["max_batch_reuse"])
     parser.add_argument("--text-read-chars", type=int, default=DIL_TRAIN_DEFAULTS["text_read_chars"])
     parser.add_argument("--prefetch-factor", type=int, default=DIL_TRAIN_DEFAULTS["prefetch_factor"])
@@ -497,12 +550,16 @@ class DilBaseTrainer(BaseTrainer):
             raise ValueError("fixed surface parquet caches are not part of the packed surface training contract")
 
     def build_teacher(self):
+        cache_dir = self.args.teacher_cache_dir
+        if cache_dir is None:
+            cache_dir = self.args.output_dir / "nllb_teacher_cache"
         return NllbTeacher(
             self.config.nllb_model_name,
             self.config.nllb_src_lang,
             self.device,
             self.teacher_dtype,
             batch_size=self.args.nllb_batch_size,
+            cache_dir=cache_dir,
         )
 
     def make_train_dataset(self):
@@ -613,10 +670,11 @@ class DilBaseTrainer(BaseTrainer):
             return
         if self.teacher is None:
             raise ValueError("eval batch has no teacher_layers and no NLLB teacher is available")
-        text_list = batch.pop("texts", None)
-        teacher_layers, teacher_mask = self.teacher.teacher_layers(batch, texts=text_list)
+        teacher_layers, teacher_mask = self.teacher.teacher_layers(batch)
         batch["teacher_layers"] = teacher_layers
         batch["teacher_mask"] = teacher_mask
+        batch["_teacher_stats"] = dict(getattr(self.teacher, "last_stats", {}))
+        batch["_teacher_reuse_count"] = 1
 
     def forward_batch(self, batch: dict, training_step: int | None):
         model_batch = model_inputs(batch)

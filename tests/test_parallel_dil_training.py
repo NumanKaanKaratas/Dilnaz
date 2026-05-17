@@ -8,6 +8,8 @@ from dilnaz.surface import PackedSurface
 from dilnaz.tokenization import HybridTokenizer
 from dilnaz.train.data.dil_data import (
     ContextDilBatchDataset,
+    NllbEncodedText,
+    NllbTeacherTextCache,
     ResidentDilBatcher,
     context_windows,
     segment_piece_ids,
@@ -141,6 +143,29 @@ def test_resident_dil_batcher_materializes_one_pass_from_repeating_dataset(tmp_p
     )
     assert len(batcher.batches) > 0
     assert isinstance(next(batcher)["surface"], PackedSurface)
+
+
+def test_nllb_teacher_text_cache_roundtrips_grouped_hidden(tmp_path: Path):
+    cache = NllbTeacherTextCache(
+        tmp_path,
+        {"model_name": "test-nllb", "layer_groups": ((1, 2),), "dtype": "torch.bfloat16"},
+    )
+    encoded = NllbEncodedText(
+        group_hidden=torch.arange(24, dtype=torch.bfloat16).reshape(2, 3, 4),
+        pieces=(("araba", 0, 5, 1), ("lar", 5, 8, 2)),
+    )
+    cache.put("tur_Latn", "arabalar", encoded)
+
+    loaded = cache.get("tur_Latn", "arabalar")
+    assert loaded is not None
+    assert torch.equal(loaded.group_hidden, encoded.group_hidden)
+    assert loaded.pieces == encoded.pieces
+
+    changed_contract_cache = NllbTeacherTextCache(
+        tmp_path,
+        {"model_name": "other-nllb", "layer_groups": ((1, 2),), "dtype": "torch.bfloat16"},
+    )
+    assert changed_contract_cache.get("tur_Latn", "arabalar") is None
 
 
 def test_context_dil_batch_size_counts_training_rows(tmp_path: Path):

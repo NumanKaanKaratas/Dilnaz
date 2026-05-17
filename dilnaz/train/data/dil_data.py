@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import random
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -16,6 +20,7 @@ from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
 
 NLLB_DEFAULT_NUM_GROUPS = 8
 NLLB_DEFAULT_MAX_ENCODER_TOKENS = 1024
+NLLB_TEACHER_CACHE_VERSION = 1
 TEACHER_CENTERED_ADD_WEIGHT = 0.5
 
 
@@ -173,6 +178,88 @@ def apply_teacher_centered_add(
     return result
 
 
+@dataclass(frozen=True)
+class NllbEncodedText:
+    group_hidden: torch.Tensor
+    pieces: tuple[tuple[str, int, int, int], ...]
+
+
+class NllbTeacherTextCache:
+    def __init__(
+        self,
+        cache_dir: Path,
+        contract: dict,
+        memory_items: int = 128,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.contract = dict(contract)
+        self.memory_items = int(memory_items)
+        self.memory_cache: dict[str, NllbEncodedText] = {}
+        self.memory_order: list[str] = []
+
+    def key(self, lang: str, text: str) -> str:
+        payload = {
+            "version": NLLB_TEACHER_CACHE_VERSION,
+            "contract": self.contract,
+            "lang": lang,
+            "text": text,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def path_for(self, key: str) -> Path:
+        return self.cache_dir / f"{key}.pt"
+
+    def get(self, lang: str, text: str) -> NllbEncodedText | None:
+        key = self.key(lang, text)
+        cached = self.memory_cache.get(key)
+        if cached is not None:
+            return cached
+        path = self.path_for(key)
+        if not path.exists():
+            return None
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        metadata = payload.get("metadata", {})
+        if metadata.get("cache_key") != key or metadata.get("contract") != self.contract:
+            raise ValueError(f"NLLB teacher cache metadata mismatch: {path}")
+        encoded = NllbEncodedText(
+            group_hidden=payload["group_hidden"].contiguous(),
+            pieces=tuple(tuple(piece) for piece in payload["pieces"]),
+        )
+        self._remember(key, encoded)
+        return encoded
+
+    def put(self, lang: str, text: str, encoded: NllbEncodedText) -> None:
+        key = self.key(lang, text)
+        self._remember(key, encoded)
+        path = self.path_for(key)
+        tmp_path = path.with_suffix(".tmp")
+        payload = {
+            "metadata": {
+                "version": NLLB_TEACHER_CACHE_VERSION,
+                "cache_key": key,
+                "contract": self.contract,
+                "lang": lang,
+            },
+            "group_hidden": encoded.group_hidden.cpu().contiguous(),
+            "pieces": tuple(encoded.pieces),
+        }
+        torch.save(payload, tmp_path)
+        os.replace(str(tmp_path), str(path))
+
+    def _remember(self, key: str, encoded: NllbEncodedText) -> None:
+        if self.memory_items <= 0:
+            return
+        if key in self.memory_cache:
+            return
+        self.memory_cache[key] = encoded
+        self.memory_order.append(key)
+        while len(self.memory_order) > self.memory_items:
+            old_key = self.memory_order.pop(0)
+            self.memory_cache.pop(old_key, None)
+
+
 class NllbTeacher:
     def __init__(
         self,
@@ -181,6 +268,8 @@ class NllbTeacher:
         device: torch.device,
         dtype: torch.dtype,
         batch_size: int = 64,
+        cache_dir: Path | None = None,
+        cache_memory_items: int = 128,
     ):
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
@@ -188,17 +277,46 @@ class NllbTeacher:
         if hasattr(self.tokenizer, "src_lang"):
             self.tokenizer.src_lang = src_lang
         self.model = (
-            AutoModelForSeq2SeqLM.from_pretrained(model_name, dtype=torch.float32)
+            AutoModelForSeq2SeqLM.from_pretrained(model_name, dtype=dtype)
             .to(device)
             .eval()
         )
+        for param in self.model.parameters():
+            param.requires_grad_(False)
+        self.model_name = model_name
+        self.src_lang = src_lang
         self.device = device
         self.dtype = dtype
         self.batch_size = batch_size
         self.max_encoder_tokens = int(getattr(self.model.config, "max_position_embeddings", NLLB_DEFAULT_MAX_ENCODER_TOKENS))
         self.layer_groups = NLLB_LAYER_GROUPS
+        self.cache = None
+        if cache_dir is not None:
+            self.cache = NllbTeacherTextCache(
+                cache_dir,
+                {
+                    "model_name": model_name,
+                    "layer_groups": tuple(tuple(int(layer) for layer in group) for group in self.layer_groups),
+                    "max_encoder_tokens": self.max_encoder_tokens,
+                    "hidden_size": int(self.model.config.d_model),
+                    "dtype": str(dtype),
+                },
+                memory_items=cache_memory_items,
+            )
+        self.last_stats: dict[str, float] = {}
 
     def teacher_layers(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        total_start = time.perf_counter()
+        stats = {
+            "cache_hits": 0.0,
+            "cache_misses": 0.0,
+            "unique_texts": 0.0,
+            "tokenize_seconds": 0.0,
+            "forward_seconds": 0.0,
+            "pool_seconds": 0.0,
+            "input_tokens": 0.0,
+            "padded_tokens": 0.0,
+        }
         texts = batch["teacher_texts"]
         text_indices = batch["teacher_text_indices"].detach().cpu().tolist()
         starts = batch["teacher_starts"].detach().cpu().tolist()
@@ -218,62 +336,125 @@ class NllbTeacher:
             text = texts[text_idx]
             rows_by_text.setdefault(text, []).append(row_idx)
         unique_texts = list(rows_by_text)
+        stats["unique_texts"] = float(len(unique_texts))
+        encoded_texts = self.encoded_texts(unique_texts, stats)
 
-        for batch_start in range(0, len(unique_texts), self.batch_size):
-            texts_batch = unique_texts[batch_start : batch_start + self.batch_size]
+        pool_start = time.perf_counter()
+        for text, rows in rows_by_text.items():
+            encoded = encoded_texts[text]
+            if not rows or not encoded.pieces:
+                continue
+            alignments = align_spans_to_pieces(
+                [starts[row_idx] for row_idx in rows],
+                [ends[row_idx] for row_idx in rows],
+                list(encoded.pieces),
+            )
+            group_hidden = encoded.group_hidden.to(self.device, non_blocking=True)
+            for row_idx, positions in zip(rows, alignments):
+                if not distill_mask[row_idx] or not positions:
+                    continue
+                teacher_mask[row_idx] = True
+                hidden_positions = [encoded.pieces[position][3] for position in positions]
+                pos = torch.tensor(hidden_positions, dtype=torch.long, device=self.device)
+                teacher[row_idx] = group_hidden.index_select(1, pos).mean(dim=1)
+        teacher = apply_teacher_centered_add(teacher, teacher_mask)
+        stats["pool_seconds"] += time.perf_counter() - pool_start
+        total_seconds = time.perf_counter() - total_start
+        cache_total = stats["cache_hits"] + stats["cache_misses"]
+        stats["total_seconds"] = total_seconds
+        stats["cache_hit_rate"] = stats["cache_hits"] / max(cache_total, 1.0)
+        stats["padding_ratio"] = (
+            1.0 - (stats["input_tokens"] / stats["padded_tokens"])
+            if stats["padded_tokens"] > 0
+            else 0.0
+        )
+        stats["nllb_tokens_per_second"] = (
+            stats["input_tokens"] / stats["forward_seconds"]
+            if stats["forward_seconds"] > 0
+            else 0.0
+        )
+        self.last_stats = stats
+        return teacher, teacher_mask
+
+    def encoded_texts(self, texts: list[str], stats: dict[str, float]) -> dict[str, NllbEncodedText]:
+        result: dict[str, NllbEncodedText] = {}
+        missing: list[str] = []
+        for text in texts:
+            cached = self.cache.get(self.src_lang, text) if self.cache is not None else None
+            if cached is None:
+                missing.append(text)
+                stats["cache_misses"] += 1.0
+            else:
+                result[text] = cached
+                stats["cache_hits"] += 1.0
+        if missing:
+            for text, encoded in self.encode_missing_texts(missing, stats).items():
+                result[text] = encoded
+                if self.cache is not None:
+                    self.cache.put(self.src_lang, text, encoded)
+        return result
+
+    def encode_missing_texts(self, texts: list[str], stats: dict[str, float]) -> dict[str, NllbEncodedText]:
+        encoded_texts: dict[str, NllbEncodedText] = {}
+        length_sorted = sorted(texts, key=len)
+        for batch_start in range(0, len(length_sorted), self.batch_size):
+            texts_batch = length_sorted[batch_start : batch_start + self.batch_size]
+            tokenize_start = time.perf_counter()
             encoded = self.tokenizer(
                 texts_batch,
                 return_tensors="pt",
                 return_offsets_mapping=True,
                 padding=True,
             )
+            stats["tokenize_seconds"] += time.perf_counter() - tokenize_start
             if encoded["input_ids"].shape[1] > self.max_encoder_tokens:
                 raise ValueError(
                     f"NLLB input has {encoded['input_ids'].shape[1]} tokens; "
                     f"max_encoder_tokens={self.max_encoder_tokens}"
                 )
             offsets = encoded.pop("offset_mapping")
-            inputs = {key: value.to(self.device) for key, value in encoded.items()}
+            input_ids_batch = encoded["input_ids"].tolist()
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is not None:
+                stats["input_tokens"] += float(attention_mask.sum().item())
+                stats["padded_tokens"] += float(attention_mask.numel())
+            else:
+                stats["input_tokens"] += float(encoded["input_ids"].numel())
+                stats["padded_tokens"] += float(encoded["input_ids"].numel())
+            inputs = {key: value.to(self.device, non_blocking=True) for key, value in encoded.items()}
             pieces = [
-                [
+                tuple(
                     (
-                        self.tokenizer.convert_ids_to_tokens(int(inputs["input_ids"][row, pos])),
+                        self.tokenizer.convert_ids_to_tokens(int(input_ids_batch[row][pos])),
                         int(offsets[row, pos, 0]),
                         int(offsets[row, pos, 1]),
                         int(pos),
                     )
-                    for pos in range(int(inputs["input_ids"].shape[1]))
+                    for pos in range(int(encoded["input_ids"].shape[1]))
                     if int(offsets[row, pos, 0]) != int(offsets[row, pos, 1])
-                ]
+                )
                 for row in range(len(texts_batch))
             ]
-            with torch.no_grad():
+            forward_start = time.perf_counter()
+            with torch.inference_mode():
                 outputs = self.model.get_encoder()(**inputs, output_hidden_states=True, return_dict=True)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            stats["forward_seconds"] += time.perf_counter() - forward_start
             hidden_states = outputs.hidden_states
-            for uni_idx in range(len(texts_batch)):
-                text = texts_batch[uni_idx]
-                rows = rows_by_text[text]
-                if not rows or not pieces[uni_idx]:
-                    continue
-                alignments = align_spans_to_pieces(
-                    [starts[row_idx] for row_idx in rows],
-                    [ends[row_idx] for row_idx in rows],
-                    pieces[uni_idx],
+            grouped = torch.stack(
+                [
+                    torch.stack([hidden_states[layer] for layer in layers], dim=0).mean(dim=0)
+                    for layers in self.layer_groups
+                ],
+                dim=1,
+            ).to(dtype=self.dtype)
+            for local_idx, text in enumerate(texts_batch):
+                encoded_texts[text] = NllbEncodedText(
+                    group_hidden=grouped[local_idx].detach().cpu().contiguous(),
+                    pieces=pieces[local_idx],
                 )
-                for row_idx, positions in zip(rows, alignments):
-                    if not distill_mask[row_idx] or not positions:
-                        continue
-                    teacher_mask[row_idx] = True
-                    hidden_positions = [pieces[uni_idx][position][3] for position in positions]
-                    pos = torch.tensor(hidden_positions, dtype=torch.long, device=self.device)
-                    for group_idx, layers in enumerate(self.layer_groups):
-                        layer_vectors = [
-                            hidden_states[layer][uni_idx, pos].float().mean(dim=0)
-                            for layer in layers
-                        ]
-                        teacher[row_idx, group_idx] = torch.stack(layer_vectors).mean(dim=0)
-        teacher = apply_teacher_centered_add(teacher, teacher_mask)
-        return teacher, teacher_mask
+        return encoded_texts
 
 
 class ContextDilBatchDataset(IterableDataset):
@@ -424,21 +605,12 @@ class ResidentDilBatcher:
         from dilnaz.train.common.runtime import cuda_sync
 
         batches = []
-        teacher_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for batch in dataset.iter_once(worker_id=0, worker_count=1):
-            text_list = batch.pop("texts", None)
-            if text_list is None:
-                teacher_layers, teacher_mask = teacher.teacher_layers(batch)
-            else:
-                missing_texts = list(dict.fromkeys(text for text in text_list if text not in teacher_cache))
-                if missing_texts:
-                    missing_layers, missing_mask = teacher.teacher_layers(batch, texts=missing_texts)
-                    for row_idx, text in enumerate(missing_texts):
-                        teacher_cache[text] = (missing_layers[row_idx], missing_mask[row_idx])
-                teacher_layers = torch.stack([teacher_cache[text][0] for text in text_list], dim=0)
-                teacher_mask = torch.stack([teacher_cache[text][1] for text in text_list], dim=0)
+            teacher_layers, teacher_mask = teacher.teacher_layers(batch)
             batch["teacher_layers"] = teacher_layers
             batch["teacher_mask"] = teacher_mask
+            batch["_teacher_stats"] = dict(getattr(teacher, "last_stats", {}))
+            batch["_teacher_reuse_count"] = 1
             cuda_sync(device)
             batches.append(batch)
         if not batches:
