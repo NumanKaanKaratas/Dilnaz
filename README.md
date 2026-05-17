@@ -39,7 +39,7 @@ flowchart LR
 The active pipeline has three practical stages:
 
 1. Train `DIL` so surface pieces become semantic latents and can be written back.
-2. Optionally fine-tune only the `DIL` writer from plain text while keeping the encoder contract fixed.
+2. Optionally run Writer-only polish from plain text while keeping the encoder contract fixed.
 3. Train `NAZ` from a frozen `DIL` checkpoint so it predicts future semantic latents.
 
 ## DIL
@@ -225,7 +225,7 @@ JSONL:
 {"text": "Baska bir cumle."}
 ```
 
-NAZ fine-tuning is handled by the unified `python -m dilnaz.train.naz.train --stage finetune` entrypoint.
+NAZ has one training path for now. Continue an existing NAZ run with `--resume`.
 
 `scripts/generate_math_sequence_data.py` can create math continuation and prompt/answer datasets.
 

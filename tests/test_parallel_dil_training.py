@@ -3,8 +3,8 @@ from pathlib import Path
 
 import torch
 
-from dilnaz.models.dil import DilConfig, compose_factorized_latent, normalize_semantic_latents
-from dilnaz.surface import PackedSurface
+from dilnaz.models.dil import Dil, DilConfig, compose_factorized_latent, normalize_semantic_latents
+from dilnaz.surface import PackedSurface, PackedWriterTarget
 from dilnaz.tokenization import HybridTokenizer
 from dilnaz.train.data.dil_data import (
     ContextDilBatchDataset,
@@ -48,6 +48,10 @@ def tiny_config(tokenizer: HybridTokenizer) -> DilConfig:
     )
 
 
+def has_no_effective_grad(parameter: torch.nn.Parameter) -> bool:
+    return parameter.grad is None or not parameter.grad.abs().gt(0).any()
+
+
 def test_parallel_dil_dataset_uses_packed_surface(tmp_path: Path):
     data = tmp_path / "pairs.txt"
     data.write_text("eng\ttur\tkirmizi araba\tred car\n", encoding="utf-8")
@@ -56,12 +60,32 @@ def test_parallel_dil_dataset_uses_packed_surface(tmp_path: Path):
     dataset = ParallelDilBatchDataset(data, config, tokenizer, batch_size=2, repeat=False)
     batch = next(dataset.iter_once(worker_id=0, worker_count=1))
     assert isinstance(batch["surface"], PackedSurface)
-    assert "labels" not in batch
-    assert "writer_labels" not in batch
+    assert isinstance(batch["writer_target"], PackedWriterTarget)
+    assert batch["writer_target"].label_mask.any()
     assert batch["surface"].batch_size == 2
+    assert batch["writer_target"].query.batch_size == batch["surface"].batch_size
     assert batch["teacher_starts"].shape == batch["surface"].unit_mask.shape
     assert batch["row_batch_indices"].numel() == int(batch["surface"].unit_mask.sum())
     assert batch["surface"].unit_mask.any()
+
+
+def test_parallel_dil_writer_loss_uses_detached_encoder_prior(tmp_path: Path):
+    data = tmp_path / "pairs.txt"
+    data.write_text("eng\ttur\tkirmizi araba\tred car\n", encoding="utf-8")
+    tokenizer = tiny_tokenizer()
+    config = tiny_config(tokenizer)
+    dataset = ParallelDilBatchDataset(data, config, tokenizer, batch_size=1, repeat=False)
+    batch = next(dataset.iter_once(worker_id=0, worker_count=1))
+    model = Dil(config)
+    output = model(batch["surface"], writer_target=batch["writer_target"])
+    output.loss.backward()
+
+    assert has_no_effective_grad(model.encoder.embed_tokens.weight)
+    assert has_no_effective_grad(model.encoder.semantic_head.weight)
+    assert model.encoder.surface_head.weight.grad is not None
+    assert model.writer.token_embeddings.weight.grad is not None
+    assert model.writer.encoder_prior_proj.weight.grad is not None
+    assert model.writer.encoder_prior_gate.weight.grad is not None
 
 
 def test_teacherless_parallel_dataset_uses_packed_surface(tmp_path: Path):
@@ -85,10 +109,44 @@ def test_teacherless_parallel_dataset_uses_packed_surface(tmp_path: Path):
     batch = next(iter(dataset))
     assert isinstance(batch["tr_surface"], PackedSurface)
     assert isinstance(batch["en_surface"], PackedSurface)
-    assert "tr_labels" not in batch
-    assert "en_labels" not in batch
+    assert isinstance(batch["tr_writer_target"], PackedWriterTarget)
+    assert isinstance(batch["en_writer_target"], PackedWriterTarget)
+    assert batch["tr_writer_target"].label_mask.any()
+    assert batch["en_writer_target"].label_mask.any()
     assert batch["tr_unit_mask"].dtype == torch.bool
     assert batch["en_unit_mask"].dtype == torch.bool
+
+
+def test_teacherless_writer_targets_use_same_encoder_prior_path(tmp_path: Path):
+    data = tmp_path / "pairs.jsonl"
+    data.write_text(json.dumps({"tr": "kirmizi araba", "en": "red car"}) + "\n", encoding="utf-8")
+    tokenizer = tiny_tokenizer()
+    config = tiny_config(tokenizer)
+    dataset = TeacherlessParallelJsonlDataset(
+        data,
+        config,
+        tokenizer,
+        batch_size=1,
+        max_segments=4,
+        min_segments=1,
+        min_length_ratio=0.1,
+        max_length_ratio=10.0,
+        shuffle_buffer_size=1,
+        seed=1,
+        repeat=False,
+    )
+    batch = next(iter(dataset))
+    model = Dil(config)
+    latents = model.encode(batch["tr_surface"])
+    metrics = model.writer_training_loss_and_metrics(latents, batch["tr_writer_target"], return_metrics=True)
+    metrics["loss"].backward()
+
+    assert has_no_effective_grad(model.encoder.embed_tokens.weight)
+    assert has_no_effective_grad(model.encoder.semantic_head.weight)
+    assert model.encoder.surface_head.weight.grad is not None
+    assert model.writer.token_embeddings.weight.grad is not None
+    assert model.writer.encoder_prior_proj.weight.grad is not None
+    assert model.writer.encoder_prior_gate.weight.grad is not None
 
 
 def test_parallel_alignment_loss_uses_only_semantic_split():

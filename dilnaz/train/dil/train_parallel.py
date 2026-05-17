@@ -121,7 +121,6 @@ def parse_args():
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
     parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
     parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
-    parser.add_argument("--encoder-context-layers", type=int, default=DIL_MODEL_DEFAULTS["encoder_context_layers"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -159,8 +158,6 @@ def validate_args(args):
         raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
     if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
         raise ValueError("--latent-size must equal semantic + surface latent sizes")
-    if args.encoder_context_layers <= 0:
-        raise ValueError("--encoder-context-layers must be > 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
@@ -198,7 +195,6 @@ def build_config(args, tokenizer):
         latent_size=args.latent_size,
         semantic_latent_size=args.semantic_latent_size,
         surface_latent_size=args.surface_latent_size,
-        encoder_context_layers=args.encoder_context_layers,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -235,6 +231,9 @@ def format_parallel_log(step: int, metrics: dict) -> str:
         f"distill={metrics['distill']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
+        f"surface_loss={metrics['surface_loss']:.4f}",
+        f"writer_token_exact={metrics['writer_token_exact']:.4f}",
+        f"writer_stop_acc={metrics['writer_stop_acc']:.4f}",
         f"align_groups={metrics['align_groups']:.1f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
@@ -259,6 +258,9 @@ def empty_metric_sums() -> dict[str, float]:
         "distill": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
+        "surface_loss": 0.0,
+        "writer_token_exact": 0.0,
+        "writer_stop_acc": 0.0,
         "align_groups": 0.0,
     }
 
@@ -271,6 +273,9 @@ def accumulate_metrics(metric_sums: dict[str, float], loss, outputs, parallel_lo
     metric_sums["distill"] += float(outputs.distill_loss.detach().cpu())
     metric_sums["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     metric_sums["var"] += float(outputs.variance_loss.detach().cpu())
+    metric_sums["surface_loss"] += float(outputs.surface_loss.detach().cpu())
+    metric_sums["writer_token_exact"] += float(outputs.token_exact.detach().cpu())
+    metric_sums["writer_stop_acc"] += float(outputs.stop_acc.detach().cpu())
     metric_sums["align_groups"] += float(batch["parallel_alignment_scores"].shape[0])
 
 

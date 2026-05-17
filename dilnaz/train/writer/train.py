@@ -25,6 +25,7 @@ from dilnaz.train.common.runtime import (
     rng_state,
     validate_compile_environment,
 )
+from dilnaz.train.common.objectives import WRITER_OBJECTIVE
 from dilnaz.train.data.dil_data import (
     ResidentDilBatcher,
     ResidentDilEvalLoader,
@@ -43,8 +44,7 @@ from dilnaz.models.dil import Dil
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 32
-WRITER_OBJECTIVE = "factorized_writer_encoder_prior_v1"
+CHECKPOINT_FORMAT_VERSION = 33
 WRITER_METRIC_KEYS = (
     "loss",
     "token_loss",
@@ -182,7 +182,7 @@ def writer_only_metrics(
     with torch.no_grad():
         full_semantic = model.encode(surface).float()
     target = target.to(full_semantic.device)
-    metrics = model.writer_loss_and_metrics(
+    metrics = model.writer_training_loss_and_metrics(
         full_semantic.detach(),
         target,
         return_metrics=True,
@@ -221,6 +221,10 @@ def save_checkpoint(
     step: int,
     metrics: dict,
     compile_mode: str,
+    source_dil_step: int,
+    source_dil_metrics: dict,
+    dil_optimizer_state_dict: dict | None,
+    dil_scheduler_state_dict: dict | None,
     checkpoint_name: str = "",
 ):
     checkpoint_dir = output_dir / checkpoint_name if checkpoint_name else output_dir
@@ -234,6 +238,8 @@ def save_checkpoint(
         "objective": WRITER_OBJECTIVE,
         "step": step,
         "metrics": metrics,
+        "source_dil_step": source_dil_step,
+        "source_dil_metrics": source_dil_metrics,
         "compile_mode": compile_mode,
         "vocab_size": config.vocab_size,
         "pad_token_id": config.pad_token_id,
@@ -246,18 +252,19 @@ def save_checkpoint(
     }
     import os as _os
 
+    payload = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "model_state_dict": model.state_dict(),
+        "writer_optimizer_state_dict": optimizer.state_dict(),
+        "writer_scheduler_state_dict": scheduler.state_dict(),
+        "training_state": training_state,
+        "rng_state": rng_state(),
+    }
+    if dil_optimizer_state_dict is not None and dil_scheduler_state_dict is not None:
+        payload["optimizer_state_dict"] = dil_optimizer_state_dict
+        payload["scheduler_state_dict"] = dil_scheduler_state_dict
     tmp_path = checkpoint_dir / "checkpoint.pt.tmp"
-    torch.save(
-        {
-            "format_version": CHECKPOINT_FORMAT_VERSION,
-            "model_state_dict": model.state_dict(),
-            "writer_optimizer_state_dict": optimizer.state_dict(),
-            "writer_scheduler_state_dict": scheduler.state_dict(),
-            "training_state": training_state,
-            "rng_state": rng_state(),
-        },
-        tmp_path,
-    )
+    torch.save(payload, tmp_path)
     _os.replace(str(tmp_path), str(checkpoint_dir / "checkpoint.pt"))
     with (checkpoint_dir / "training_state.json").open("w", encoding="utf-8") as handle:
         json.dump(training_state, handle, indent=2)
@@ -397,11 +404,16 @@ def main():
     model, config, checkpoint = load_model_checkpoint(args.checkpoint, device)
     tokenizer_vocab_path = args.checkpoint.parent / config.tokenizer_vocab_file
     tokenizer = load_hybrid_tokenizer(tokenizer_vocab_path)
-    writer_resume = checkpoint.get("training_state", {}).get("objective") == WRITER_OBJECTIVE
-    if not writer_resume:
-        fresh_model = Dil(config).to(device)
-        model.writer.load_state_dict(fresh_model.writer.state_dict())
-        del fresh_model
+    source_training_state = checkpoint.get("training_state", {})
+    writer_resume = source_training_state.get("objective") == WRITER_OBJECTIVE
+    if writer_resume:
+        source_dil_step = int(source_training_state.get("source_dil_step", 0))
+        source_dil_metrics = dict(source_training_state.get("source_dil_metrics", {}))
+    else:
+        source_dil_step = int(source_training_state.get("step", 0))
+        source_dil_metrics = dict(source_training_state.get("metrics", {}))
+    dil_optimizer_state_dict = checkpoint.get("optimizer_state_dict")
+    dil_scheduler_state_dict = checkpoint.get("scheduler_state_dict")
     freeze_for_writer_only(model)
     model.set_encoder_bf16_runtime(autocast_enabled)
     model.set_compiled_forwards(
@@ -502,6 +514,10 @@ def main():
             completed_step,
             last_metrics,
             compile_mode,
+            source_dil_step,
+            source_dil_metrics,
+            dil_optimizer_state_dict,
+            dil_scheduler_state_dict,
             checkpoint_name=checkpoint_name,
         )
 

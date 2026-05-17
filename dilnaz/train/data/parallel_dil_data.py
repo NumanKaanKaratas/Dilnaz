@@ -23,7 +23,7 @@ from dilnaz.train.data.dil_data import (
     teacher_distill_segment,
     trainable_segments,
 )
-from dilnaz.surface import pack_token_units
+from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
 
 
@@ -268,6 +268,14 @@ class ParallelDilBatchDataset(IterableDataset):
                 surface_rows,
                 pad_token_id=self.pad_token_id,
                 bucket_sizes=self.surface_bucket_sizes,
+                max_pieces_per_unit=self.max_surface_pieces_per_unit,
+            ),
+            "writer_target": pack_writer_targets(
+                surface_rows,
+                pad_token_id=self.pad_token_id,
+                bos_token_id=self.config.decoder_start_token_id,
+                stop_token_id=self.config.writer_stop_token_id,
+                surface_bucket_sizes=self.surface_bucket_sizes,
                 max_pieces_per_unit=self.max_surface_pieces_per_unit,
             ),
             "teacher_texts": teacher_texts,

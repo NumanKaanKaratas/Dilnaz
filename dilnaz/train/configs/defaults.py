@@ -7,15 +7,14 @@ DIL_MODEL_DEFAULTS = {
     "latent_size": 512,
     "semantic_latent_size": 480,
     "surface_latent_size": 32,
-    "encoder_context_layers": 2,
     "max_surface_pieces_per_unit": 256,
     "surface_bucket_sizes": (64, 128, 256, 512, 1024, 2048, 4096, 8192),
     "byte_conv_layers": 2,
     "byte_conv_kernel_size": 5,
     "byte_conv_expansion": 2,
     "dil_dropout": 0.10,
-    "distillation_weight": 8.0,
-    "mean_geometry_weight": 4.0,
+    "distillation_weight": 16.0,
+    "mean_geometry_weight": 8.0,
     "variance_weight": 0.05,
     "context_radius": 2,
     "max_sequence_units": 4096,
@@ -24,7 +23,6 @@ DIL_MODEL_DEFAULTS = {
     "writer_conv_expansion": 4,
     "writer_dropout": 0.1,
 }
-
 
 DIL_TRAIN_DEFAULTS = {
     "data_mode": "streaming",
@@ -102,31 +100,6 @@ NAZ_TRAIN_DEFAULTS = {
     "log_every": 50,
     "checkpoint_every": 0,
     "eval_every": 0,
-    "max_eval_batches": 16,
-    "text_read_chars": 1048576,
-    "semantic_cache_chunk_tokens": 4096,
-    "num_workers": 4,
-    "prefetch_factor": 4,
-    "seed": 1,
-}
-
-
-NAZ_FINETUNE_DEFAULTS = {
-    "data_mode": "cached",
-    "max_steps": 5000,
-    "batch_size": 8,
-    "eval_batch_size": 8,
-    "sequence_length": 128,
-    "learning_rate": 3e-5,
-    "weight_decay": 0.05,
-    "adam_beta1": 0.9,
-    "adam_beta2": 0.95,
-    "warmup_steps": 100,
-    "gradient_accumulation_steps": 1,
-    "max_grad_norm": 1.0,
-    "log_every": 25,
-    "checkpoint_every": 1000,
-    "eval_every": 250,
     "max_eval_batches": 16,
     "text_read_chars": 1048576,
     "semantic_cache_chunk_tokens": 4096,

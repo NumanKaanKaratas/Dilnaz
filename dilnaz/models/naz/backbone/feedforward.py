@@ -66,18 +66,42 @@ class SparseMoEFeedForward(nn.Module):
 
         expert_counts = torch.bincount(selected_experts, minlength=self.num_experts)
         expert_offsets = expert_counts.cumsum(dim=0)
-        expert_starts = torch.cat((expert_offsets.new_zeros(1), expert_offsets[:-1]))
-        routed_positions = torch.arange(selected_experts.numel(), device=flat_states.device)
-        expert_slots = routed_positions - expert_starts.index_select(0, selected_experts)
-        max_tokens_per_expert = int(expert_counts.max().item())
-
-        grouped_inputs = flat_states.new_zeros((self.num_experts, max_tokens_per_expert, hidden_size))
-        grouped_inputs[selected_experts, expert_slots] = flat_states.index_select(0, token_indices)
-        gate = torch.bmm(grouped_inputs, self.expert_gate_weight.transpose(1, 2))
-        up = torch.bmm(grouped_inputs, self.expert_up_weight.transpose(1, 2))
-        expert_hidden = F.silu(gate) * up
-        grouped_outputs = torch.bmm(expert_hidden, self.expert_down_weight.transpose(1, 2))
-        expert_output = grouped_outputs[selected_experts, expert_slots] * selected_weights.unsqueeze(-1)
+        sorted_inputs = flat_states.index_select(0, token_indices)
+        if hidden_states.is_cuda and torch.is_autocast_enabled("cuda"):
+            expert_ends = expert_offsets.to(dtype=torch.int32)
+            grouped_inputs = sorted_inputs.to(dtype=torch.bfloat16)
+            gate_weight = self.expert_gate_weight.transpose(1, 2).to(dtype=torch.bfloat16)
+            up_weight = self.expert_up_weight.transpose(1, 2).to(dtype=torch.bfloat16)
+            down_weight = self.expert_down_weight.transpose(1, 2).to(dtype=torch.bfloat16)
+            gate = torch._grouped_mm(
+                grouped_inputs,
+                gate_weight,
+                offs=expert_ends,
+            )
+            up = torch._grouped_mm(
+                grouped_inputs,
+                up_weight,
+                offs=expert_ends,
+            )
+            expert_hidden = F.silu(gate) * up
+            expert_output = torch._grouped_mm(
+                expert_hidden,
+                down_weight,
+                offs=expert_ends,
+            ).to(dtype=hidden_states.dtype)
+        else:
+            expert_starts = torch.cat((expert_offsets.new_zeros(1), expert_offsets[:-1]))
+            routed_positions = torch.arange(selected_experts.numel(), device=flat_states.device)
+            expert_slots = routed_positions - expert_starts.index_select(0, selected_experts)
+            route_capacity = flat_states.shape[0] * self.top_k
+            grouped_inputs = flat_states.new_zeros((self.num_experts, route_capacity, hidden_size))
+            grouped_inputs[selected_experts, expert_slots] = sorted_inputs
+            gate = torch.bmm(grouped_inputs, self.expert_gate_weight.transpose(1, 2))
+            up = torch.bmm(grouped_inputs, self.expert_up_weight.transpose(1, 2))
+            expert_hidden = F.silu(gate) * up
+            grouped_outputs = torch.bmm(expert_hidden, self.expert_down_weight.transpose(1, 2))
+            expert_output = grouped_outputs[selected_experts, expert_slots]
+        expert_output = expert_output * selected_weights.unsqueeze(-1)
 
         routed = flat_states.new_zeros(flat_states.shape)
         routed.index_add_(0, token_indices, expert_output)

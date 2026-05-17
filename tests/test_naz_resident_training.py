@@ -1,3 +1,4 @@
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5,9 +6,18 @@ import torch
 
 from dilnaz.models.dil import DilConfig, compose_factorized_latent, normalize_semantic_latents
 from dilnaz.models.naz import Naz, NazConfig
+from dilnaz.models.naz.backbone.feedforward import SparseMoEFeedForward
 from dilnaz.models.naz.outputs import NazDynamicsOutput
 from dilnaz.surface import pack_token_units
 from dilnaz.train.naz import train as naz_train
+
+
+def test_sparse_moe_forward_has_no_cpu_scalar_sync():
+    source = inspect.getsource(SparseMoEFeedForward.forward)
+
+    assert ".item()" not in source
+    assert ".cpu()" not in source
+    assert "int(" not in source
 
 
 def test_semantic_cache_spans_respect_surface_bucket_width():
@@ -37,7 +47,6 @@ def test_resident_source_uses_dil_surface_config(monkeypatch, tmp_path: Path):
         surface_latent_size=4,
         max_surface_pieces_per_unit=16,
         surface_bucket_sizes=(8, 32),
-        encoder_context_layers=2,
         encoder_layer_pattern=("sliding", "global"),
         encoder_attention_heads=4,
         encoder_key_value_heads=2,
@@ -130,7 +139,6 @@ def test_naz_windowed_surface_tensor_path_matches_context_rows():
         max_surface_pieces_per_unit=8,
         surface_bucket_sizes=(8, 16, 32, 64),
         context_radius=1,
-        encoder_context_layers=1,
         writer_num_layers=1,
     )
     surface = pack_token_units(

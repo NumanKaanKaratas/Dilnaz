@@ -3,11 +3,16 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.optim import AdamW
 
 from dilnaz.models.dil import Dil, DilConfig, compose_factorized_latent, split_factorized_latent
 from dilnaz.models.common.norms import DilRMSNorm
 from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
+from dilnaz.train.common.objectives import WRITER_OBJECTIVE
+from dilnaz.train.common.runtime import rng_state
+from dilnaz.train.common.trainer_core import make_scheduler
+from dilnaz.train.dil.train import restore_checkpoint
 from dilnaz.train.writer.train import (
     WRITER_METRIC_KEYS,
     WriterContextDataset,
@@ -49,7 +54,6 @@ def test_encoder_bf16_runtime_is_scoped_to_encoder_reductions():
     assert {module.reduction_dtype for module in encoder_norms} == {None}
     assert {module.reduction_dtype for module in writer_norms} == {torch.float32}
     assert model.encoder.semantic_norm_reduction_dtype is None
-    assert {block.attention_softmax_dtype for block in model.encoder.context_blocks} == {None}
 
 
 def test_factorized_latent_split_compose_and_bounds():
@@ -78,6 +82,21 @@ def test_dil_defaults_expose_only_context_radius():
     assert "context_radius" in DIL_MODEL_DEFAULTS
     assert "context_size" not in DIL_MODEL_DEFAULTS
     assert "target_index" not in DIL_MODEL_DEFAULTS
+    assert "encoder_context_layers" not in DIL_MODEL_DEFAULTS
+
+
+def test_center_conditioned_context_keeps_context_states_detached():
+    cfg = tiny_config()
+    model = Dil(cfg)
+    token_states = torch.randn(2, cfg.context_size, cfg.hidden_size, requires_grad=True)
+    token_mask = torch.ones(2, cfg.context_size, dtype=torch.bool)
+
+    output = model.encoder.target_conditioned_by_context(token_states, token_mask)
+    output.square().mean().backward()
+
+    context_grad = token_states.grad.index_select(1, model.encoder.context_indices)
+    assert token_states.grad[:, cfg.target_index].abs().gt(0).any()
+    assert not context_grad.abs().gt(0).any()
 
 
 def make_writer_target(cfg: DilConfig, rows):
@@ -284,7 +303,7 @@ def test_writer_loss_is_unit_local_token_loss():
     model = Dil(cfg)
     semantic = torch.randn(1, cfg.latent_size)
     target = make_writer_target(cfg, [[[2, 3, 4]]])
-    metrics = model.writer_loss_and_metrics(semantic, target, return_metrics=True)
+    metrics = model.writer_training_loss_and_metrics(semantic, target, return_metrics=True)
     assert torch.isfinite(metrics["loss"])
     assert torch.equal(metrics["loss"], metrics["token_loss"])
 
@@ -299,7 +318,7 @@ def test_writer_surface_loss_does_not_backprop_to_semantic_trunk():
         max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
     )
     target = make_writer_target(cfg, [[[4]]])
-    output = model(surface, labels=target)
+    output = model(surface, writer_target=target)
     output.loss.backward()
 
     def has_no_effective_grad(parameter: torch.nn.Parameter) -> bool:
@@ -317,6 +336,26 @@ def test_writer_surface_loss_does_not_backprop_to_semantic_trunk():
     assert model.writer.encoder_prior_proj.weight.grad.abs().gt(0).any()
     assert model.writer.encoder_prior_gate.weight.grad.abs().gt(0).any()
     assert model.writer.surface_proj.weight.grad.abs().gt(0).any()
+
+
+def test_dil_forward_and_writer_only_share_writer_loss_contract():
+    cfg = tiny_config()
+    model = Dil(cfg).eval()
+    surface = pack_token_units(
+        [[[2], [3], [4], [5], [6]]],
+        pad_token_id=cfg.pad_token_id,
+        bucket_sizes=cfg.surface_bucket_sizes,
+        max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
+    )
+    target = make_writer_target(cfg, [[[4]]])
+
+    output = model(surface, writer_target=target)
+    metrics = writer_only_metrics(model, {"surface": surface, "writer_target": target})
+
+    assert torch.allclose(output.surface_loss, metrics["loss"], atol=1e-6, rtol=1e-6)
+    assert torch.allclose(output.writer_token_loss, metrics["token_loss"], atol=1e-6, rtol=1e-6)
+    assert torch.allclose(output.token_exact, metrics["token_exact"], atol=1e-6, rtol=1e-6)
+    assert torch.allclose(output.stop_acc, metrics["stop_acc"], atol=1e-6, rtol=1e-6)
 
 
 def test_writer_trainer_accepts_base_dil_checkpoint_format(tmp_path: Path):
@@ -353,6 +392,72 @@ def test_writer_trainer_rejects_previous_dil_checkpoint_format(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="unsupported Dil checkpoint format_version=31"):
         load_model_checkpoint(checkpoint_path, torch.device("cpu"))
+
+
+def test_dil_restore_accepts_writer_checkpoint_with_dil_optimizer_state(tmp_path: Path):
+    cfg = tiny_config()
+    source_model = Dil(cfg)
+    source_optimizer = AdamW(source_model.parameters(), lr=1e-3)
+    source_scheduler = make_scheduler(source_optimizer, 1e-3, warmup_steps=0, max_steps=20)
+    cfg.save_pretrained(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "format_version": cfg.checkpoint_format_version,
+            "model_state_dict": source_model.state_dict(),
+            "optimizer_state_dict": source_optimizer.state_dict(),
+            "scheduler_state_dict": source_scheduler.state_dict(),
+            "training_state": {
+                "objective": WRITER_OBJECTIVE,
+                "step": 11,
+                "metrics": {"loss": 9.0},
+                "source_dil_step": 7,
+                "source_dil_metrics": {"loss": 1.25},
+            },
+            "rng_state": rng_state(),
+        },
+        checkpoint_path,
+    )
+
+    model = Dil(cfg)
+    optimizer = AdamW(model.parameters(), lr=1e-3)
+    scheduler = make_scheduler(optimizer, 1e-3, warmup_steps=0, max_steps=20)
+    step, metrics = restore_checkpoint(checkpoint_path, model, optimizer, scheduler, torch.device("cpu"))
+
+    assert step == 7
+    assert metrics == {"loss": 1.25}
+    for key, value in source_model.state_dict().items():
+        assert torch.equal(model.state_dict()[key], value)
+
+
+def test_dil_restore_accepts_writer_checkpoint_without_dil_optimizer_state(tmp_path: Path):
+    cfg = tiny_config()
+    source_model = Dil(cfg)
+    cfg.save_pretrained(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "format_version": cfg.checkpoint_format_version,
+            "model_state_dict": source_model.state_dict(),
+            "training_state": {
+                "objective": WRITER_OBJECTIVE,
+                "step": 11,
+                "metrics": {"loss": 9.0},
+            },
+            "rng_state": rng_state(),
+        },
+        checkpoint_path,
+    )
+
+    model = Dil(cfg)
+    optimizer = AdamW(model.parameters(), lr=1e-3)
+    scheduler = make_scheduler(optimizer, 1e-3, warmup_steps=0, max_steps=20)
+    step, metrics = restore_checkpoint(checkpoint_path, model, optimizer, scheduler, torch.device("cpu"))
+
+    assert step == 0
+    assert metrics == {}
+    for key, value in source_model.state_dict().items():
+        assert torch.equal(model.state_dict()[key], value)
 
 
 def test_writer_only_metrics_are_tensors():

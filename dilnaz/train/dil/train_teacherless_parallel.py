@@ -21,7 +21,7 @@ from dilnaz.train.common.runtime import (
     validate_compile_environment,
 )
 from dilnaz.train.data.dil_data import load_hybrid_tokenizer, make_dil_batch_loader, segment_piece_ids, trainable_segments
-from dilnaz.surface import pack_token_units
+from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
 from dilnaz.models.dil import DilConfig, split_factorized_latent
 from dilnaz.models.dil import Dil
@@ -51,8 +51,14 @@ class TeacherlessDilOutput:
     variance_loss: torch.Tensor
     token_balance_loss: torch.Tensor
     covariance_loss: torch.Tensor
+    writer_loss: torch.Tensor
+    writer_token_loss: torch.Tensor
+    byte_acc: torch.Tensor
+    token_exact: torch.Tensor
+    stop_acc: torch.Tensor
     token_balance_weight: float
     covariance_weight: float
+    writer_loss_weight: float
 
 
 def parse_parallel_jsonl_line(line: str, line_id: int) -> JsonlParallelPair | None:
@@ -96,6 +102,7 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
         self.max_surface_pieces_per_unit = config.max_surface_pieces_per_unit
         self.surface_bucket_sizes = tuple(config.surface_bucket_sizes)
         self.pad_token_id = config.pad_token_id
+        self.stop_token_id = config.writer_stop_token_id
         self.batch_size = batch_size
         self.max_segments = max_segments
         self.min_segments = min_segments
@@ -159,6 +166,14 @@ class TeacherlessParallelJsonlDataset(IterableDataset):
                 surface_rows,
                 pad_token_id=self.pad_token_id,
                 bucket_sizes=self.surface_bucket_sizes,
+                max_pieces_per_unit=self.max_surface_pieces_per_unit,
+            ),
+            f"{prefix}_writer_target": pack_writer_targets(
+                target_rows,
+                pad_token_id=self.pad_token_id,
+                bos_token_id=self.config.decoder_start_token_id,
+                stop_token_id=self.stop_token_id,
+                surface_bucket_sizes=self.surface_bucket_sizes,
                 max_pieces_per_unit=self.max_surface_pieces_per_unit,
             ),
             f"{prefix}_unit_mask": unit_mask,
@@ -375,7 +390,6 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
     parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
     parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
-    parser.add_argument("--encoder-context-layers", type=int, default=DIL_MODEL_DEFAULTS["encoder_context_layers"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -418,8 +432,6 @@ def validate_args(args) -> None:
         raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
     if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
         raise ValueError("--latent-size must equal semantic + surface latent sizes")
-    if args.encoder_context_layers <= 0:
-        raise ValueError("--encoder-context-layers must be > 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
@@ -467,7 +479,6 @@ def build_config(args, tokenizer: HybridTokenizer) -> DilConfig:
         latent_size=args.latent_size,
         semantic_latent_size=args.semantic_latent_size,
         surface_latent_size=args.surface_latent_size,
-        encoder_context_layers=args.encoder_context_layers,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -494,8 +505,13 @@ def empty_metric_sums() -> dict:
         "token_balance_w": 0.0,
         "cov": 0.0,
         "cov_w": 0.0,
+        "writer": 0.0,
+        "writer_w": 0.0,
+        "writer_token_exact": 0.0,
+        "writer_stop_acc": 0.0,
         "token_balance_weight": 0.0,
         "covariance_weight": 0.0,
+        "writer_loss_weight": 0.0,
         "batches": 0,
         "source_line_ids": set(),
     }
@@ -509,8 +525,13 @@ def accumulate_output_metrics(total: dict, outputs: TeacherlessDilOutput, batch:
     total["token_balance_w"] += float((outputs.token_balance_loss * outputs.token_balance_weight).detach().cpu())
     total["cov"] += float(outputs.covariance_loss.detach().cpu())
     total["cov_w"] += float((outputs.covariance_loss * outputs.covariance_weight).detach().cpu())
+    total["writer"] += float(outputs.writer_loss.detach().cpu())
+    total["writer_w"] += float((outputs.writer_loss * outputs.writer_loss_weight).detach().cpu())
+    total["writer_token_exact"] += float(outputs.token_exact.detach().cpu())
+    total["writer_stop_acc"] += float(outputs.stop_acc.detach().cpu())
     total["token_balance_weight"] += outputs.token_balance_weight
     total["covariance_weight"] += outputs.covariance_weight
+    total["writer_loss_weight"] += outputs.writer_loss_weight
     total["batches"] += 1
     total["source_line_ids"].update(int(line_id) for line_id in batch["source_line_ids"].detach().cpu().tolist())
 
@@ -537,7 +558,12 @@ def format_log(step: int, metrics: dict[str, float]) -> str:
         f"token_balance_w={metrics['token_balance_w']:.4f}",
         f"cov={metrics['cov']:.4f}",
         f"cov_w={metrics['cov_w']:.4f}",
+        f"writer={metrics['writer']:.4f}",
+        f"writer_w={metrics['writer_w']:.4f}",
+        f"writer_token_exact={metrics['writer_token_exact']:.4f}",
+        f"writer_stop_acc={metrics['writer_stop_acc']:.4f}",
         f"balance_weight={metrics['token_balance_weight']:.3f}",
+        f"writer_weight={metrics['writer_loss_weight']:.3f}",
         f"lr={metrics['lr']:.2e}",
         f"data_s={metrics['data_seconds']:.4f}",
         f"compute_s={metrics['compute_seconds']:.4f}",
@@ -652,26 +678,41 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
     def reduce_metrics(self, total: dict) -> dict[str, float]:
         return reduce_metric_sums(total)
 
-    def encode_side(self, batch: dict, prefix: str) -> torch.Tensor:
+    def encode_side(self, batch: dict, prefix: str) -> tuple[torch.Tensor, torch.Tensor]:
         surface = batch[f"{prefix}_surface"]
         unit_mask = batch[f"{prefix}_unit_mask"]
-        latents = self.model.encode(surface).float()
-        latents, _ = split_factorized_latent(
-            latents,
+        full_latents = self.model.encode(surface)
+        semantic_latents, _ = split_factorized_latent(
+            full_latents,
             self.config.semantic_latent_size,
             self.config.surface_latent_size,
         )
-        if latents.shape[:2] != unit_mask.shape:
+        if semantic_latents.shape[:2] != unit_mask.shape:
             raise ValueError("encoded sequence latents must match unit_mask shape")
-        return latents * unit_mask.unsqueeze(-1).to(latents.dtype)
+        masked_semantic = semantic_latents.float() * unit_mask.unsqueeze(-1).to(semantic_latents.dtype)
+        return full_latents, masked_semantic
+
+    def writer_metrics_for_side(self, latents: torch.Tensor, batch: dict, prefix: str) -> dict[str, torch.Tensor]:
+        return self.model.writer_training_loss_and_metrics(
+            latents,
+            batch[f"{prefix}_writer_target"],
+            return_metrics=True,
+        )
 
     def forward_batch(self, batch: dict, step: int | None) -> TeacherlessDilOutput:
-        tr_latents = self.encode_side(batch, "tr")
-        en_latents = self.encode_side(batch, "en")
+        tr_full_latents, tr_latents = self.encode_side(batch, "tr")
+        en_full_latents, en_latents = self.encode_side(batch, "en")
         tr_unit_mask = batch["tr_unit_mask"]
         en_unit_mask = batch["en_unit_mask"]
         tr_sentence = masked_mean(tr_latents, tr_unit_mask)
         en_sentence = masked_mean(en_latents, en_unit_mask)
+        tr_writer = self.writer_metrics_for_side(tr_full_latents, batch, "tr")
+        en_writer = self.writer_metrics_for_side(en_full_latents, batch, "en")
+        writer_loss = (tr_writer["loss"] + en_writer["loss"]) * 0.5
+        writer_token_loss = (tr_writer["token_loss"] + en_writer["token_loss"]) * 0.5
+        byte_acc = (tr_writer["byte_acc"] + en_writer["byte_acc"]) * 0.5
+        token_exact = (tr_writer["token_exact"] + en_writer["token_exact"]) * 0.5
+        stop_acc = (tr_writer["stop_acc"] + en_writer["stop_acc"]) * 0.5
 
         sentence_loss = sentence_contrastive_loss(
             tr_sentence,
@@ -708,6 +749,7 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
             + variance_loss * self.args.teacherless_variance_weight
             + balance_loss * token_balance_weight
             + covariance_loss * covariance_weight
+            + writer_loss * self.model.writer_loss_weight
         )
         return TeacherlessDilOutput(
             loss=loss,
@@ -715,8 +757,14 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
             variance_loss=variance_loss,
             token_balance_loss=balance_loss,
             covariance_loss=covariance_loss,
+            writer_loss=writer_loss,
+            writer_token_loss=writer_token_loss,
+            byte_acc=byte_acc,
+            token_exact=token_exact,
+            stop_acc=stop_acc,
             token_balance_weight=token_balance_weight,
             covariance_weight=covariance_weight,
+            writer_loss_weight=float(self.model.writer_loss_weight),
         )
 
     def train_step(self, batch: dict, step: int) -> StepResult:
@@ -757,7 +805,7 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
             f"device={self.device.type} bf16={int(self.autocast_enabled)} compile_mode={self.compile_mode} "
             f"resume_step={self.start_step} teacher_source=none trainer=teacherless_parallel "
             f"vocab_size={self.config.vocab_size} hidden_size={self.config.hidden_size} "
-            f"latent_size={self.config.latent_size} enc_layers={self.config.encoder_context_layers} "
+            f"latent_size={self.config.latent_size} "
             f"writer_layers={self.config.writer_num_layers} batch_pairs={self.args.batch_size} "
             f"max_segments={self.args.max_segments}",
             flush=True,

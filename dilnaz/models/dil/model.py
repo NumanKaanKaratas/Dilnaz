@@ -21,8 +21,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 32:
-            raise ValueError("DIL writer encoder-prior v1 checkpoints require checkpoint_format_version=32")
+        if config.checkpoint_format_version != 33:
+            raise ValueError("DIL center-context factorized checkpoints require checkpoint_format_version=33")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
@@ -158,7 +158,7 @@ class Dil(PreTrainedModel):
         token_exact = (unit_bad.eq(0) & unit_valid).sum().float() / unit_valid.sum().clamp_min(1).float()
         return byte_acc, token_exact, stop_acc
 
-    def writer_loss_and_metrics(
+    def _writer_loss_and_metrics(
         self,
         semantic: torch.Tensor,
         target: PackedWriterTarget,
@@ -182,10 +182,20 @@ class Dil(PreTrainedModel):
             }
         return token_loss, token_loss, byte_acc, token_exact, stop_acc
 
+    def writer_training_loss_and_metrics(
+        self,
+        semantic: torch.Tensor,
+        target: PackedWriterTarget,
+        return_metrics: bool = False,
+    ):
+        semantic_part, surface_part = self.split_latent(semantic)
+        writer_semantic = compose_factorized_latent(semantic_part.detach(), surface_part)
+        return self._writer_loss_and_metrics(writer_semantic, target, return_metrics=return_metrics)
+
     def forward(
         self,
         surface: PackedSurface,
-        labels: Optional[PackedWriterTarget] = None,
+        writer_target: Optional[PackedWriterTarget] = None,
         teacher_layers: Optional[torch.Tensor] = None,
         teacher_mask: Optional[torch.Tensor] = None,
         training_step: Optional[int] = None,
@@ -208,7 +218,6 @@ class Dil(PreTrainedModel):
         loss = semantic.new_zeros(())
         distill_loss = semantic.new_zeros(())
         semantic_loss = semantic.new_zeros(())
-        semantic_cos = semantic.new_zeros(())
         mean_geometry_loss = semantic.new_zeros(())
         variance_loss = semantic.new_zeros(())
         surface_loss = semantic.new_zeros(())
@@ -228,10 +237,6 @@ class Dil(PreTrainedModel):
                 + variance_loss * self.variance_weight
             )
             distill_loss = semantic_loss
-            if teacher_target.shape[-1] == semantic_part.shape[-1]:
-                active_cos = F.cosine_similarity(semantic_part.float(), teacher_target.float(), dim=-1)
-                cos_mask = teacher_mask.to(active_cos.dtype)
-                semantic_cos = (active_cos * cos_mask).sum() / cos_mask.sum().clamp_min(1.0)
             loss = loss + distill_loss * self.distillation_weight
 
         writer_loss = semantic.new_zeros(())
@@ -239,11 +244,10 @@ class Dil(PreTrainedModel):
         token_exact = semantic.new_zeros(())
         writer_token_loss = semantic.new_zeros(())
         stop_acc = semantic.new_zeros(())
-        if labels is not None and self.writer_loss_weight > 0.0:
-            writer_semantic = compose_factorized_latent(semantic_part.detach(), surface_part)
-            writer_loss, writer_token_loss, byte_acc, token_exact, stop_acc = self.writer_loss_and_metrics(
-                writer_semantic,
-                labels,
+        if writer_target is not None and self.writer_loss_weight > 0.0:
+            writer_loss, writer_token_loss, byte_acc, token_exact, stop_acc = self.writer_training_loss_and_metrics(
+                semantic,
+                writer_target,
             )
             surface_loss = writer_loss
             loss = loss + surface_loss * self.writer_loss_weight
@@ -253,7 +257,6 @@ class Dil(PreTrainedModel):
             semantic=semantic,
             distill_loss=distill_loss,
             semantic_loss=semantic_loss,
-            semantic_cos=semantic_cos,
             surface_loss=surface_loss,
             surface_norm=surface_norm,
             writer_loss=writer_loss,

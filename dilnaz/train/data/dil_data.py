@@ -505,7 +505,7 @@ class ContextDilBatchDataset(IterableDataset):
         )
         batch: dict = {
             "surface": surface,
-            "labels": pack_writer_targets(
+            "writer_target": pack_writer_targets(
                 target_rows,
                 pad_token_id=self.pad_token_id,
                 bos_token_id=self.config.decoder_start_token_id,

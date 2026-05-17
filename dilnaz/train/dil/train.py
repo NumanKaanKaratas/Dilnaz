@@ -22,6 +22,7 @@ from dilnaz.train.common.runtime import (
     rng_state,
     validate_compile_environment,
 )
+from dilnaz.train.common.objectives import DIL_OBJECTIVE, WRITER_OBJECTIVE
 from dilnaz.train.data.dil_data import (
     ContextDilBatchDataset,
     NllbTeacher,
@@ -35,7 +36,7 @@ from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
-CHECKPOINT_FORMAT_VERSION = 32
+CHECKPOINT_FORMAT_VERSION = 33
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -88,6 +89,7 @@ class AsyncTeacherBatchSource:
 def json_training_state(config, step: int, metrics: dict, compile_mode: str):
     return {
         "format_version": CHECKPOINT_FORMAT_VERSION,
+        "objective": DIL_OBJECTIVE,
         "step": step,
         "metrics": metrics,
         "compile_mode": compile_mode,
@@ -110,6 +112,7 @@ def runtime_training_state(args) -> dict:
         "eval_batch_size": args.eval_batch_size,
         "nllb_batch_size": args.nllb_batch_size,
         "teacher_cache_dir": str(args.teacher_cache_dir) if args.teacher_cache_dir is not None else None,
+        "no_teacher_cache": args.no_teacher_cache,
         "max_batch_reuse": args.max_batch_reuse,
         "text_read_chars": args.text_read_chars,
         "prefetch_factor": args.prefetch_factor,
@@ -177,11 +180,23 @@ def restore_checkpoint(path: Path, model, optimizer, scheduler, device: torch.de
     if checkpoint["format_version"] != CHECKPOINT_FORMAT_VERSION:
         raise ValueError(f"unsupported checkpoint format_version={checkpoint.get('format_version')}")
     model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    restore_rng_state(checkpoint["rng_state"])
     training_state = checkpoint["training_state"]
-    return int(training_state["step"]), dict(training_state["metrics"])
+    objective = training_state.get("objective", DIL_OBJECTIVE)
+
+    has_dil_optimizer = "optimizer_state_dict" in checkpoint and "scheduler_state_dict" in checkpoint
+    if has_dil_optimizer:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        restore_rng_state(checkpoint["rng_state"])
+        if objective == WRITER_OBJECTIVE:
+            return int(training_state.get("source_dil_step", 0)), dict(training_state.get("source_dil_metrics", {}))
+        return int(training_state["step"]), dict(training_state["metrics"])
+
+    if objective != WRITER_OBJECTIVE:
+        raise ValueError("DIL resume checkpoint is missing optimizer_state_dict and scheduler_state_dict")
+    if "rng_state" in checkpoint:
+        restore_rng_state(checkpoint["rng_state"])
+    return 0, {}
 
 
 def is_dataloader_worker_exit(error: RuntimeError) -> bool:
@@ -195,8 +210,8 @@ def model_inputs(batch: dict) -> dict:
         "teacher_layers": batch["teacher_layers"],
         "teacher_mask": batch["teacher_mask"],
     }
-    if "labels" in batch:
-        inputs["labels"] = batch["labels"]
+    if "writer_target" in batch:
+        inputs["writer_target"] = batch["writer_target"]
     return inputs
 
 
@@ -235,7 +250,6 @@ def empty_metric_sums() -> dict:
         "loss": 0.0,
         "distill": 0.0,
         "sem_loss": 0.0,
-        "sem_cos": 0.0,
         "surface_loss": 0.0,
         "surface_norm": 0.0,
         "geom_mean": 0.0,
@@ -262,7 +276,6 @@ def accumulate_output_metrics(total: dict, outputs, batch: dict) -> None:
     total["loss"] += float(outputs.loss.detach().cpu())
     total["distill"] += float(outputs.distill_loss.detach().cpu())
     total["sem_loss"] += float(outputs.semantic_loss.detach().cpu())
-    total["sem_cos"] += float(outputs.semantic_cos.detach().cpu())
     total["surface_loss"] += float(outputs.surface_loss.detach().cpu())
     total["surface_norm"] += float(outputs.surface_norm.detach().cpu())
     total["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
@@ -320,7 +333,6 @@ def format_log(step, metrics):
         f"loss={metrics['loss']:.4f}",
         f"distill={metrics['distill']:.4f}",
         f"sem_loss={metrics['sem_loss']:.4f}",
-        f"sem_cos={metrics['sem_cos']:.4f}",
         f"surface_loss={metrics['surface_loss']:.4f}",
         f"surface_norm={metrics['surface_norm']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
@@ -370,6 +382,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--eval-batch-size", type=int, default=DIL_TRAIN_DEFAULTS["eval_batch_size"])
     parser.add_argument("--nllb-batch-size", type=int, default=DIL_TRAIN_DEFAULTS["nllb_batch_size"])
     parser.add_argument("--teacher-cache-dir", type=Path, default=None)
+    parser.add_argument("--no-teacher-cache", action="store_true")
     parser.add_argument("--max-batch-reuse", type=int, default=DIL_TRAIN_DEFAULTS["max_batch_reuse"])
     parser.add_argument("--text-read-chars", type=int, default=DIL_TRAIN_DEFAULTS["text_read_chars"])
     parser.add_argument("--prefetch-factor", type=int, default=DIL_TRAIN_DEFAULTS["prefetch_factor"])
@@ -395,7 +408,6 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
     parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
     parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
-    parser.add_argument("--encoder-context-layers", type=int, default=DIL_MODEL_DEFAULTS["encoder_context_layers"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -421,6 +433,8 @@ def validate_args(args):
         raise ValueError("--batch-size and --eval-batch-size must be > 0")
     if args.nllb_batch_size <= 0:
         raise ValueError("--nllb-batch-size must be > 0")
+    if args.no_teacher_cache and args.teacher_cache_dir is not None:
+        raise ValueError("--no-teacher-cache cannot be used with --teacher-cache-dir")
     if args.max_batch_reuse <= 0:
         raise ValueError("--max-batch-reuse must be > 0")
     if args.text_read_chars <= 0:
@@ -431,8 +445,6 @@ def validate_args(args):
         raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
     if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
         raise ValueError("--latent-size must equal semantic + surface latent sizes")
-    if args.encoder_context_layers <= 0:
-        raise ValueError("--encoder-context-layers must be > 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
@@ -473,7 +485,6 @@ def build_config(args, tokenizer):
         latent_size=args.latent_size,
         semantic_latent_size=args.semantic_latent_size,
         surface_latent_size=args.surface_latent_size,
-        encoder_context_layers=args.encoder_context_layers,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -550,8 +561,8 @@ class DilBaseTrainer(BaseTrainer):
             raise ValueError("fixed surface parquet caches are not part of the packed surface training contract")
 
     def build_teacher(self):
-        cache_dir = self.args.teacher_cache_dir
-        if cache_dir is None:
+        cache_dir = None if self.args.no_teacher_cache else self.args.teacher_cache_dir
+        if cache_dir is None and not self.args.no_teacher_cache:
             cache_dir = self.args.output_dir / "nllb_teacher_cache"
         return NllbTeacher(
             self.config.nllb_model_name,

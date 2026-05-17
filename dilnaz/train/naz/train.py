@@ -22,7 +22,7 @@ from dilnaz.train.common.runtime import (
     rng_state,
     validate_compile_environment,
 )
-from dilnaz.train.configs.defaults import NAZ_FINETUNE_DEFAULTS, NAZ_MODEL_DEFAULTS, NAZ_TRAIN_DEFAULTS
+from dilnaz.train.configs.defaults import NAZ_MODEL_DEFAULTS, NAZ_TRAIN_DEFAULTS
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.naz import NazConfig
 from dilnaz.models.naz import Naz
@@ -44,7 +44,7 @@ CHECKPOINT_FORMAT_VERSION = 29
 OBJECTIVE = "factorized_semantic_dynamics_moe_mtp_v1"
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 SEMANTIC_CACHE_FORMAT_VERSION = 3
-STAGES = ("pretrain", "finetune")
+CHECKPOINT_STAGE = "pretrain"
 RUNTIME_STATE_FIELDS = (
     "data_mode",
     "sequence_length",
@@ -123,8 +123,8 @@ def checkpoint_training_state(path: Path, device: torch.device | None = None) ->
     state = checkpoint["training_state"]
     if state.get("objective") != OBJECTIVE:
         raise ValueError(f"checkpoint objective is not {OBJECTIVE}")
-    if state.get("stage") not in STAGES:
-        raise ValueError("checkpoint training_state.stage is missing or invalid")
+    if state.get("stage") != CHECKPOINT_STAGE:
+        raise ValueError(f"checkpoint training_state.stage must be {CHECKPOINT_STAGE}")
     if not isinstance(state.get("runtime"), dict):
         raise ValueError("checkpoint training_state.runtime is missing or invalid")
     return state
@@ -136,17 +136,15 @@ def runtime_training_state(args) -> dict:
 
 def json_training_state(
     config: NazConfig,
-    stage: str,
     step: int,
     metrics: dict,
     checksum: str,
     compile_mode: str,
-    init_naz_checkpoint: Path | None,
     runtime: dict,
 ) -> dict:
     state = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
-        "stage": stage,
+        "stage": CHECKPOINT_STAGE,
         "step": step,
         "metrics": metrics,
         "dil_checksum": checksum,
@@ -164,8 +162,6 @@ def json_training_state(
         "pad_token_id": config.pad_token_id,
         "runtime": runtime,
     }
-    if init_naz_checkpoint is not None:
-        state["init_naz_checkpoint"] = str(init_naz_checkpoint)
     return state
 
 
@@ -175,13 +171,11 @@ def save_checkpoint(
     optimizer,
     scheduler,
     config: NazConfig,
-    stage: str,
     step: int,
     metrics: dict,
     checksum: str,
     compile_mode: str,
     runtime: dict,
-    init_naz_checkpoint: Path | None = None,
     checkpoint_name: str = "",
 ) -> Path:
     checkpoint_dir = output_dir / checkpoint_name if checkpoint_name else output_dir
@@ -189,12 +183,10 @@ def save_checkpoint(
     config.save_pretrained(checkpoint_dir)
     state = json_training_state(
         config,
-        stage,
         step,
         metrics,
         checksum,
         compile_mode,
-        init_naz_checkpoint,
         runtime,
     )
     import os as _os
@@ -224,8 +216,8 @@ def restore_checkpoint(path: Path, model: Naz, optimizer, scheduler, device: tor
     state = checkpoint["training_state"]
     if state.get("objective") != OBJECTIVE:
         raise ValueError(f"checkpoint objective is not {OBJECTIVE}")
-    if state.get("stage") not in STAGES:
-        raise ValueError("checkpoint training_state.stage is missing or invalid")
+    if state.get("stage") != CHECKPOINT_STAGE:
+        raise ValueError(f"checkpoint training_state.stage must be {CHECKPOINT_STAGE}")
     if not isinstance(state.get("runtime"), dict):
         raise ValueError("checkpoint training_state.runtime is missing or invalid")
     model.load_trainable_state_dict(checkpoint["model_state_dict"])
@@ -233,19 +225,6 @@ def restore_checkpoint(path: Path, model: Naz, optimizer, scheduler, device: tor
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     restore_rng_state(checkpoint["rng_state"])
     return int(state["step"]), dict(state["metrics"])
-
-
-def load_init_checkpoint(path: Path, model: Naz, device: torch.device) -> dict:
-    checkpoint = load_checkpoint(path, device)
-    if checkpoint["format_version"] != CHECKPOINT_FORMAT_VERSION:
-        raise ValueError(f"unsupported checkpoint format_version={checkpoint.get('format_version')}")
-    state = checkpoint["training_state"]
-    if state.get("objective") != OBJECTIVE:
-        raise ValueError(f"checkpoint objective is not {OBJECTIVE}")
-    if state.get("stage") not in STAGES:
-        raise ValueError("checkpoint training_state.stage is missing or invalid")
-    model.load_trainable_state_dict(checkpoint["model_state_dict"])
-    return state
 
 
 def is_dataloader_worker_exit(error: RuntimeError) -> bool:
@@ -467,11 +446,9 @@ def run_naz_batch(model: Naz, batch: dict, training_step: int | None = None):
 
 def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", choices=STAGES, default="pretrain")
     parser.add_argument("--train-file", type=Path, required=True)
     parser.add_argument("--eval-file", type=Path, default=None)
     parser.add_argument("--dil-checkpoint-dir", type=Path, default=None)
-    parser.add_argument("--init-naz-checkpoint", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--compile-mode", choices=COMPILE_MODE_CHOICES, default=None)
@@ -540,17 +517,15 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--surface-loss-weight", type=float, default=NAZ_MODEL_DEFAULTS["surface_loss_weight"])
     args = parser.parse_args(argv)
     args.provided_options = provided_options(argv)
+    args.stage = CHECKPOINT_STAGE
     return args
 
 
-def apply_stage_defaults(args) -> None:
-    defaults = NAZ_FINETUNE_DEFAULTS if args.stage == "finetune" else NAZ_TRAIN_DEFAULTS
-    for key, value in defaults.items():
+def apply_train_defaults(args) -> None:
+    for key, value in NAZ_TRAIN_DEFAULTS.items():
         attr = key.replace("-", "_")
         if hasattr(args, attr) and getattr(args, attr) is None:
             setattr(args, attr, value)
-    if args.stage == "finetune" and args.eval_file is None and "--eval-every" not in args.provided_options:
-        args.eval_every = 0
 
 
 def validate_common_args(args) -> None:
@@ -628,8 +603,8 @@ def validate_common_args(args) -> None:
 
 def validate_args(args) -> None:
     if args.resume is not None:
-        if args.dil_checkpoint_dir is not None or args.init_naz_checkpoint is not None:
-            raise ValueError("--resume must be used without --dil-checkpoint-dir or --init-naz-checkpoint")
+        if args.dil_checkpoint_dir is not None:
+            raise ValueError("--resume must be used without --dil-checkpoint-dir")
         state = checkpoint_training_state(args.resume)
         args.stage = state["stage"]
         runtime = state["runtime"]
@@ -639,31 +614,22 @@ def validate_args(args) -> None:
             if option in args.provided_options and getattr(args, field) != saved_value:
                 raise ValueError(f"{option} is owned by the checkpoint during --resume")
             setattr(args, field, saved_value)
-    elif args.stage == "pretrain":
-        if args.dil_checkpoint_dir is None:
-            raise ValueError("--dil-checkpoint-dir is required for --stage pretrain")
-        if args.init_naz_checkpoint is not None:
-            raise ValueError("--init-naz-checkpoint is only valid for --stage finetune")
     else:
-        if args.init_naz_checkpoint is None:
-            raise ValueError("--init-naz-checkpoint is required for --stage finetune")
-        if args.dil_checkpoint_dir is not None:
-            raise ValueError("--stage finetune reads Dil path from --init-naz-checkpoint config")
+        if args.dil_checkpoint_dir is None:
+            raise ValueError("--dil-checkpoint-dir is required for a new NAZ run")
 
-    if args.stage == "finetune" or args.resume is not None:
+    if args.resume is not None:
         forbidden = sorted(args.provided_options & MODEL_OVERRIDE_OPTIONS)
         if forbidden:
             raise ValueError(f"model architecture/objective overrides are not allowed here: {', '.join(forbidden)}")
 
-    apply_stage_defaults(args)
+    apply_train_defaults(args)
     validate_common_args(args)
 
 
 def build_config(args, dil_config: DilConfig | None) -> NazConfig:
     if args.resume is not None:
         return NazConfig.from_pretrained(args.resume.parent)
-    if args.stage == "finetune":
-        return NazConfig.from_pretrained(args.init_naz_checkpoint.parent)
     return NazConfig(
         dil_path=str(args.dil_checkpoint_dir),
         byte_vocab_size=dil_config.byte_vocab_size,
@@ -746,7 +712,7 @@ class NazBaseTrainer(BaseTrainer):
         self.prepare_data_sources()
 
     def load_dil_config_for_new_pretrain(self, args) -> DilConfig | None:
-        if args.resume is not None or args.stage == "finetune":
+        if args.resume is not None:
             return None
         return DilConfig.from_pretrained(args.dil_checkpoint_dir)
 
@@ -768,11 +734,6 @@ class NazBaseTrainer(BaseTrainer):
                     flush=True,
                 )
             self.initial_dil_checksum = checksum
-        elif self.stage == "finetune":
-            init_state = load_init_checkpoint(self.args.init_naz_checkpoint, self.model, self.device)
-            init_stage = init_state.get("stage", "unknown")
-            print(f"initialized_from={self.args.init_naz_checkpoint} init_stage={init_stage}", flush=True)
-            self.initial_dil_checksum = dil_checksum(self.model)
 
     def prepare_data_sources(self) -> None:
         if self.args.data_mode == "resident":
@@ -1005,13 +966,11 @@ class NazBaseTrainer(BaseTrainer):
             self.optimizer,
             self.scheduler,
             self.config,
-            self.stage,
             step,
             metrics,
             self.initial_dil_checksum,
             self.compile_mode,
             runtime_training_state(self.args),
-            self.args.init_naz_checkpoint if self.stage == "finetune" else None,
             checkpoint_name=checkpoint_name,
         )
 
@@ -1070,14 +1029,8 @@ class NazPretrainTrainer(NazBaseTrainer):
     pass
 
 
-class NazFinetuneTrainer(NazBaseTrainer):
-    pass
-
-
 def make_trainer(args) -> NazBaseTrainer:
-    if args.resume is not None:
-        validate_args(args)
-    return NazFinetuneTrainer(args) if args.stage == "finetune" else NazPretrainTrainer(args)
+    return NazPretrainTrainer(args)
 
 
 def main(argv: list[str] | None = None):
