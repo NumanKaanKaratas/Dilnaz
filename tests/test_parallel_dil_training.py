@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from dilnaz.models.dil import Dil, DilConfig, compose_factorized_latent, normalize_semantic_latents
+from dilnaz.models.dil import Dil, DilConfig, normalize_semantic_latents
 from dilnaz.surface import PackedSurface, PackedWriterTarget
 from dilnaz.tokenization import HybridTokenizer
 from dilnaz.train.data.dil_data import (
@@ -39,8 +39,6 @@ def tiny_config(tokenizer: HybridTokenizer) -> DilConfig:
         hidden_size=32,
         intermediate_size=64,
         latent_size=16,
-        semantic_latent_size=12,
-        surface_latent_size=4,
         max_surface_pieces_per_unit=16,
         surface_bucket_sizes=(8, 16, 32),
         num_encoder_layers=2,
@@ -81,11 +79,11 @@ def test_parallel_dil_writer_loss_uses_detached_encoder_prior(tmp_path: Path):
     output.loss.backward()
 
     assert has_no_effective_grad(model.encoder.embed_tokens.weight)
-    assert has_no_effective_grad(model.encoder.semantic_head.weight)
-    assert model.encoder.surface_head.weight.grad is not None
+    assert has_no_effective_grad(model.encoder.hidden_to_semantic.weight)
     assert model.writer.token_embeddings.weight.grad is not None
     assert model.writer.encoder_prior_proj.weight.grad is not None
     assert model.writer.encoder_prior_gate.weight.grad is not None
+    assert model.writer.semantic_proj.weight.grad is not None
 
 
 def test_teacherless_parallel_dataset_uses_packed_surface(tmp_path: Path):
@@ -142,21 +140,17 @@ def test_teacherless_writer_targets_use_same_encoder_prior_path(tmp_path: Path):
     metrics["loss"].backward()
 
     assert has_no_effective_grad(model.encoder.embed_tokens.weight)
-    assert has_no_effective_grad(model.encoder.semantic_head.weight)
-    assert model.encoder.surface_head.weight.grad is not None
+    assert has_no_effective_grad(model.encoder.hidden_to_semantic.weight)
     assert model.writer.token_embeddings.weight.grad is not None
     assert model.writer.encoder_prior_proj.weight.grad is not None
     assert model.writer.encoder_prior_gate.weight.grad is not None
+    assert model.writer.semantic_proj.weight.grad is not None
 
 
-def test_parallel_alignment_loss_uses_only_semantic_split():
+def test_parallel_alignment_loss_uses_full_512_latent():
     tokenizer = tiny_tokenizer()
     config = tiny_config(tokenizer)
-    semantic = normalize_semantic_latents(torch.ones(2, config.semantic_latent_size))
-    latents = compose_factorized_latent(
-        semantic,
-        torch.tensor([[-1.0, -1.0, -1.0, -1.0], [1.0, 1.0, 1.0, 1.0]]),
-    )
+    latents = normalize_semantic_latents(torch.ones(2, config.latent_size))
     batch = {
         "row_batch_indices": torch.zeros(2, dtype=torch.long),
         "row_unit_indices": torch.arange(2, dtype=torch.long),
@@ -168,8 +162,6 @@ def test_parallel_alignment_loss_uses_only_semantic_split():
     loss = parallel_alignment_loss(
         latents.unsqueeze(0),
         batch,
-        config.semantic_latent_size,
-        config.surface_latent_size,
     )
     assert torch.isclose(loss, torch.zeros_like(loss), atol=1e-6)
 

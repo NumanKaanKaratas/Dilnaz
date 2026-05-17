@@ -7,7 +7,7 @@ from transformers.modeling_utils import PreTrainedModel
 
 from dilnaz.surface import PackedSurface, PackedWriterTarget
 
-from ..common.latents import compose_factorized_latent, normalize_factorized_latents, split_factorized_latent
+from ..common.latents import normalize_semantic_latents
 from .configuration import DilConfig
 from .encoder import DilEncoderCore
 from .layers import DilPackedDepthwiseConv
@@ -21,8 +21,8 @@ class Dil(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        if config.checkpoint_format_version != 33:
-            raise ValueError("DIL center-context factorized checkpoints require checkpoint_format_version=33")
+        if config.checkpoint_format_version != 34:
+            raise ValueError("DIL 512-latent checkpoints require checkpoint_format_version=34")
         if config.pad_token_id >= config.vocab_size:
             raise ValueError("pad_token_id must be inside the tokenizer vocabulary")
         if config.eos_token_id >= config.vocab_size:
@@ -76,24 +76,13 @@ class Dil(PreTrainedModel):
         )
         if output_hidden_states:
             latent, layer_vectors = encoded
-            return normalize_factorized_latents(
+            return normalize_semantic_latents(
                 latent,
-                self.config.semantic_latent_size,
-                self.config.surface_latent_size,
-                semantic_reduction_dtype=self.encoder.semantic_norm_reduction_dtype,
+                reduction_dtype=self.encoder.semantic_norm_reduction_dtype,
             ), layer_vectors
-        return normalize_factorized_latents(
+        return normalize_semantic_latents(
             encoded,
-            self.config.semantic_latent_size,
-            self.config.surface_latent_size,
-            semantic_reduction_dtype=self.encoder.semantic_norm_reduction_dtype,
-        )
-
-    def split_latent(self, latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return split_factorized_latent(
-            latents,
-            self.config.semantic_latent_size,
-            self.config.surface_latent_size,
+            reduction_dtype=self.encoder.semantic_norm_reduction_dtype,
         )
 
     def writer_encoder_embedding_weight(self) -> torch.Tensor:
@@ -188,9 +177,7 @@ class Dil(PreTrainedModel):
         target: PackedWriterTarget,
         return_metrics: bool = False,
     ):
-        semantic_part, surface_part = self.split_latent(semantic)
-        writer_semantic = compose_factorized_latent(semantic_part.detach(), surface_part)
-        return self._writer_loss_and_metrics(writer_semantic, target, return_metrics=return_metrics)
+        return self._writer_loss_and_metrics(semantic.detach(), target, return_metrics=return_metrics)
 
     def forward(
         self,
@@ -214,14 +201,12 @@ class Dil(PreTrainedModel):
             )
 
         semantic = self.encode(surface=encoder_surface)
-        semantic_part, surface_part = self.split_latent(semantic)
         loss = semantic.new_zeros(())
         distill_loss = semantic.new_zeros(())
         semantic_loss = semantic.new_zeros(())
         mean_geometry_loss = semantic.new_zeros(())
         variance_loss = semantic.new_zeros(())
         surface_loss = semantic.new_zeros(())
-        surface_norm = surface_part.float().norm(dim=-1).mean().to(semantic.dtype)
 
         if teacher_layers is not None:
             teacher_layers = teacher_layers.to(semantic.device, dtype=torch.float32)
@@ -230,8 +215,8 @@ class Dil(PreTrainedModel):
             else:
                 teacher_mask = teacher_mask.to(semantic.device, dtype=torch.bool)
             teacher_target = teacher_layers[..., -1, :]
-            mean_geometry_loss = self.geometry_loss(semantic_part, teacher_target, teacher_mask)
-            variance_loss = self.variance_regularizer(semantic_part, teacher_mask)
+            mean_geometry_loss = self.geometry_loss(semantic, teacher_target, teacher_mask)
+            variance_loss = self.variance_regularizer(semantic, teacher_mask)
             semantic_loss = (
                 mean_geometry_loss * self.mean_geometry_weight
                 + variance_loss * self.variance_weight
@@ -258,7 +243,6 @@ class Dil(PreTrainedModel):
             distill_loss=distill_loss,
             semantic_loss=semantic_loss,
             surface_loss=surface_loss,
-            surface_norm=surface_norm,
             writer_loss=writer_loss,
             writer_token_loss=writer_token_loss,
             mean_geometry_loss=mean_geometry_loss,

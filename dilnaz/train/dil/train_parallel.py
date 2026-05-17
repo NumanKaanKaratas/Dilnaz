@@ -34,6 +34,7 @@ from dilnaz.train.data.parallel_dil_data import (
 )
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.dil.train import (
+    effective_writer_loss_weight,
     prepare_writer_for_surface_training,
     is_dataloader_worker_exit,
     make_scheduler,
@@ -119,8 +120,6 @@ def parse_args():
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
-    parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
-    parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -129,6 +128,8 @@ def parse_args():
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
+    parser.add_argument("--writer-loss-weight", type=float, default=None)
+    parser.add_argument("--no-writer-training", action="store_true")
     parser.add_argument("--writer-num-layers", type=int, default=DIL_MODEL_DEFAULTS["writer_num_layers"])
     parser.add_argument("--writer-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_kernel_size"])
     parser.add_argument("--writer-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_expansion"])
@@ -154,10 +155,10 @@ def validate_args(args):
         raise ValueError("--parallel-alignment-weight must be >= 0")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
-    if args.semantic_latent_size <= 0 or args.surface_latent_size <= 0:
-        raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
-    if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
-        raise ValueError("--latent-size must equal semantic + surface latent sizes")
+    if args.latent_size <= 0:
+        raise ValueError("--latent-size must be > 0")
+    if args.writer_loss_weight is not None and args.writer_loss_weight < 0.0:
+        raise ValueError("--writer-loss-weight must be >= 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
@@ -185,7 +186,10 @@ def validate_args(args):
 
 def build_config(args, tokenizer):
     if args.resume is not None:
-        return DilConfig.from_pretrained(args.resume.parent)
+        config = DilConfig.from_pretrained(args.resume.parent)
+        config.writer_loss_weight = effective_writer_loss_weight(args, config.writer_loss_weight)
+        return config
+    writer_loss_weight = effective_writer_loss_weight(args, DIL_MODEL_DEFAULTS["writer_loss_weight"])
     return DilConfig(
         vocab_size=tokenizer.vocab_size,
         pad_token_id=tokenizer.pad_token_id,
@@ -193,8 +197,6 @@ def build_config(args, tokenizer):
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         latent_size=args.latent_size,
-        semantic_latent_size=args.semantic_latent_size,
-        surface_latent_size=args.surface_latent_size,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -203,6 +205,7 @@ def build_config(args, tokenizer):
         distillation_weight=args.distillation_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
+        writer_loss_weight=writer_loss_weight,
         max_sequence_units=DIL_MODEL_DEFAULTS["max_sequence_units"],
         writer_num_layers=args.writer_num_layers,
         writer_conv_kernel_size=args.writer_conv_kernel_size,
@@ -303,8 +306,6 @@ def evaluate_parallel(
                 outputs,
                 batch,
                 parallel_alignment_weight,
-                model.config.semantic_latent_size,
-                model.config.surface_latent_size,
             )
         accumulate_metrics(total, loss, outputs, parallel_loss, batch, model.config, parallel_alignment_weight)
         batches += 1
@@ -378,7 +379,8 @@ def main():
         f"nllb={args.nllb_model_name} source_lang={args.source_lang} target_lang={args.target_lang} "
         f"teacher_dtype={str(teacher_dtype).replace('torch.', '')} nllb_batch={args.nllb_batch_size} "
         f"parallel_weight={args.parallel_alignment_weight} vocab_size={config.vocab_size} "
-        f"latent_size={config.latent_size} hidden_size={config.hidden_size}",
+        f"latent_size={config.latent_size} hidden_size={config.hidden_size} "
+        f"writer_loss_weight={config.writer_loss_weight:g}",
         flush=True,
     )
 
@@ -459,8 +461,6 @@ def main():
                         outputs,
                         batch,
                         args.parallel_alignment_weight,
-                        model.config.semantic_latent_size,
-                        model.config.surface_latent_size,
                     )
 
                 (loss / args.gradient_accumulation_steps).backward()

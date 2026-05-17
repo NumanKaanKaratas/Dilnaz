@@ -44,7 +44,7 @@ from dilnaz.models.dil import Dil
 from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 
 
-CHECKPOINT_FORMAT_VERSION = 33
+CHECKPOINT_FORMAT_VERSION = 34
 WRITER_METRIC_KEYS = (
     "loss",
     "token_loss",
@@ -247,8 +247,6 @@ def save_checkpoint(
         "writer_stop_token_id": config.writer_stop_token_id,
         "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
         "latent_size": config.latent_size,
-        "semantic_latent_size": config.semantic_latent_size,
-        "surface_latent_size": config.surface_latent_size,
     }
     import os as _os
 

@@ -10,7 +10,7 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from dilnaz.train.common.runtime import COMPILE_MODE_CHOICES, compile_forward, validate_compile_environment
 from dilnaz.train.data.dil_data import align_spans_to_pieces, apply_teacher_centered_add, build_nllb_layer_groups, context_windows
-from dilnaz.models.dil import DilConfig, split_factorized_latent
+from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.surface import pack_token_units
 from dilnaz.tokenization import HybridTokenizer, TokenSegment
@@ -130,8 +130,7 @@ def decode_tokens(model: Dil, tokenizer: HybridTokenizer, latents: torch.Tensor)
 
 
 def similarity_matrix(latents: torch.Tensor, config: DilConfig | None = None) -> list[list[float]]:
-    if config is not None:
-        latents, _ = split_factorized_latent(latents, config.semantic_latent_size, config.surface_latent_size)
+    del config
     normalized = F.normalize(latents, dim=-1)
     return (normalized @ normalized.T).detach().cpu().tolist()
 

@@ -36,7 +36,7 @@ from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
-CHECKPOINT_FORMAT_VERSION = 33
+CHECKPOINT_FORMAT_VERSION = 34
 DATALOADER_WORKER_EXIT = "DataLoader worker"
 
 
@@ -99,9 +99,8 @@ def json_training_state(config, step: int, metrics: dict, compile_mode: str):
         "max_surface_pieces_per_unit": config.max_surface_pieces_per_unit,
         "context_radius": config.context_radius,
         "latent_size": config.latent_size,
-        "semantic_latent_size": config.semantic_latent_size,
-        "surface_latent_size": config.surface_latent_size,
         "distillation_weight": config.distillation_weight,
+        "writer_loss_weight": config.writer_loss_weight,
     }
 
 
@@ -216,9 +215,18 @@ def model_inputs(batch: dict) -> dict:
 
 
 def prepare_writer_for_surface_training(model: Dil) -> None:
-    model.writer.train()
+    train_writer = model.writer_loss_weight > 0.0
+    model.writer.train(train_writer)
     for param in model.writer.parameters():
-        param.requires_grad_(True)
+        param.requires_grad_(train_writer)
+
+
+def effective_writer_loss_weight(args, fallback: float) -> float:
+    if args.no_writer_training:
+        return 0.0
+    if args.writer_loss_weight is None:
+        return fallback
+    return args.writer_loss_weight
 
 
 class AsyncTeacherIterator:
@@ -251,7 +259,6 @@ def empty_metric_sums() -> dict:
         "distill": 0.0,
         "sem_loss": 0.0,
         "surface_loss": 0.0,
-        "surface_norm": 0.0,
         "geom_mean": 0.0,
         "var": 0.0,
         "writer_token_exact": 0.0,
@@ -277,7 +284,6 @@ def accumulate_output_metrics(total: dict, outputs, batch: dict) -> None:
     total["distill"] += float(outputs.distill_loss.detach().cpu())
     total["sem_loss"] += float(outputs.semantic_loss.detach().cpu())
     total["surface_loss"] += float(outputs.surface_loss.detach().cpu())
-    total["surface_norm"] += float(outputs.surface_norm.detach().cpu())
     total["geom_mean"] += float(outputs.mean_geometry_loss.detach().cpu())
     total["var"] += float(outputs.variance_loss.detach().cpu())
     total["writer_token_exact"] += float(outputs.token_exact.detach().cpu())
@@ -334,7 +340,6 @@ def format_log(step, metrics):
         f"distill={metrics['distill']:.4f}",
         f"sem_loss={metrics['sem_loss']:.4f}",
         f"surface_loss={metrics['surface_loss']:.4f}",
-        f"surface_norm={metrics['surface_norm']:.4f}",
         f"geom_mean={metrics['geom_mean']:.4f}",
         f"var={metrics['var']:.4f}",
         f"writer_token_exact={metrics['writer_token_exact']:.4f}",
@@ -406,8 +411,6 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
-    parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
-    parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -416,6 +419,8 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
+    parser.add_argument("--writer-loss-weight", type=float, default=None)
+    parser.add_argument("--no-writer-training", action="store_true")
     parser.add_argument("--writer-num-layers", type=int, default=DIL_MODEL_DEFAULTS["writer_num_layers"])
     parser.add_argument("--writer-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_kernel_size"])
     parser.add_argument("--writer-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_expansion"])
@@ -441,10 +446,10 @@ def validate_args(args):
         raise ValueError("--text-read-chars must be > 0")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
-    if args.semantic_latent_size <= 0 or args.surface_latent_size <= 0:
-        raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
-    if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
-        raise ValueError("--latent-size must equal semantic + surface latent sizes")
+    if args.latent_size <= 0:
+        raise ValueError("--latent-size must be > 0")
+    if args.writer_loss_weight is not None and args.writer_loss_weight < 0.0:
+        raise ValueError("--writer-loss-weight must be >= 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
@@ -474,7 +479,10 @@ def validate_args(args):
 
 def build_config(args, tokenizer):
     if args.resume is not None:
-        return DilConfig.from_pretrained(args.resume.parent)
+        config = DilConfig.from_pretrained(args.resume.parent)
+        config.writer_loss_weight = effective_writer_loss_weight(args, config.writer_loss_weight)
+        return config
+    writer_loss_weight = effective_writer_loss_weight(args, DIL_MODEL_DEFAULTS["writer_loss_weight"])
     return DilConfig(
         vocab_size=tokenizer.vocab_size,
         pad_token_id=tokenizer.pad_token_id,
@@ -483,8 +491,6 @@ def build_config(args, tokenizer):
         intermediate_size=args.intermediate_size,
         num_encoder_layers=args.num_encoder_layers,
         latent_size=args.latent_size,
-        semantic_latent_size=args.semantic_latent_size,
-        surface_latent_size=args.surface_latent_size,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -493,6 +499,7 @@ def build_config(args, tokenizer):
         distillation_weight=args.distillation_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
+        writer_loss_weight=writer_loss_weight,
         writer_num_layers=args.writer_num_layers,
         writer_conv_kernel_size=args.writer_conv_kernel_size,
         writer_conv_expansion=args.writer_conv_expansion,
@@ -749,8 +756,7 @@ class DilBaseTrainer(BaseTrainer):
             f"data_mode={self.args.data_mode} resume_step={self.start_step} teacher_source=online_nllb "
             f"teacher_dtype={str(self.teacher_dtype).replace('torch.', '')} nllb_batch={self.args.nllb_batch_size} "
             f"vocab_size={self.config.vocab_size} latent_size={self.config.latent_size} "
-            f"semantic_latent_size={self.config.semantic_latent_size} surface_latent_size={self.config.surface_latent_size} "
-            f"hidden_size={self.config.hidden_size}",
+            f"hidden_size={self.config.hidden_size} writer_loss_weight={self.config.writer_loss_weight:g}",
             flush=True,
         )
         super().run()

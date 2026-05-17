@@ -14,8 +14,6 @@ class DilConfig(PretrainedConfig):
         intermediate_size=1280,
         num_encoder_layers=6,
         latent_size=512,
-        semantic_latent_size=480,
-        surface_latent_size=32,
         max_sequence_units=4096,
         max_surface_pieces_per_unit=256,
         surface_bucket_sizes=(64, 128, 256, 512, 1024, 2048, 4096, 8192),
@@ -39,9 +37,12 @@ class DilConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         mlp_bias=False,
-        checkpoint_format_version=33,
+        checkpoint_format_version=34,
         **kwargs,
     ):
+        stale_factorized_keys = {"semantic_latent_size", "surface_latent_size"} & set(kwargs)
+        if stale_factorized_keys:
+            raise ValueError(f"DIL 512-latent checkpoints do not accept stale factorized keys: {sorted(stale_factorized_keys)}")
         self.surface_bucket_sizes = tuple(int(bucket) for bucket in surface_bucket_sizes)
         if not self.surface_bucket_sizes or any(bucket <= 0 for bucket in self.surface_bucket_sizes):
             raise ValueError("surface_bucket_sizes must be a non-empty positive tuple")
@@ -67,12 +68,10 @@ class DilConfig(PretrainedConfig):
             raise ValueError("num_encoder_layers must be > 0")
         if num_encoder_layers % 2 != 0:
             raise ValueError("num_encoder_layers must be even")
-        if semantic_latent_size <= 0 or surface_latent_size <= 0:
-            raise ValueError("semantic_latent_size and surface_latent_size must be > 0")
-        if latent_size != semantic_latent_size + surface_latent_size:
-            raise ValueError("latent_size must equal semantic_latent_size + surface_latent_size")
-        if checkpoint_format_version != 33:
-            raise ValueError("DIL center-context factorized checkpoints require checkpoint_format_version=33")
+        if latent_size <= 0:
+            raise ValueError("latent_size must be > 0")
+        if checkpoint_format_version != 34:
+            raise ValueError("DIL 512-latent checkpoints require checkpoint_format_version=34")
 
         self.byte_vocab_size = byte_vocab_size
         self.vocab_size = vocab_size
@@ -82,8 +81,6 @@ class DilConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_encoder_layers = num_encoder_layers
         self.latent_size = latent_size
-        self.semantic_latent_size = semantic_latent_size
-        self.surface_latent_size = surface_latent_size
         self.max_surface_pieces_per_unit = max_surface_pieces_per_unit
         self.max_sequence_units = max_sequence_units
         self.context_radius = context_radius

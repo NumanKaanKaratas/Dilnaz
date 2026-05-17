@@ -23,10 +23,16 @@ from dilnaz.train.common.runtime import (
 from dilnaz.train.data.dil_data import load_hybrid_tokenizer, make_dil_batch_loader, segment_piece_ids, trainable_segments
 from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS, DIL_TRAIN_DEFAULTS
-from dilnaz.models.dil import DilConfig, split_factorized_latent
+from dilnaz.models.dil import DilConfig
 from dilnaz.models.dil import Dil
 from dilnaz.tokenization import HybridTokenizer, TokenSegment, default_vocab_path
-from dilnaz.train.dil.train import prepare_writer_for_surface_training, is_dataloader_worker_exit, restore_checkpoint, save_checkpoint
+from dilnaz.train.dil.train import (
+    effective_writer_loss_weight,
+    prepare_writer_for_surface_training,
+    is_dataloader_worker_exit,
+    restore_checkpoint,
+    save_checkpoint,
+)
 from dilnaz.train.common.trainer_core import BaseTrainer, StepResult, make_scheduler
 
 
@@ -388,8 +394,6 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--hidden-size", type=int, default=DIL_MODEL_DEFAULTS["hidden_size"])
     parser.add_argument("--intermediate-size", type=int, default=DIL_MODEL_DEFAULTS["intermediate_size"])
     parser.add_argument("--latent-size", type=int, default=DIL_MODEL_DEFAULTS["latent_size"])
-    parser.add_argument("--semantic-latent-size", type=int, default=DIL_MODEL_DEFAULTS["semantic_latent_size"])
-    parser.add_argument("--surface-latent-size", type=int, default=DIL_MODEL_DEFAULTS["surface_latent_size"])
     parser.add_argument("--max-surface-pieces-per-unit", type=int, default=DIL_MODEL_DEFAULTS["max_surface_pieces_per_unit"])
     parser.add_argument("--byte-conv-layers", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_layers"])
     parser.add_argument("--byte-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_kernel_size"])
@@ -399,6 +403,8 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--writer-conv-kernel-size", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_kernel_size"])
     parser.add_argument("--writer-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["writer_conv_expansion"])
     parser.add_argument("--writer-dropout", type=float, default=DIL_MODEL_DEFAULTS["writer_dropout"])
+    parser.add_argument("--writer-loss-weight", type=float, default=None)
+    parser.add_argument("--no-writer-training", action="store_true")
     parser.add_argument("--sentence-loss-weight", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.05)
     parser.add_argument("--margin", type=float, default=0.3)
@@ -428,10 +434,8 @@ def validate_args(args) -> None:
         raise ValueError("--shuffle-buffer-size must be >= --batch-size")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
-    if args.semantic_latent_size <= 0 or args.surface_latent_size <= 0:
-        raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
-    if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
-        raise ValueError("--latent-size must equal semantic + surface latent sizes")
+    if args.latent_size <= 0:
+        raise ValueError("--latent-size must be > 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
         raise ValueError("--byte-conv-kernel-size must be a positive odd integer")
     if args.byte_conv_expansion <= 0:
@@ -444,6 +448,8 @@ def validate_args(args) -> None:
         raise ValueError("--writer-conv-expansion must be > 0")
     if not 0.0 <= args.writer_dropout < 1.0:
         raise ValueError("--writer-dropout must be inside [0, 1)")
+    if args.writer_loss_weight is not None and args.writer_loss_weight < 0.0:
+        raise ValueError("--writer-loss-weight must be >= 0")
     if args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
     if args.prefetch_factor <= 0:
@@ -469,7 +475,10 @@ def validate_args(args) -> None:
 
 def build_config(args, tokenizer: HybridTokenizer) -> DilConfig:
     if args.resume is not None:
-        return DilConfig.from_pretrained(args.resume.parent)
+        config = DilConfig.from_pretrained(args.resume.parent)
+        config.writer_loss_weight = effective_writer_loss_weight(args, config.writer_loss_weight)
+        return config
+    writer_loss_weight = effective_writer_loss_weight(args, DIL_MODEL_DEFAULTS["writer_loss_weight"])
     return DilConfig(
         vocab_size=tokenizer.vocab_size,
         pad_token_id=tokenizer.pad_token_id,
@@ -477,8 +486,6 @@ def build_config(args, tokenizer: HybridTokenizer) -> DilConfig:
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         latent_size=args.latent_size,
-        semantic_latent_size=args.semantic_latent_size,
-        surface_latent_size=args.surface_latent_size,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
@@ -487,6 +494,7 @@ def build_config(args, tokenizer: HybridTokenizer) -> DilConfig:
         distillation_weight=0.0,
         mean_geometry_weight=0.0,
         variance_weight=0.0,
+        writer_loss_weight=writer_loss_weight,
         max_sequence_units=DIL_MODEL_DEFAULTS["max_sequence_units"],
         writer_num_layers=args.writer_num_layers,
         writer_conv_kernel_size=args.writer_conv_kernel_size,
@@ -682,14 +690,9 @@ class TeacherlessParallelDilTrainer(BaseTrainer):
         surface = batch[f"{prefix}_surface"]
         unit_mask = batch[f"{prefix}_unit_mask"]
         full_latents = self.model.encode(surface)
-        semantic_latents, _ = split_factorized_latent(
-            full_latents,
-            self.config.semantic_latent_size,
-            self.config.surface_latent_size,
-        )
-        if semantic_latents.shape[:2] != unit_mask.shape:
+        if full_latents.shape[:2] != unit_mask.shape:
             raise ValueError("encoded sequence latents must match unit_mask shape")
-        masked_semantic = semantic_latents.float() * unit_mask.unsqueeze(-1).to(semantic_latents.dtype)
+        masked_semantic = full_latents.float() * unit_mask.unsqueeze(-1).to(full_latents.dtype)
         return full_latents, masked_semantic
 
     def writer_metrics_for_side(self, latents: torch.Tensor, batch: dict, prefix: str) -> dict[str, torch.Tensor]:
