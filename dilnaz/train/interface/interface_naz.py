@@ -81,7 +81,6 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
     return model, config, tokenizer, checkpoint["training_state"]["step"]
 
 
-@torch.no_grad()
 def stream_text(
     model: Naz,
     config: NazConfig,
@@ -97,38 +96,39 @@ def stream_text(
         raise ValueError("--max-new-tokens must be > 0")
     if writer_microbatch_size <= 0:
         raise ValueError("--writer-microbatch-size must be > 0")
-    surface, unit_mask, _ = make_batch(prompt_segments, tokenizer, model.dil_model.config, device)
-    prompt_text = "".join(tokenizer.decode(segment.token_ids) for segment in prompt_segments)
-    sys.stdout.write(prompt_text)
-    sys.stdout.flush()
+    with torch.inference_mode():
+        surface, unit_mask, _ = make_batch(prompt_segments, tokenizer, model.dil_model.config, device)
+        prompt_text = "".join(tokenizer.decode(segment.token_ids) for segment in prompt_segments)
+        sys.stdout.write(prompt_text)
+        sys.stdout.flush()
 
-    writer_buffer = UnitWriterBuffer(model, model.dil_model.config, tokenizer, microbatch_size=writer_microbatch_size)
-    prompt_latents = None
-    if hasattr(model, "encode_sequence_latents"):
-        prompt_latents = model.encode_sequence_latents(surface, unit_mask)
-        writer_buffer.seed_prompt(prompt_latents, prompt_segments)
+        writer_buffer = UnitWriterBuffer(model, model.dil_model.config, tokenizer, microbatch_size=writer_microbatch_size)
+        prompt_latents = None
+        if hasattr(model, "encode_sequence_latents"):
+            prompt_latents = model.encode_sequence_latents(surface, unit_mask)
+            writer_buffer.seed_prompt(prompt_latents, prompt_segments)
 
-    for step in model.generate_stream(
-        surface=surface,
-        unit_mask=unit_mask,
-        max_new_tokens=max_new_tokens,
-        min_new_tokens=min_new_tokens,
-        repetition_cos_threshold=repetition_cos_threshold,
-        prompt_latents=prompt_latents,
-    ):
-        writer_buffer.append(
-            step.latent,
-            bool(step.should_stop[0].detach().cpu()),
-        )
-        if writer_buffer.flush(force=False):
-            break
-        if writer_buffer.pending_should_stop and writer_buffer.pending_should_stop[-1]:
-            if writer_buffer.flush(force=True):
+        for step in model.generate_stream(
+            surface=surface,
+            unit_mask=unit_mask,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            repetition_cos_threshold=repetition_cos_threshold,
+            prompt_latents=prompt_latents,
+        ):
+            writer_buffer.append(
+                step.latent,
+                bool(step.should_stop[0].detach().cpu()),
+            )
+            if writer_buffer.flush(force=False):
                 break
-    else:
-        writer_buffer.flush(force=True)
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+            if writer_buffer.pending_should_stop and writer_buffer.pending_should_stop[-1]:
+                if writer_buffer.flush(force=True):
+                    break
+        else:
+            writer_buffer.flush(force=True)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 def parse_args():

@@ -127,7 +127,7 @@ class Naz(PreTrainedModel):
     ) -> torch.Tensor:
         unit_mask = surface.unit_mask if unit_mask is None else unit_mask.to(surface.ids.device, dtype=torch.bool)
         windowed_surface = self._build_windowed_surface(surface, unit_mask)
-        semantic_states = self.dil_model.encode(surface=windowed_surface).float()
+        semantic_states = self.dil_model.encode(surface=windowed_surface)
         batch_size, unit_count = unit_mask.shape
         if semantic_states.dim() == 3 and semantic_states.shape[1] == 1:
             semantic_states = semantic_states.squeeze(1)
@@ -206,7 +206,7 @@ class Naz(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states, _, _ = self._student_output(semantic_states, unit_mask, attention_mask=attention_mask)
-        return self.semantic_head(hidden_states).selected_latents[:, :, 0].float()
+        return self.semantic_head(hidden_states).selected_latents[:, :, 0]
 
     def predict_semantic_dynamics(
         self,
@@ -471,13 +471,13 @@ class Naz(PreTrainedModel):
             )
             past_key_values = outputs.past_key_values
             dynamics = self.semantic_head(outputs.last_hidden_state[:, -1:])
-            model_latent = dynamics.selected_latents[:, 0, 0].float()
+            model_latent = dynamics.selected_latents[:, 0, 0]
             candidate_index = dynamics.selected_indices[:, 0, 0]
-            repeated = F.cosine_similarity(previous_model_latent.float(), model_latent.float(), dim=-1).ge(repetition_cos_threshold)
+            repeated = F.cosine_similarity(previous_model_latent, model_latent, dim=-1).ge(repetition_cos_threshold)
             should_stop = repeated & torch.full_like(repeated, generated_idx + 1 >= min_new_tokens)
             yield NazGenerationStep(
                 latent=model_latent,
-                latent_cos_to_previous=F.cosine_similarity(previous_model_latent.float(), model_latent.float(), dim=-1),
+                latent_cos_to_previous=F.cosine_similarity(previous_model_latent, model_latent, dim=-1),
                 should_stop=should_stop,
                 candidate_index=candidate_index,
             )

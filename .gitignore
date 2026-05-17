@@ -1,5 +1,6 @@
 # Local/editor state
 .claude/
+.devin/
 .vscode/
 .idea/
 

@@ -69,8 +69,8 @@ class SemanticDynamicsMixtureHead(nn.Module):
         )
         selected_latents = candidate_latents.gather(dim=3, index=gather_index).squeeze(3)
         return NazDynamicsOutput(
-            candidate_latents=candidate_latents.float(),
-            router_logits=router_logits.float(),
-            selected_latents=selected_latents.float(),
+            candidate_latents=candidate_latents,
+            router_logits=router_logits,
+            selected_latents=selected_latents,
             selected_indices=selected_indices,
         )

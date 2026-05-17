@@ -179,7 +179,6 @@ class Dil(PreTrainedModel):
             )
 
         semantic = self.encode(surface=encoder_surface)
-        semantic = semantic.float()
         loss = semantic.new_zeros(())
         distill_loss = semantic.new_zeros(())
         mean_geometry_loss = semantic.new_zeros(())
