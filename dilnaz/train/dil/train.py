@@ -509,7 +509,7 @@ class DilBaseTrainer(BaseTrainer):
         self.compile_mode = effective_compile_mode(args.compile_mode, self.device)
         validate_compile_environment(self.compile_mode)
         self.autocast_enabled = bool(args.bf16 and self.device.type == "cuda")
-        self.teacher_dtype = torch.bfloat16 if self.autocast_enabled else torch.float32
+        self.teacher_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         self.cuda_prefetch = bool(self.device.type == "cuda" and not args.no_cuda_prefetch)
         self.model = Dil(self.config).to(self.device)
         self.model.train()
@@ -736,6 +736,7 @@ class DilBaseTrainer(BaseTrainer):
         print(
             f"device={self.device.type} bf16={int(self.autocast_enabled)} compile_mode={self.compile_mode} "
             f"data_mode={self.args.data_mode} resume_step={self.start_step} teacher_source=online_nllb "
+            f"teacher_dtype={str(self.teacher_dtype).replace('torch.', '')} nllb_batch={self.args.nllb_batch_size} "
             f"vocab_size={self.config.vocab_size} latent_size={self.config.latent_size} "
             f"semantic_latent_size={self.config.semantic_latent_size} surface_latent_size={self.config.surface_latent_size} "
             f"hidden_size={self.config.hidden_size}",

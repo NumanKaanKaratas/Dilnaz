@@ -219,9 +219,10 @@ def build_config(args, tokenizer):
 
 
 def teacher_dtype_for(device: torch.device, autocast_enabled: bool) -> torch.dtype:
+    del autocast_enabled
     if device.type != "cuda":
         return torch.float32
-    return torch.bfloat16 if autocast_enabled else torch.float16
+    return torch.bfloat16
 
 
 def format_parallel_log(step: int, metrics: dict) -> str:
@@ -370,6 +371,7 @@ def main():
         f"device={device.type} bf16={int(autocast_enabled)} compile_mode={compile_mode} "
         f"resume_step={start_step} teacher_source=parallel_online_nllb "
         f"nllb={args.nllb_model_name} source_lang={args.source_lang} target_lang={args.target_lang} "
+        f"teacher_dtype={str(teacher_dtype).replace('torch.', '')} nllb_batch={args.nllb_batch_size} "
         f"parallel_weight={args.parallel_alignment_weight} vocab_size={config.vocab_size} "
         f"latent_size={config.latent_size} hidden_size={config.hidden_size}",
         flush=True,

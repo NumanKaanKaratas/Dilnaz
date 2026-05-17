@@ -24,25 +24,36 @@ def compose_factorized_latent(semantic: torch.Tensor, surface: torch.Tensor) -> 
 
 
 def semantic_unit_latents(latents: torch.Tensor) -> torch.Tensor:
-    raw = latents.float()
+    return semantic_unit_latents_with_reduction(latents, torch.float32)
+
+
+def semantic_unit_latents_with_reduction(
+    latents: torch.Tensor,
+    reduction_dtype: torch.dtype | None,
+) -> torch.Tensor:
+    raw = latents if reduction_dtype is None else latents.to(reduction_dtype)
     norm = raw.norm(dim=-1, keepdim=True)
     fallback = torch.zeros_like(raw)
     fallback[..., 0] = 1.0
     return torch.where(norm > 1e-6, raw / norm.clamp_min(1e-6), fallback)
 
 
-def normalize_semantic_latents(latents: torch.Tensor) -> torch.Tensor:
+def normalize_semantic_latents(
+    latents: torch.Tensor,
+    reduction_dtype: torch.dtype | None = torch.float32,
+) -> torch.Tensor:
     scale = math.sqrt(latents.shape[-1])
-    return semantic_unit_latents(latents).to(latents.dtype) * scale
+    return semantic_unit_latents_with_reduction(latents, reduction_dtype).to(latents.dtype) * scale
 
 
 def normalize_factorized_latents(
     latents: torch.Tensor,
     semantic_latent_size: int,
     surface_latent_size: int,
+    semantic_reduction_dtype: torch.dtype | None = torch.float32,
 ) -> torch.Tensor:
     semantic, surface = split_factorized_latent(latents, semantic_latent_size, surface_latent_size)
-    return compose_factorized_latent(normalize_semantic_latents(semantic), surface.tanh())
+    return compose_factorized_latent(normalize_semantic_latents(semantic, semantic_reduction_dtype), surface.tanh())
 
 
 def angular_noise_like(latents: torch.Tensor, min_cos: torch.Tensor, max_cos: torch.Tensor) -> torch.Tensor:

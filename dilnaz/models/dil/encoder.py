@@ -49,6 +49,7 @@ class DilUnitContextBlock(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.attn_dropout = nn.Dropout(config.dil_dropout)
+        self.attention_softmax_dtype: torch.dtype | None = torch.float32
         self.mlp = nn.Sequential(
             DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps),
             nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias),
@@ -56,6 +57,10 @@ class DilUnitContextBlock(nn.Module):
             nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias),
             nn.Dropout(config.dil_dropout),
         )
+
+    def set_reduction_dtype(self, dtype: torch.dtype | None):
+        self.attention_softmax_dtype = dtype
+        return self
 
     def forward(self, hidden_states: torch.Tensor, unit_mask: torch.Tensor) -> torch.Tensor:
         batch_size, unit_count, _ = hidden_states.shape
@@ -71,7 +76,8 @@ class DilUnitContextBlock(nn.Module):
             torch.ones_like(key_mask),
         )
         scores = scores.masked_fill(~safe_key_mask, torch.finfo(scores.dtype).min)
-        attention = torch.softmax(scores.float(), dim=-1).to(scores.dtype).masked_fill(~safe_key_mask, 0.0)
+        softmax_scores = scores if self.attention_softmax_dtype is None else scores.to(self.attention_softmax_dtype)
+        attention = torch.softmax(softmax_scores, dim=-1).to(scores.dtype).masked_fill(~safe_key_mask, 0.0)
         attention = attention * key_mask.any(dim=-1, keepdim=True).to(attention.dtype)
         context = torch.matmul(attention, value).transpose(1, 2).reshape(batch_size, unit_count, self.hidden_size)
         hidden_states = hidden_states + self.attn_dropout(self.o_proj(context))
@@ -100,6 +106,16 @@ class DilEncoderCore(nn.Module):
         self.semantic_head = nn.Linear(config.hidden_size, config.semantic_latent_size)
         self.surface_head = nn.Linear(config.hidden_size, config.surface_latent_size)
         self.norm = DilRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.semantic_norm_reduction_dtype: torch.dtype | None = torch.float32
+
+    def set_reduction_dtype(self, dtype: torch.dtype | None):
+        self.semantic_norm_reduction_dtype = dtype
+        for module in self.modules():
+            if isinstance(module, DilRMSNorm):
+                module.set_reduction_dtype(dtype)
+            elif isinstance(module, DilUnitContextBlock):
+                module.set_reduction_dtype(dtype)
+        return self
 
     def pool_unit_states(self, hidden_states: torch.Tensor, surface: PackedSurface) -> torch.Tensor:
         scores = self.pool_score(self.pool_norm(hidden_states)).squeeze(-1)
@@ -116,7 +132,10 @@ class DilEncoderCore(nn.Module):
         return token_states[:, target_idx]
 
     def factorized_latent(self, context_states: torch.Tensor, surface_states: torch.Tensor) -> torch.Tensor:
-        semantic = normalize_semantic_latents(self.semantic_head(context_states))
+        semantic = normalize_semantic_latents(
+            self.semantic_head(context_states),
+            reduction_dtype=self.semantic_norm_reduction_dtype,
+        )
         surface = self.surface_head(surface_states.detach())
         return compose_factorized_latent(semantic, surface)
 

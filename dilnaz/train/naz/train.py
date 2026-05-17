@@ -398,6 +398,7 @@ def build_memmap_semantic_cache(
         "surface_latent_size": model.config.surface_latent_size,
         "latent_layout": "factorized_v2",
         "surface_cache": "packed_flat_offsets",
+        "encoder_runtime": "bf16" if autocast_enabled else "fp32",
         "dil_checksum": checksum,
         "ids_path": str(ids_path.resolve()),
         "lengths_path": str(lengths_path.resolve()),
@@ -733,6 +734,7 @@ class NazBaseTrainer(BaseTrainer):
         self.scheduler = make_scheduler(self.optimizer, args.learning_rate, args.warmup_steps, args.max_steps)
         self.initial_dil_checksum = dil_checksum(self.model)
         self.restore_or_initialize()
+        self.model.dil_model.set_encoder_bf16_runtime(self.autocast_enabled)
         self.model.dil_model.set_compiled_forwards(
             encoder_forward=compile_forward(self.model.dil_model.encoder.forward, self.compile_mode, "DilEncoderCore"),
         )
@@ -1057,6 +1059,7 @@ class NazBaseTrainer(BaseTrainer):
     def run(self) -> None:
         print(
             f"device={self.device.type} bf16={int(self.autocast_enabled)} compile_mode={self.compile_mode} "
+            f"encoder_runtime={'bf16' if self.autocast_enabled else 'fp32'} "
             f"stage={self.stage} data_mode={self.args.data_mode} objective={OBJECTIVE} resume_step={self.start_step}",
             flush=True,
         )

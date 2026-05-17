@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from dilnaz.models.dil import Dil, DilConfig, compose_factorized_latent, split_factorized_latent
+from dilnaz.models.common.norms import DilRMSNorm
 from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
 from dilnaz.train.writer.train import (
@@ -33,6 +34,22 @@ def tiny_config() -> DilConfig:
         num_encoder_layers=2,
         writer_num_layers=1,
     )
+
+
+def test_encoder_bf16_runtime_is_scoped_to_encoder_reductions():
+    cfg = tiny_config()
+    model = Dil(cfg)
+    model.set_encoder_bf16_runtime(True)
+
+    encoder_norms = [module for module in model.encoder.modules() if isinstance(module, DilRMSNorm)]
+    writer_norms = [module for module in model.writer.modules() if isinstance(module, DilRMSNorm)]
+
+    assert encoder_norms
+    assert writer_norms
+    assert {module.reduction_dtype for module in encoder_norms} == {None}
+    assert {module.reduction_dtype for module in writer_norms} == {torch.float32}
+    assert model.encoder.semantic_norm_reduction_dtype is None
+    assert {block.attention_softmax_dtype for block in model.encoder.context_blocks} == {None}
 
 
 def test_factorized_latent_split_compose_and_bounds():

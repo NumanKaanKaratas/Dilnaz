@@ -80,11 +80,13 @@ class Dil(PreTrainedModel):
                 latent,
                 self.config.semantic_latent_size,
                 self.config.surface_latent_size,
+                semantic_reduction_dtype=self.encoder.semantic_norm_reduction_dtype,
             ), layer_vectors
         return normalize_factorized_latents(
             encoded,
             self.config.semantic_latent_size,
             self.config.surface_latent_size,
+            semantic_reduction_dtype=self.encoder.semantic_norm_reduction_dtype,
         )
 
     def split_latent(self, latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -107,6 +109,10 @@ class Dil(PreTrainedModel):
     def set_compiled_forwards(self, encoder_forward=None, writer_forward=None):
         object.__setattr__(self, "_compiled_encoder_forward", encoder_forward)
         object.__setattr__(self, "_compiled_writer_forward", writer_forward)
+
+    def set_encoder_bf16_runtime(self, enabled: bool):
+        self.encoder.set_reduction_dtype(None if enabled else torch.float32)
+        return self
 
     def geometry_loss(
         self,

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from dilnaz.train.common.runtime import COMPILE_MODE_CHOICES, compile_forward, validate_compile_environment
+from dilnaz.train.common.runtime import COMPILE_MODE_CHOICES, autocast_context, compile_forward, validate_compile_environment
 from dilnaz.models.dil import DilConfig
 from dilnaz.models.naz import NazConfig
 from dilnaz.models.naz import Naz
@@ -51,7 +51,7 @@ def make_batch(segments: list[TokenSegment], tokenizer: HybridTokenizer, config:
     return surface, unit_mask, byte_lengths
 
 
-def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
+def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str, encoder_bf16: bool):
     checkpoint_dir = checkpoint_dir.resolve()
     config = NazConfig.from_pretrained(checkpoint_dir)
     checkpoint = torch.load(
@@ -71,6 +71,7 @@ def load_model(checkpoint_dir: Path, device: torch.device, compile_mode: str):
     config.dil_path = str(dil_path)
     model = Naz(config).to(device)
     model.load_trainable_state_dict(checkpoint["model_state_dict"])
+    model.dil_model.set_encoder_bf16_runtime(encoder_bf16)
     model.dil_model.set_compiled_forwards(
         encoder_forward=compile_forward(model.dil_model.encoder.forward, compile_mode, "DilEncoderCore"),
         writer_forward=compile_forward(model.dil_model.writer.forward, compile_mode, "DilConditionalWriter"),
@@ -91,6 +92,7 @@ def stream_text(
     min_new_tokens: int,
     repetition_cos_threshold: float,
     writer_microbatch_size: int,
+    encoder_bf16: bool,
 ):
     if max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be > 0")
@@ -105,7 +107,8 @@ def stream_text(
         writer_buffer = UnitWriterBuffer(model, model.dil_model.config, tokenizer, microbatch_size=writer_microbatch_size)
         prompt_latents = None
         if hasattr(model, "encode_sequence_latents"):
-            prompt_latents = model.encode_sequence_latents(surface, unit_mask)
+            with autocast_context(encoder_bf16):
+                prompt_latents = model.encode_sequence_latents(surface, unit_mask).float()
             writer_buffer.seed_prompt(prompt_latents, prompt_segments)
 
         for step in model.generate_stream(
@@ -142,6 +145,7 @@ def parse_args():
     parser.add_argument("--writer-microbatch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--compile-mode", choices=COMPILE_MODE_CHOICES, default="off")
     return parser.parse_args()
 
@@ -156,8 +160,9 @@ def main():
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
     validate_compile_environment(args.compile_mode)
+    encoder_bf16 = bool(args.bf16 and device.type == "cuda")
 
-    model, config, tokenizer, _ = load_model(args.checkpoint_dir, device, args.compile_mode)
+    model, config, tokenizer, _ = load_model(args.checkpoint_dir, device, args.compile_mode, encoder_bf16)
     text = args.text_file.read_text(encoding="utf-8") if args.text_file else args.text
     if text is None:
         raise ValueError("--text or --text-file is required")
@@ -172,6 +177,7 @@ def main():
         config.min_new_tokens if args.min_new_tokens is None else args.min_new_tokens,
         config.repetition_cos_threshold if args.repetition_cos_threshold is None else args.repetition_cos_threshold,
         args.writer_microbatch_size,
+        encoder_bf16,
     )
 
 

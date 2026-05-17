@@ -31,7 +31,7 @@ DIL_TRAIN_DEFAULTS = {
     "max_steps": 30000,
     "batch_size": 64,
     "eval_batch_size": 64,
-    "nllb_batch_size": 64,
+    "nllb_batch_size": 16,
     "max_batch_reuse": 3,
     "text_read_chars": 4096,
     "prefetch_factor": 4,

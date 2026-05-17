@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_utils import PreTrainedModel
 
-from dilnaz.surface import PackedSurface
+from dilnaz.surface import PackedSurface, choose_bucket_size
 
 from ..common.latents import angular_noise_like, compose_factorized_latent, split_factorized_latent
 from ..dil import Dil, DilConfig
@@ -151,40 +151,53 @@ class Naz(PreTrainedModel):
         surface: PackedSurface,
         unit_mask: torch.Tensor,
     ) -> PackedSurface:
-        from dilnaz.surface import pack_token_units
-
         batch_size, unit_count = unit_mask.shape
         context_radius = self.dil_config.context_radius
+        context_size = self.dil_config.context_size
         device = surface.ids.device
-        ids_cpu = surface.ids.detach().cpu()
-        offsets_cpu = surface.unit_offsets.detach().cpu()
-        lengths_cpu = surface.unit_lengths.detach().cpu()
-        unit_mask_cpu = unit_mask.detach().cpu()
-        rows: list[list[list[int]]] = []
-        for b in range(batch_size):
-            unit_pieces: list[list[int]] = []
-            for u in range(unit_count):
-                start = int(offsets_cpu[b, u])
-                length = int(lengths_cpu[b, u])
-                unit_pieces.append(ids_cpu[b, start : start + length].tolist())
-            for u in range(unit_count):
-                window: list[list[int]] = []
-                for offset in range(-context_radius, context_radius + 1):
-                    neighbor = u + offset
-                    if (
-                        0 <= neighbor < unit_count
-                        and bool(unit_mask_cpu[b, neighbor])
-                    ):
-                        window.append(unit_pieces[neighbor])
-                    else:
-                        window.append([])
-                rows.append(window)
-        return pack_token_units(
-            rows,
-            pad_token_id=self.dil_config.pad_token_id,
-            bucket_sizes=self.dil_config.surface_bucket_sizes,
-            max_pieces_per_unit=self.dil_config.max_surface_pieces_per_unit,
-            device=device,
+        piece_width = max(1, int(surface.unit_lengths.max().detach().cpu()))
+        packed_width = choose_bucket_size(context_size * piece_width, self.dil_config.surface_bucket_sizes)
+
+        piece_positions = torch.arange(piece_width, device=device)
+        source_offsets = surface.unit_offsets[:, :unit_count]
+        source_positions = (source_offsets.unsqueeze(-1) + piece_positions).clamp_max(surface.ids.shape[1] - 1)
+        source_ids = surface.ids.gather(1, source_positions.reshape(batch_size, unit_count * piece_width))
+        source_ids = source_ids.view(batch_size, unit_count, piece_width)
+        source_lengths = surface.unit_lengths[:, :unit_count]
+
+        unit_positions = torch.arange(unit_count, device=device)
+        context_offsets = torch.arange(-context_radius, context_radius + 1, device=device)
+        raw_neighbors = unit_positions.unsqueeze(1) + context_offsets.unsqueeze(0)
+        neighbor_in_bounds = raw_neighbors.ge(0) & raw_neighbors.lt(unit_count)
+        neighbor_indices = raw_neighbors.clamp(0, unit_count - 1)
+
+        gathered_ids = source_ids[:, neighbor_indices, :]
+        gathered_lengths = source_lengths[:, neighbor_indices]
+        neighbor_valid = unit_mask[:, neighbor_indices] & neighbor_in_bounds.unsqueeze(0)
+        gathered_lengths = gathered_lengths * neighbor_valid.long()
+        piece_mask = piece_positions.view(1, 1, 1, piece_width).lt(gathered_lengths.unsqueeze(-1))
+
+        row_count = batch_size * unit_count
+        flat_width = context_size * piece_width
+        ids = surface.ids.new_full((row_count, packed_width), self.dil_config.pad_token_id)
+        mask = torch.zeros((row_count, packed_width), dtype=torch.bool, device=device)
+        unit_ids = torch.zeros((row_count, packed_width), dtype=torch.long, device=device)
+        pos_in_unit = torch.zeros((row_count, packed_width), dtype=torch.long, device=device)
+        ids[:, :flat_width] = gathered_ids.reshape(row_count, flat_width)
+        mask[:, :flat_width] = piece_mask.reshape(row_count, flat_width)
+        unit_ids[:, :flat_width] = torch.arange(context_size, device=device).repeat_interleave(piece_width).unsqueeze(0)
+        pos_in_unit[:, :flat_width] = piece_positions.repeat(context_size).unsqueeze(0)
+
+        unit_lengths = gathered_lengths.reshape(row_count, context_size)
+        unit_offsets = (torch.arange(context_size + 1, device=device) * piece_width).unsqueeze(0).expand(row_count, -1)
+        return PackedSurface(
+            ids=ids,
+            mask=mask,
+            unit_ids=unit_ids,
+            pos_in_unit=pos_in_unit,
+            unit_lengths=unit_lengths,
+            unit_offsets=unit_offsets,
+            unit_mask=unit_lengths.gt(0),
         )
 
     def embed_sequence_latents(

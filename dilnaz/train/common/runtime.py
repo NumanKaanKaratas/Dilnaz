@@ -11,7 +11,8 @@ import numpy as np
 import torch
 
 
-COMPILE_MODE_CHOICES = ("off", "default", "reduce-overhead", "max-autotune")
+COMPILE_MODE_CHOICES = ("off", "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs")
+COMPILE_FULLGRAPH_ENV = "DILNAZ_COMPILE_FULLGRAPH"
 
 
 def effective_compile_mode(requested: str | None, device: torch.device) -> str:
@@ -20,15 +21,32 @@ def effective_compile_mode(requested: str | None, device: torch.device) -> str:
     return "reduce-overhead" if device.type == "cuda" else "off"
 
 
-def compile_forward(forward, compile_mode: str, name: str):
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _configure_compile_runtime() -> None:
+    import torch._dynamo
+
+    torch._dynamo.config.capture_scalar_outputs = True
+
+
+def compile_forward(forward, compile_mode: str, name: str, *, fullgraph: bool | None = None, dynamic: bool | None = False):
     if compile_mode == "off":
         return None
     if not hasattr(torch, "compile"):
         raise RuntimeError("torch.compile is not available in this PyTorch build")
-    print(f"compiled={name} mode={compile_mode}", flush=True)
-    if compile_mode == "default":
-        return torch.compile(forward, backend="inductor")
-    return torch.compile(forward, backend="inductor", mode=compile_mode)
+    _configure_compile_runtime()
+    fullgraph = _env_flag(COMPILE_FULLGRAPH_ENV) if fullgraph is None else fullgraph
+    compile_kwargs = {
+        "backend": "inductor",
+        "fullgraph": fullgraph,
+        "dynamic": dynamic,
+    }
+    if compile_mode != "default":
+        compile_kwargs["mode"] = compile_mode
+    print(f"compiled={name} mode={compile_mode} fullgraph={int(fullgraph)} dynamic={dynamic}", flush=True)
+    return torch.compile(forward, **compile_kwargs)
 
 
 def validate_compile_environment(compile_mode: str):

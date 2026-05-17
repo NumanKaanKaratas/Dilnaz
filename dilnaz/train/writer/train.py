@@ -403,6 +403,7 @@ def main():
         model.writer.load_state_dict(fresh_model.writer.state_dict())
         del fresh_model
     freeze_for_writer_only(model)
+    model.set_encoder_bf16_runtime(autocast_enabled)
     model.set_compiled_forwards(
         encoder_forward=compile_forward(model.encoder.forward, compile_mode, "DilEncoderCore"),
         writer_forward=compile_forward(model.writer.forward, compile_mode, "DilConditionalWriter"),
@@ -473,6 +474,7 @@ def main():
 
     print(
         f"device={device.type} bf16={int(autocast_enabled)} compile_mode={compile_mode} "
+        f"encoder_runtime={'bf16' if autocast_enabled else 'fp32'} "
         f"data_mode={args.data_mode} objective={WRITER_OBJECTIVE} "
         f"vocab_size={config.vocab_size} latent_size={config.latent_size} hidden_size={config.hidden_size} "
         f"writer_resume={int(writer_resume)}",

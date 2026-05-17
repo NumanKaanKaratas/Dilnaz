@@ -6,6 +6,7 @@ import torch
 from dilnaz.models.dil import DilConfig, compose_factorized_latent, normalize_semantic_latents
 from dilnaz.models.naz import Naz, NazConfig
 from dilnaz.models.naz.outputs import NazDynamicsOutput
+from dilnaz.surface import pack_token_units
 from dilnaz.train.naz import train as naz_train
 
 
@@ -103,6 +104,59 @@ def test_resident_source_uses_dil_surface_config(monkeypatch, tmp_path: Path):
 
     assert seen["config"] is dil_config
     assert trainer.train_iterator is not None
+
+
+def _surface_rows(surface):
+    rows = []
+    for row_idx in range(surface.ids.shape[0]):
+        row = []
+        for unit_idx in range(surface.unit_lengths.shape[1]):
+            active = surface.mask[row_idx] & surface.unit_ids[row_idx].eq(unit_idx)
+            row.append(surface.ids[row_idx, active].tolist())
+        rows.append(row)
+    return rows
+
+
+def test_naz_windowed_surface_tensor_path_matches_context_rows():
+    dil_config = DilConfig(
+        vocab_size=32,
+        pad_token_id=0,
+        eos_token_id=1,
+        hidden_size=32,
+        intermediate_size=64,
+        latent_size=16,
+        semantic_latent_size=12,
+        surface_latent_size=4,
+        max_surface_pieces_per_unit=8,
+        surface_bucket_sizes=(8, 16, 32, 64),
+        context_radius=1,
+        encoder_context_layers=1,
+        writer_num_layers=1,
+    )
+    surface = pack_token_units(
+        [[[2], [3, 4], [5], [6, 7, 8]]],
+        pad_token_id=dil_config.pad_token_id,
+        bucket_sizes=dil_config.surface_bucket_sizes,
+        max_pieces_per_unit=dil_config.max_surface_pieces_per_unit,
+    )
+    unit_mask = torch.tensor([[True, True, False, True]])
+    harness = SimpleNamespace(dil_config=dil_config)
+
+    windowed = Naz._build_windowed_surface(harness, surface, unit_mask)
+
+    assert windowed.ids.device == surface.ids.device
+    assert windowed.unit_lengths.tolist() == [
+        [0, 1, 2],
+        [1, 2, 0],
+        [2, 0, 3],
+        [0, 3, 0],
+    ]
+    assert _surface_rows(windowed) == [
+        [[], [2], [3, 4]],
+        [[2], [3, 4], []],
+        [[3, 4], [], [6, 7, 8]],
+        [[], [6, 7, 8], []],
+    ]
 
 
 def test_naz_mixture_loss_splits_semantic_and_surface_terms():
