@@ -14,8 +14,10 @@ from dilnaz.train.data.dil_data import (
     NllbTeacherTextCache,
     ResidentDilBatcher,
     context_windows,
+    merge_punctuation_sentence_chunks,
     nllb_token_count,
     segment_piece_ids,
+    sentence_texts_from_chunks,
     split_text_for_nllb,
     stream_text_items,
     trainable_segments,
@@ -433,3 +435,44 @@ def test_stream_text_items_reads_jsonl_text_field(tmp_path: Path):
     text = "kirmizi araba " * 200
     data.write_text(json.dumps({"text": text}) + "\n", encoding="utf-8")
     assert list(stream_text_items(data, read_chars=16)) == [(0, text, True)]
+
+
+def test_sentence_chunk_helpers_preserve_text_coverage():
+    text = "Yapacak misin bunu? ... Gidiyorsun. A. B. Moliere geldi."
+    chunks = ["Yapacak misin bunu? ", "... ", "Gidiyorsun. ", "A. B. Moliere geldi."]
+    merged = merge_punctuation_sentence_chunks(chunks)
+
+    assert merged == ["Yapacak misin bunu? ... ", "Gidiyorsun. ", "A. B. Moliere geldi."]
+    assert sentence_texts_from_chunks(text, merged) == [
+        "Yapacak misin bunu? ...",
+        "Gidiyorsun.",
+        "A. B. Moliere geldi.",
+    ]
+
+
+def test_context_dil_sentence_split_counts_sentence_rows(tmp_path: Path):
+    class FakeSentenceSplitter:
+        def split(self, _text: str) -> list[str]:
+            return ["kirmizi araba", "red car"]
+
+    data = tmp_path / "train.jsonl"
+    data.write_text(json.dumps({"text": "kirmizi araba. red car."}) + "\n", encoding="utf-8")
+    tokenizer = tiny_tokenizer()
+    config = tiny_config(tokenizer)
+    dataset = ContextDilBatchDataset(
+        data,
+        config,
+        tokenizer,
+        batch_size=6,
+        read_chars=1024,
+        repeat=True,
+        sentence_split=True,
+    )
+    dataset._sentence_splitter = FakeSentenceSplitter()
+
+    batch = next(dataset.iter_once(worker_id=0, worker_count=1))
+
+    assert batch["source_row_count"] == 2
+    assert batch["target_unit_count"] == 6
+    assert batch["teacher_texts"][:3] == ["kirmizi araba", "kirmizi araba", "kirmizi araba"]
+    assert batch["teacher_texts"][3:] == ["red car", "red car", "red car"]

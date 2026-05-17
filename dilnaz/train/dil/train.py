@@ -119,6 +119,9 @@ def runtime_training_state(args) -> dict:
         "teacher_cache_max_gb": args.teacher_cache_max_gb,
         "max_batch_reuse": args.max_batch_reuse,
         "text_read_chars": args.text_read_chars,
+        "sentence_split": not args.no_sentence_split,
+        "sentence_split_model": args.sentence_split_model,
+        "sentence_split_threshold": args.sentence_split_threshold,
         "prefetch_factor": args.prefetch_factor,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
@@ -410,6 +413,9 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--teacher-cache-max-gb", type=float, default=DIL_TRAIN_DEFAULTS["teacher_cache_max_gb"])
     parser.add_argument("--max-batch-reuse", type=int, default=DIL_TRAIN_DEFAULTS["max_batch_reuse"])
     parser.add_argument("--text-read-chars", type=int, default=DIL_TRAIN_DEFAULTS["text_read_chars"])
+    parser.add_argument("--no-sentence-split", action="store_true", default=not DIL_TRAIN_DEFAULTS["sentence_split"])
+    parser.add_argument("--sentence-split-model", default=DIL_TRAIN_DEFAULTS["sentence_split_model"])
+    parser.add_argument("--sentence-split-threshold", type=float, default=DIL_TRAIN_DEFAULTS["sentence_split_threshold"])
     parser.add_argument("--prefetch-factor", type=int, default=DIL_TRAIN_DEFAULTS["prefetch_factor"])
     parser.add_argument("--no-cuda-prefetch", action="store_true")
     parser.add_argument("--sync-timing", action="store_true")
@@ -467,6 +473,8 @@ def validate_args(args):
         raise ValueError("--max-batch-reuse must be > 0")
     if args.text_read_chars <= 0:
         raise ValueError("--text-read-chars must be > 0")
+    if not 0.0 < args.sentence_split_threshold < 1.0:
+        raise ValueError("--sentence-split-threshold must be between 0 and 1")
     if args.byte_conv_layers < 0:
         raise ValueError("--byte-conv-layers must be >= 0")
     if args.semantic_latent_size <= 0 or args.surface_latent_size <= 0:
@@ -622,6 +630,9 @@ class DilBaseTrainer(BaseTrainer):
             max_samples=self.args.max_samples,
             teacher_tokenizer=self.teacher.tokenizer,
             teacher_max_tokens=self.teacher.max_encoder_tokens,
+            sentence_split=not self.args.no_sentence_split,
+            sentence_split_model=self.args.sentence_split_model,
+            sentence_split_threshold=self.args.sentence_split_threshold,
         )
 
     def make_eval_dataset(self):
@@ -636,6 +647,9 @@ class DilBaseTrainer(BaseTrainer):
             repeat=False,
             teacher_tokenizer=self.teacher.tokenizer,
             teacher_max_tokens=self.teacher.max_encoder_tokens,
+            sentence_split=not self.args.no_sentence_split,
+            sentence_split_model=self.args.sentence_split_model,
+            sentence_split_threshold=self.args.sentence_split_threshold,
         )
 
     def prepare_data_sources(self) -> None:
@@ -791,6 +805,8 @@ class DilBaseTrainer(BaseTrainer):
             f"data_mode={self.args.data_mode} resume_step={self.start_step} teacher_source=online_nllb "
             f"teacher_dtype={str(self.teacher_dtype).replace('torch.', '')} nllb_batch={self.args.nllb_batch_size} "
             f"teacher_cache_max_gb={self.args.teacher_cache_max_gb:g} "
+            f"sentence_split={int(not self.args.no_sentence_split)} sentence_split_model={self.args.sentence_split_model} "
+            f"sentence_split_threshold={self.args.sentence_split_threshold:g} "
             f"vocab_size={self.config.vocab_size} latent_size={self.config.latent_size} "
             f"semantic_latent_size={self.config.semantic_latent_size} surface_latent_size={self.config.surface_latent_size} "
             f"hidden_size={self.config.hidden_size} writer_loss_weight={self.config.writer_loss_weight:g}",

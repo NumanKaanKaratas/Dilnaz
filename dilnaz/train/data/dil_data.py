@@ -23,6 +23,7 @@ NLLB_DEFAULT_MAX_ENCODER_TOKENS = 1024
 NLLB_TEACHER_CACHE_VERSION = 1
 NLLB_TEXT_CHUNKING = "offset-token-budget-v1"
 TEACHER_CENTERED_ADD_WEIGHT = 0.5
+SENTENCE_SPLIT_PUNCTUATION = frozenset(".!?\u2026")
 
 
 def build_nllb_layer_groups(num_layers: int, num_groups: int = 8) -> tuple[tuple[int, ...], ...]:
@@ -122,6 +123,48 @@ def stream_text_items(path: Path, read_chars: int) -> Iterator[tuple[int, str, b
 
 
 stream_teacher_text_items_with_eos = stream_text_items
+
+
+def is_punctuation_sentence_chunk(chunk: str) -> bool:
+    stripped = chunk.strip()
+    return bool(stripped) and all(char in SENTENCE_SPLIT_PUNCTUATION for char in stripped)
+
+
+def merge_punctuation_sentence_chunks(chunks: list[str]) -> list[str]:
+    merged: list[str] = []
+    for chunk in chunks:
+        if merged and is_punctuation_sentence_chunk(chunk):
+            merged[-1] += chunk
+        else:
+            merged.append(chunk)
+    return merged
+
+
+def sentence_texts_from_chunks(text: str, chunks: list[str]) -> list[str]:
+    cursor = 0
+    sentences: list[str] = []
+    for chunk in chunks:
+        start = text.find(chunk, cursor)
+        if start < 0:
+            raise ValueError("sentence splitter chunk is not aligned with the source text")
+        cursor = start + len(chunk)
+        sentence = chunk.strip()
+        if sentence:
+            sentences.append(sentence)
+    return sentences
+
+
+class WtpSentenceSplitter:
+    def __init__(self, model_name: str, threshold: float):
+        from wtpsplit import SaT
+
+        self.model = SaT(model_name)
+        self.threshold = threshold
+
+    def split(self, text: str) -> list[str]:
+        chunks = list(self.model.split(text, threshold=self.threshold))
+        chunks = merge_punctuation_sentence_chunks(chunks)
+        return sentence_texts_from_chunks(text, chunks)
 
 
 def load_hybrid_tokenizer(vocab_path: Path) -> HybridTokenizer:
@@ -646,6 +689,9 @@ class ContextDilBatchDataset(IterableDataset):
         max_samples: int = 0,
         teacher_tokenizer=None,
         teacher_max_tokens: int = 512,
+        sentence_split: bool = False,
+        sentence_split_model: str = "sat-3l-sm",
+        sentence_split_threshold: float = 0.35,
     ):
         super().__init__()
         self.train_file = train_file
@@ -662,6 +708,23 @@ class ContextDilBatchDataset(IterableDataset):
         self.pad_token_id = config.pad_token_id
         self.teacher_tokenizer = teacher_tokenizer
         self.teacher_max_tokens = teacher_max_tokens
+        self.sentence_split = sentence_split
+        self.sentence_split_model = sentence_split_model
+        self.sentence_split_threshold = sentence_split_threshold
+        self._sentence_splitter = None
+
+    @property
+    def sentence_splitter(self) -> WtpSentenceSplitter:
+        if self._sentence_splitter is None:
+            self._sentence_splitter = WtpSentenceSplitter(self.sentence_split_model, self.sentence_split_threshold)
+        return self._sentence_splitter
+
+    def training_text_items(self, source_line_id: int, text: str, add_eos: bool) -> Iterator[tuple[int, str, bool]]:
+        if not self.sentence_split:
+            yield source_line_id, text, add_eos
+            return
+        for sentence in self.sentence_splitter.split(text):
+            yield source_line_id, sentence, add_eos
 
     def make_batch(
         self,
@@ -719,52 +782,31 @@ class ContextDilBatchDataset(IterableDataset):
         ):
             if item_idx % worker_count != worker_id:
                 continue
-            segments = trainable_segments(
-                self.tokenizer,
-                text,
-                self.max_pieces_per_unit,
-                add_eos=add_eos,
-            )
-            if not segments:
-                continue
-            windows = context_windows(segments, self.context_radius)
-            for target_idx, window in enumerate(windows):
-                segment = segments[target_idx]
-                row = [segment_piece_ids(seg) for seg in window]
-                text_idx = len(texts)
-                texts.append(text)
-                unit_rows.append(row)
-                target_rows.append([segment_piece_ids(segment)])
-                line_ids.append(source_line_id)
-                text_indices.append(text_idx)
-                starts.append(segment.start)
-                ends.append(segment.end)
-                distill_mask.append(teacher_distill_segment(segment))
-                source_row_starts.append(target_idx == 0)
-                produced += 1
-                if len(unit_rows) >= self.batch_size:
-                    yield self.make_batch(
-                        unit_rows,
-                        target_rows,
-                        texts,
-                        line_ids,
-                        text_indices,
-                        starts,
-                        ends,
-                        distill_mask,
-                        source_row_starts,
-                    )
-                    unit_rows = []
-                    target_rows = []
-                    texts = []
-                    line_ids = []
-                    text_indices = []
-                    starts = []
-                    ends = []
-                    distill_mask = []
-                    source_row_starts = []
-                if self.max_samples > 0 and produced >= self.max_samples:
-                    if unit_rows:
+            for source_text_id, training_text, training_add_eos in self.training_text_items(source_line_id, text, add_eos):
+                segments = trainable_segments(
+                    self.tokenizer,
+                    training_text,
+                    self.max_pieces_per_unit,
+                    add_eos=training_add_eos,
+                )
+                if not segments:
+                    continue
+                windows = context_windows(segments, self.context_radius)
+                for target_idx, window in enumerate(windows):
+                    segment = segments[target_idx]
+                    row = [segment_piece_ids(seg) for seg in window]
+                    text_idx = len(texts)
+                    texts.append(training_text)
+                    unit_rows.append(row)
+                    target_rows.append([segment_piece_ids(segment)])
+                    line_ids.append(source_text_id)
+                    text_indices.append(text_idx)
+                    starts.append(segment.start)
+                    ends.append(segment.end)
+                    distill_mask.append(teacher_distill_segment(segment))
+                    source_row_starts.append(target_idx == 0)
+                    produced += 1
+                    if len(unit_rows) >= self.batch_size:
                         yield self.make_batch(
                             unit_rows,
                             target_rows,
@@ -776,7 +818,29 @@ class ContextDilBatchDataset(IterableDataset):
                             distill_mask,
                             source_row_starts,
                         )
-                    return
+                        unit_rows = []
+                        target_rows = []
+                        texts = []
+                        line_ids = []
+                        text_indices = []
+                        starts = []
+                        ends = []
+                        distill_mask = []
+                        source_row_starts = []
+                    if self.max_samples > 0 and produced >= self.max_samples:
+                        if unit_rows:
+                            yield self.make_batch(
+                                unit_rows,
+                                target_rows,
+                                texts,
+                                line_ids,
+                                text_indices,
+                                starts,
+                                ends,
+                                distill_mask,
+                                source_row_starts,
+                            )
+                        return
 
         if unit_rows:
             yield self.make_batch(

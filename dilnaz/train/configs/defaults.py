@@ -28,13 +28,16 @@ DIL_MODEL_DEFAULTS = {
 
 DIL_TRAIN_DEFAULTS = {
     "data_mode": "streaming",
-    "max_steps": 30000,
+    "max_steps": 30000000,
     "batch_size": 64,
     "eval_batch_size": 64,
     "nllb_batch_size": 16,
     "teacher_cache_max_gb": 20.0,
     "max_batch_reuse": 3,
     "text_read_chars": 4096,
+    "sentence_split": True,
+    "sentence_split_model": "sat-3l-sm",
+    "sentence_split_threshold": 0.35,
     "prefetch_factor": 4,
     "learning_rate": 3e-4,
     "weight_decay": 0.1,
