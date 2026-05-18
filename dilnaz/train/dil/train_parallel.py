@@ -34,6 +34,7 @@ from dilnaz.train.data.parallel_dil_data import (
 )
 from dilnaz.tokenization import default_vocab_path
 from dilnaz.train.dil.train import (
+    apply_dil_loss_config_overrides,
     effective_writer_loss_weight,
     prepare_writer_for_surface_training,
     is_dataloader_worker_exit,
@@ -128,6 +129,8 @@ def parse_args():
     parser.add_argument("--byte-conv-expansion", type=int, default=DIL_MODEL_DEFAULTS["byte_conv_expansion"])
     parser.add_argument("--dil-dropout", type=float, default=DIL_MODEL_DEFAULTS["dil_dropout"])
     parser.add_argument("--distillation-weight", type=float, default=DIL_MODEL_DEFAULTS["distillation_weight"])
+    parser.add_argument("--semantic-anchor-weight", type=float, default=DIL_MODEL_DEFAULTS["semantic_anchor_weight"])
+    parser.add_argument("--teacher-latent-size", type=int, default=DIL_MODEL_DEFAULTS["teacher_latent_size"])
     parser.add_argument("--layer-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["layer_geometry_weight"])
     parser.add_argument("--mean-geometry-weight", type=float, default=DIL_MODEL_DEFAULTS["mean_geometry_weight"])
     parser.add_argument("--variance-weight", type=float, default=DIL_MODEL_DEFAULTS["variance_weight"])
@@ -162,8 +165,18 @@ def validate_args(args):
         raise ValueError("--semantic-latent-size and --surface-latent-size must be > 0")
     if args.latent_size != args.semantic_latent_size + args.surface_latent_size:
         raise ValueError("--latent-size must equal semantic + surface latent sizes")
+    if args.distillation_weight < 0.0:
+        raise ValueError("--distillation-weight must be >= 0")
     if args.layer_geometry_weight < 0.0:
         raise ValueError("--layer-geometry-weight must be >= 0")
+    if args.mean_geometry_weight < 0.0:
+        raise ValueError("--mean-geometry-weight must be >= 0")
+    if args.semantic_anchor_weight < 0.0:
+        raise ValueError("--semantic-anchor-weight must be >= 0")
+    if args.variance_weight < 0.0:
+        raise ValueError("--variance-weight must be >= 0")
+    if args.teacher_latent_size <= 0:
+        raise ValueError("--teacher-latent-size must be > 0")
     if args.writer_loss_weight is not None and args.writer_loss_weight < 0.0:
         raise ValueError("--writer-loss-weight must be >= 0")
     if args.byte_conv_kernel_size <= 0 or args.byte_conv_kernel_size % 2 == 0:
@@ -194,7 +207,8 @@ def validate_args(args):
 def build_config(args, tokenizer):
     if args.resume is not None:
         config = DilConfig.from_pretrained(args.resume.parent)
-        config.writer_loss_weight = effective_writer_loss_weight(args, config.writer_loss_weight)
+        apply_dil_loss_config_overrides(args, config)
+        config.teacher_latent_size = args.teacher_latent_size
         return config
     writer_loss_weight = effective_writer_loss_weight(args, DIL_MODEL_DEFAULTS["writer_loss_weight"])
     return DilConfig(
@@ -206,12 +220,14 @@ def build_config(args, tokenizer):
         latent_size=args.latent_size,
         semantic_latent_size=args.semantic_latent_size,
         surface_latent_size=args.surface_latent_size,
+        teacher_latent_size=args.teacher_latent_size,
         max_surface_pieces_per_unit=args.max_surface_pieces_per_unit,
         byte_conv_layers=args.byte_conv_layers,
         byte_conv_kernel_size=args.byte_conv_kernel_size,
         byte_conv_expansion=args.byte_conv_expansion,
         dil_dropout=args.dil_dropout,
         distillation_weight=args.distillation_weight,
+        semantic_anchor_weight=args.semantic_anchor_weight,
         layer_geometry_weight=args.layer_geometry_weight,
         mean_geometry_weight=args.mean_geometry_weight,
         variance_weight=args.variance_weight,
@@ -242,6 +258,7 @@ def format_parallel_log(step: int, metrics: dict) -> str:
         f"parallel={metrics['parallel']:.4f}",
         f"parallel_w={metrics['parallel_weighted']:.4f}",
         f"distill={metrics['distill']:.4f}",
+        f"anchor={metrics['anchor']:.4f}",
         f"geom_l1={metrics['geom_l1']:.4f}",
         f"geom_l2={metrics['geom_l2']:.4f}",
         f"geom_l3={metrics['geom_l3']:.4f}",
@@ -275,6 +292,7 @@ def empty_metric_sums() -> dict[str, float]:
         "parallel": 0.0,
         "parallel_weighted": 0.0,
         "distill": 0.0,
+        "anchor": 0.0,
         "geom_l1": 0.0,
         "geom_l2": 0.0,
         "geom_l3": 0.0,
@@ -294,6 +312,7 @@ def accumulate_metrics(metric_sums: dict[str, float], loss, outputs, parallel_lo
     metric_sums["parallel"] += float(parallel_loss.detach().cpu())
     metric_sums["parallel_weighted"] += float((parallel_loss * weight).detach().cpu())
     metric_sums["distill"] += float(outputs.distill_loss.detach().cpu())
+    metric_sums["anchor"] += float(outputs.semantic_anchor_loss.detach().cpu())
     layer_losses = outputs.layer_geometry_losses.detach().cpu().tolist()
     for idx in range(4):
         metric_sums[f"geom_l{idx + 1}"] += float(layer_losses[idx]) if idx < len(layer_losses) else 0.0
@@ -404,7 +423,8 @@ def main():
         f"nllb={args.nllb_model_name} source_lang={args.source_lang} target_lang={args.target_lang} "
         f"teacher_dtype={str(teacher_dtype).replace('torch.', '')} nllb_batch={args.nllb_batch_size} "
         f"parallel_weight={args.parallel_alignment_weight} vocab_size={config.vocab_size} "
-        f"latent_size={config.latent_size} hidden_size={config.hidden_size} "
+        f"latent_size={config.latent_size} teacher_latent_size={config.teacher_latent_size} hidden_size={config.hidden_size} "
+        f"distillation_weight={config.distillation_weight:g} semantic_anchor_weight={config.semantic_anchor_weight:g} "
         f"writer_loss_weight={config.writer_loss_weight:g}",
         flush=True,
     )

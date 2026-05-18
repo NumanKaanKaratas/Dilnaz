@@ -256,6 +256,29 @@ def test_nllb_teacher_text_cache_prunes_old_entries(tmp_path: Path):
     assert cache.disk_bytes <= cache.max_disk_bytes
 
 
+def test_nllb_teacher_text_cache_get_refreshes_lru_entry(tmp_path: Path):
+    contract = {"model_name": "test-nllb", "layer_groups": ((1, 2),), "dtype": "torch.bfloat16"}
+    encoded = NllbEncodedText(
+        group_hidden=torch.arange(24, dtype=torch.bfloat16).reshape(2, 3, 4),
+        pieces=(("araba", 0, 5, 1),),
+    )
+    cache = NllbTeacherTextCache(tmp_path, contract)
+    cache.put("tur_Latn", "birinci", encoded)
+    cache.put("tur_Latn", "ikinci", encoded)
+    first_path = cache.path_for(cache.key("tur_Latn", "birinci"))
+    second_path = cache.path_for(cache.key("tur_Latn", "ikinci"))
+    size = first_path.stat().st_size
+    os.utime(first_path, (1, 1))
+    os.utime(second_path, (2, 2))
+
+    cache.get("tur_Latn", "birinci")
+    cache.max_disk_bytes = size * 2
+    cache.put("tur_Latn", "ucuncu", encoded)
+
+    assert first_path.exists()
+    assert not second_path.exists()
+
+
 class FakeNllbTokenizer:
     def num_special_tokens_to_add(self, pair=False):
         return 2

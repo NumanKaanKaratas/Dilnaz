@@ -34,8 +34,10 @@ class Dil(PreTrainedModel):
 
         self.encoder = DilEncoderCore(config)
         self.writer = DilConditionalWriter(config)
+        self.semantic_teacher_proj = nn.Linear(config.semantic_latent_size, config.teacher_latent_size)
         self.dil_dropout = config.dil_dropout
         self.distillation_weight = config.distillation_weight
+        self.semantic_anchor_weight = config.semantic_anchor_weight
         self.layer_geometry_weight = config.layer_geometry_weight
         self.mean_geometry_weight = config.mean_geometry_weight
         self.variance_weight = config.variance_weight
@@ -61,6 +63,21 @@ class Dil(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        if not strict:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        incompatible = super().load_state_dict(state_dict, strict=False, assign=assign)
+        allowed_missing = {"semantic_teacher_proj.weight", "semantic_teacher_proj.bias"}
+        missing = set(incompatible.missing_keys)
+        unexpected = set(incompatible.unexpected_keys)
+        if missing - allowed_missing or unexpected:
+            raise RuntimeError(
+                "Error(s) in loading state_dict for Dil:\n"
+                f"\tMissing key(s): {sorted(missing)}\n"
+                f"\tUnexpected key(s): {sorted(unexpected)}"
+            )
+        return incompatible
 
     def get_input_embeddings(self):
         return self.encoder.embed_tokens
@@ -139,6 +156,25 @@ class Dil(PreTrainedModel):
             return model_vectors.new_zeros(())
         std = torch.sqrt(model_vectors.float().var(dim=0, unbiased=False) + 1e-4)
         return F.relu(1.0 - std).mean()
+
+    def semantic_anchor_loss(
+        self,
+        semantic_vectors: torch.Tensor,
+        teacher_vectors: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if teacher_vectors.shape[-1] != self.config.teacher_latent_size:
+            raise ValueError(
+                f"teacher target dim must be {self.config.teacher_latent_size}, got {teacher_vectors.shape[-1]}"
+            )
+        if mask is not None:
+            semantic_vectors = semantic_vectors[mask]
+            teacher_vectors = teacher_vectors[mask]
+        if semantic_vectors.shape[0] == 0:
+            return semantic_vectors.new_zeros(())
+        projected = self.semantic_teacher_proj(semantic_vectors).float()
+        teacher_vectors = teacher_vectors.float()
+        return (1.0 - F.cosine_similarity(projected, teacher_vectors, dim=-1)).mean().to(semantic_vectors.dtype)
 
     def writer_metrics(
         self,
@@ -223,6 +259,7 @@ class Dil(PreTrainedModel):
         loss = semantic.new_zeros(())
         distill_loss = semantic.new_zeros(())
         semantic_loss = semantic.new_zeros(())
+        semantic_anchor_loss = semantic.new_zeros(())
         layer_geometry_losses = semantic.new_zeros((0,))
         mean_geometry_loss = semantic.new_zeros(())
         variance_loss = semantic.new_zeros(())
@@ -236,25 +273,29 @@ class Dil(PreTrainedModel):
             else:
                 teacher_mask = teacher_mask.to(semantic.device, dtype=torch.bool)
             layer_count = min(len(layer_vectors), teacher_layers.shape[-2])
-            layer_geometry_losses = torch.stack(
-                [
-                    self.geometry_loss(layer_vectors[idx].float(), teacher_layers[..., idx, :], teacher_mask)
-                    for idx in range(layer_count)
-                ]
-            )
             teacher_target = teacher_layers[..., layer_count - 1, :]
-            mean_geometry_loss = self.geometry_loss(semantic_part, teacher_target, teacher_mask)
-            variance_terms = [self.variance_regularizer(semantic_part, teacher_mask)]
-            variance_terms.extend(
-                self.variance_regularizer(layer_vectors[idx].float(), teacher_mask)
-                for idx in range(layer_count)
-            )
-            variance_loss = torch.stack(variance_terms).mean()
-            semantic_loss = (
-                layer_geometry_losses.mean() * self.layer_geometry_weight
-                + mean_geometry_loss * self.mean_geometry_weight
-                + variance_loss * self.variance_weight
-            )
+            if self.semantic_anchor_weight > 0.0:
+                semantic_anchor_loss = self.semantic_anchor_loss(semantic_part, teacher_target, teacher_mask)
+                semantic_loss = semantic_loss + semantic_anchor_loss * self.semantic_anchor_weight
+            if self.layer_geometry_weight > 0.0:
+                layer_geometry_losses = torch.stack(
+                    [
+                        self.geometry_loss(layer_vectors[idx].float(), teacher_layers[..., idx, :], teacher_mask)
+                        for idx in range(layer_count)
+                    ]
+                )
+                semantic_loss = semantic_loss + layer_geometry_losses.mean() * self.layer_geometry_weight
+            if self.mean_geometry_weight > 0.0:
+                mean_geometry_loss = self.geometry_loss(semantic_part, teacher_target, teacher_mask)
+                semantic_loss = semantic_loss + mean_geometry_loss * self.mean_geometry_weight
+            if self.variance_weight > 0.0:
+                variance_terms = [self.variance_regularizer(semantic_part, teacher_mask)]
+                variance_terms.extend(
+                    self.variance_regularizer(layer_vectors[idx].float(), teacher_mask)
+                    for idx in range(layer_count)
+                )
+                variance_loss = torch.stack(variance_terms).mean()
+                semantic_loss = semantic_loss + variance_loss * self.variance_weight
             distill_loss = semantic_loss
             loss = loss + distill_loss * self.distillation_weight
 
@@ -280,6 +321,7 @@ class Dil(PreTrainedModel):
             surface_norm=surface_norm,
             writer_loss=writer_loss,
             writer_token_loss=writer_token_loss,
+            semantic_anchor_loss=semantic_anchor_loss,
             layer_geometry_losses=layer_geometry_losses,
             mean_geometry_loss=mean_geometry_loss,
             variance_loss=variance_loss,

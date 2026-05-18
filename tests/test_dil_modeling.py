@@ -11,7 +11,7 @@ from dilnaz.surface import pack_token_units, pack_writer_targets
 from dilnaz.train.configs.defaults import DIL_MODEL_DEFAULTS
 from dilnaz.train.common.objectives import WRITER_OBJECTIVE
 from dilnaz.train.common.runtime import rng_state
-from dilnaz.train.common.trainer_core import make_scheduler
+from dilnaz.train.common.trainer_core import make_adamw_param_groups, make_scheduler
 from dilnaz.train.dil.train import prepare_writer_for_surface_training, restore_checkpoint
 from dilnaz.train.writer.train import (
     WRITER_METRIC_KEYS,
@@ -196,7 +196,7 @@ def test_dil_distillation_includes_intermediate_layer_geometry():
         bucket_sizes=cfg.surface_bucket_sizes,
         max_pieces_per_unit=cfg.max_surface_pieces_per_unit,
     )
-    teacher_layers = torch.randn(2, 4, cfg.hidden_size + 7)
+    teacher_layers = torch.randn(2, 4, cfg.teacher_latent_size)
     teacher_mask = torch.ones(2, dtype=torch.bool)
 
     output = model(surface, teacher_layers=teacher_layers, teacher_mask=teacher_mask)
@@ -204,7 +204,8 @@ def test_dil_distillation_includes_intermediate_layer_geometry():
     assert output.layer_geometry_losses.shape == (cfg.num_encoder_layers,)
     assert torch.isfinite(output.layer_geometry_losses).all()
     expected_semantic = (
-        output.layer_geometry_losses.mean() * cfg.layer_geometry_weight
+        output.semantic_anchor_loss * cfg.semantic_anchor_weight
+        + output.layer_geometry_losses.mean() * cfg.layer_geometry_weight
         + output.mean_geometry_loss * cfg.mean_geometry_weight
         + output.variance_loss * cfg.variance_weight
     )
@@ -475,6 +476,47 @@ def test_dil_restore_accepts_writer_checkpoint_with_dil_optimizer_state(tmp_path
     assert step == 7
     assert metrics == {"loss": 1.25}
     for key, value in source_model.state_dict().items():
+        assert torch.equal(model.state_dict()[key], value)
+
+
+def test_dil_restore_merges_pre_anchor_checkpoint(tmp_path: Path):
+    cfg = tiny_config()
+    source_model = Dil(cfg)
+    old_state = {
+        key: value
+        for key, value in source_model.state_dict().items()
+        if not key.startswith("semantic_teacher_proj.")
+    }
+    old_optimizer = AdamW(
+        make_adamw_param_groups(
+            (item for item in source_model.named_parameters() if not item[0].startswith("semantic_teacher_proj.")),
+            0.1,
+        ),
+        lr=1e-3,
+    )
+    old_scheduler = make_scheduler(old_optimizer, 1e-3, warmup_steps=0, max_steps=20)
+    cfg.save_pretrained(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "format_version": cfg.checkpoint_format_version,
+            "model_state_dict": old_state,
+            "optimizer_state_dict": old_optimizer.state_dict(),
+            "scheduler_state_dict": old_scheduler.state_dict(),
+            "training_state": {"step": 5, "metrics": {"loss": 1.0}},
+            "rng_state": rng_state(),
+        },
+        checkpoint_path,
+    )
+
+    model = Dil(cfg)
+    optimizer = AdamW(make_adamw_param_groups(model.named_parameters(), 0.1), lr=1e-3)
+    scheduler = make_scheduler(optimizer, 1e-3, warmup_steps=0, max_steps=20)
+    step, metrics = restore_checkpoint(checkpoint_path, model, optimizer, scheduler, torch.device("cpu"))
+
+    assert step == 5
+    assert metrics == {"loss": 1.0}
+    for key, value in old_state.items():
         assert torch.equal(model.state_dict()[key], value)
 
 

@@ -24,7 +24,9 @@ class DilConfig(PretrainedConfig):
         byte_conv_kernel_size=5,
         byte_conv_expansion=2,
         dil_dropout=0.10,
-        distillation_weight=16.0,
+        distillation_weight=8.0,
+        semantic_anchor_weight=1.0,
+        teacher_latent_size=1024,
         layer_geometry_weight=2.0,
         mean_geometry_weight=8.0,
         variance_weight=0.05,
@@ -70,6 +72,8 @@ class DilConfig(PretrainedConfig):
             raise ValueError("num_encoder_layers must be even")
         if semantic_latent_size <= 0 or surface_latent_size <= 0:
             raise ValueError("semantic_latent_size and surface_latent_size must be > 0")
+        if teacher_latent_size <= 0:
+            raise ValueError("teacher_latent_size must be > 0")
         if latent_size != semantic_latent_size + surface_latent_size:
             raise ValueError("latent_size must equal semantic_latent_size + surface_latent_size")
         if checkpoint_format_version != 33:
@@ -95,6 +99,8 @@ class DilConfig(PretrainedConfig):
         self.byte_conv_expansion = byte_conv_expansion
         self.dil_dropout = dil_dropout
         self.distillation_weight = distillation_weight
+        self.semantic_anchor_weight = semantic_anchor_weight
+        self.teacher_latent_size = teacher_latent_size
         self.layer_geometry_weight = layer_geometry_weight
         self.mean_geometry_weight = mean_geometry_weight
         self.variance_weight = variance_weight

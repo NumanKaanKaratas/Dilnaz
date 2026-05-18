@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import random
@@ -353,8 +354,10 @@ class NllbTeacherTextCache:
         self.max_disk_bytes = int(max_disk_bytes)
         self.memory_cache: dict[str, NllbEncodedText] = {}
         self.memory_order: list[str] = []
+        self.disk_entries: dict[str, tuple[int, float]] = {}
+        self.disk_lru_heap: list[tuple[float, str]] = []
         self._remove_stale_tmp_files()
-        self.disk_bytes = self._scan_disk_bytes()
+        self.disk_bytes = self._scan_disk_cache()
         self._prune_disk_cache()
 
     def key(self, lang: str, text: str) -> str:
@@ -374,6 +377,10 @@ class NllbTeacherTextCache:
         key = self.key(lang, text)
         cached = self.memory_cache.get(key)
         if cached is not None:
+            path = self.path_for(key)
+            if path.exists():
+                os.utime(path, None)
+                self._record_disk_file(key, path)
             return cached
         path = self.path_for(key)
         if not path.exists():
@@ -383,6 +390,7 @@ class NllbTeacherTextCache:
         if metadata.get("cache_key") != key or metadata.get("contract") != self.contract:
             raise ValueError(f"NLLB teacher cache metadata mismatch: {path}")
         os.utime(path, None)
+        self._record_disk_file(key, path)
         encoded = NllbEncodedText(
             group_hidden=payload["group_hidden"].contiguous(),
             pieces=tuple(tuple(piece) for piece in payload["pieces"]),
@@ -408,7 +416,7 @@ class NllbTeacherTextCache:
         torch.save(payload, tmp_path)
         old_size = path.stat().st_size if path.exists() else 0
         os.replace(str(tmp_path), str(path))
-        self.disk_bytes += path.stat().st_size - old_size
+        self.disk_bytes += self._record_disk_file(key, path) - old_size
         self._prune_disk_cache()
 
     def _remember(self, key: str, encoded: NllbEncodedText) -> None:
@@ -422,8 +430,22 @@ class NllbTeacherTextCache:
             old_key = self.memory_order.pop(0)
             self.memory_cache.pop(old_key, None)
 
-    def _scan_disk_bytes(self) -> int:
-        return sum(path.stat().st_size for path in self.cache_dir.glob("*.pt") if path.is_file())
+    def _record_disk_file(self, key: str, path: Path) -> int:
+        stat = path.stat()
+        size = int(stat.st_size)
+        modified = float(stat.st_mtime)
+        self.disk_entries[key] = (size, modified)
+        heapq.heappush(self.disk_lru_heap, (modified, key))
+        return size
+
+    def _scan_disk_cache(self) -> int:
+        self.disk_entries.clear()
+        self.disk_lru_heap.clear()
+        total = 0
+        for path in self.cache_dir.glob("*.pt"):
+            if path.is_file():
+                total += self._record_disk_file(path.stem, path)
+        return total
 
     def _remove_stale_tmp_files(self) -> None:
         for path in self.cache_dir.glob("*.tmp"):
@@ -433,16 +455,16 @@ class NllbTeacherTextCache:
     def _prune_disk_cache(self) -> None:
         if self.max_disk_bytes <= 0 or self.disk_bytes <= self.max_disk_bytes:
             return
-        files = sorted(
-            (path for path in self.cache_dir.glob("*.pt") if path.is_file()),
-            key=lambda path: path.stat().st_mtime,
-        )
-        for path in files:
-            if self.disk_bytes <= self.max_disk_bytes:
-                break
-            key = path.stem
-            size = path.stat().st_size
-            path.unlink()
+        while self.disk_bytes > self.max_disk_bytes and self.disk_lru_heap:
+            modified, key = heapq.heappop(self.disk_lru_heap)
+            entry = self.disk_entries.get(key)
+            if entry is None or entry[1] != modified:
+                continue
+            path = self.path_for(key)
+            size = entry[0]
+            self.disk_entries.pop(key, None)
+            if path.exists():
+                path.unlink()
             self.disk_bytes -= size
             self.memory_cache.pop(key, None)
             if key in self.memory_order:

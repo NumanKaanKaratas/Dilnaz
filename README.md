@@ -93,6 +93,45 @@ Global text EOS and Writer unit STOP are separate:
 
 DIL/Writer and NAZ training data share the same global EOS contract. Each JSONL/text record receives a tokenizer EOS unit; the EOS unit is taught as a Writer target, but it is excluded from NLLB teacher geometry distillation.
 
+### Planned Surface-Latent Split
+
+The current factorized DIL latent is:
+
+```text
+semantic 480 + surface 32 = latent 512
+```
+
+The intended next surface-latent experiment is to make the two parts come from different surface embedding sources:
+
+```text
+semantic 480:
+  encoder token embeddings
+  -> byte/surface stem
+  -> symmetric left/right context conditioning
+  -> semantic head
+
+surface 32:
+  writer token embeddings / writer-side surface path
+  -> surface head
+```
+
+The goal is not to attach the encoder surface branch to the Writer after the fact. The goal is to make the 32-dimensional surface part originate from the Writer-side form space, while the 480-dimensional semantic part remains owned by the Encoder-side contextual semantic path.
+
+This preserves the intended meaning of the split:
+
+```text
+480 = contextual meaning
+32  = writer-facing form / spelling hint
+```
+
+NAZ would still predict one latent vector, but that vector would have two clearer subcontracts:
+
+```text
+NAZ target = [encoder-semantic 480] + [writer-surface 32]
+```
+
+The semantic contract must not be polluted by this change. Surface gradients must stay isolated from the semantic trunk, and the 32-dimensional writer-surface path must not update the 480-dimensional contextual semantic path. The normalized semantic latent contract remains unchanged.
+
 ## DIL Writer-Only Training
 
 `python -m dilnaz.train.writer.train` loads an existing DIL checkpoint, freezes the encoder, and trains only the writer on plain text. This is used when surface rendering needs improvement without changing the semantic trunk.
